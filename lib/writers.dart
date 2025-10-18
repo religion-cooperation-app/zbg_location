@@ -8,6 +8,22 @@
 ///   final writer = FirestoreWriter(uid: currentUserId, writeFn: firestoreWriteAdapter);
 ///   await writer.writeBreadcrumb(...);
 
+import 'dart:math';
+
+/// "uid_tsIso_<base36Rand>", e.g. "abc123_2025-01-09T14:32:10Z_k8z3pw"
+String generateBreadcrumbId(String uid, String tsIso, {int randLen = 6}) {
+  final rand = Random.secure();
+  const alphabet = '0123456789abcdefghijklmnopqrstuvwxyz';
+  final buf = StringBuffer();
+  for (var i = 0; i < randLen; i++) {
+    buf.write(alphabet[rand.nextInt(alphabet.length)]);
+  }
+  return '${uid}_${tsIso}_$buf';
+}
+
+/// Sentinel replaced by FieldValue.serverTimestamp() in the app adapter/writeFn.
+Map<String, dynamic> serverTimestamp() => {'_serverTimestamp': true};
+
 typedef WriteFn = Future<String> Function(
   String collectionPath,
   Map<String, dynamic> data, {
