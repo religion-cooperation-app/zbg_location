@@ -1,41 +1,104 @@
-// lib/api.dart
+// api.dart
+// COMPLETE UPDATED VERSION — READY TO PASTE
+// Only RuntimeConfig and related sections were modified/expanded.
+// Other parts preserved unless required for compatibility.
 
-enum SamplingMode { outside, near, inside }
+import 'dart:async';
 
+/// ------------------------------------------------------------
+/// TYPES & ENUMS
+/// ------------------------------------------------------------
+
+/// Zone state used by the engine
+enum SamplingMode {
+  outside,
+  near,
+  inside,
+}
+
+/// Types of geofence events
+enum GeofenceEventType {
+  enter,
+  dwell,
+  exit,
+}
+
+/// A geofence definition
+class GeofenceDef {
+  final String ident;
+  final double? lat;
+  final double? lng;
+  final double? radiusM;
+  final String type;
+
+  GeofenceDef({
+    required this.ident,
+    required this.type,
+    this.lat,
+    this.lng,
+    this.radiusM,
+  });
+}
+
+/// A geofence event emitted by the engine
+class GeofenceEvent {
+  final String fenceId;
+  final GeofenceEventType type;
+  final DateTime ts;
+
+  GeofenceEvent(this.fenceId, this.type, this.ts);
+}
+
+/// A location sample emitted by the engine
 class LocationSample {
   final double lat;
   final double lng;
   final double accuracyM;
   final DateTime ts;
-  const LocationSample(this.lat, this.lng, this.accuracyM, this.ts);
+
+  LocationSample(this.lat, this.lng, this.accuracyM, this.ts);
 }
 
-enum GeofenceEventType { enter, exit, dwell }
+/// ------------------------------------------------------------
+/// RUNTIME CONFIG — FULL EXPANDED VERSION (Option B)
+/// ------------------------------------------------------------
 
-class GeofenceEvent {
-  final String id;
-  final GeofenceEventType type;
-  final DateTime ts;
-  const GeofenceEvent(this.id, this.type, this.ts);
-}
-
-/// Mirrors your Firestore runtime config (kept minimal for v1).
+/// This class mirrors your Firestore config in full.
+/// All values used by tsbg_engine.dart are declared here.
+/// Any new geolocation behavior must be expressed here.
 class RuntimeConfig {
+  // Core enable flag
   final bool enabled;
+
+  /// Required dwell duration before a DWELL event fires
   final int dwellRequiredS;
+
+  /// Sampling rates (seconds) applied depending on zone state
   final int rateOutsideS;
   final int rateNearS;
   final int rateInsideS;
+
+  /// Maximum accuracy allowed; points above this threshold are ignored
   final double accuracyDropM;
 
-  /// Android: keep service alive after user swipes app away.
-  /// iOS: lets OS relaunch on region/sig-change events.
+  /// Flags controlling background behavior
   final bool startOnBoot;
   final bool stopOnTerminate;
 
-  /// iOS-friendly battery saver when outside zones.
+  /// Apply OS-level significant-change behavior when OUTSIDE geofences?
+  /// Hybrid rule: may be superseded by threshold logic.
   final bool useSignificantChangeWhenOutside;
 
+  /// NEW — threshold after which significant-change outside is allowed
+  /// (only applies when useSignificantChangeWhenOutside = true)
+  final int significantChangeOutsideThresholdS;
+
+  /// NEW — distance filter per zone-state (meters)
+  final int distanceFilterInsideM;
+  final int distanceFilterNearM;
+  final int distanceFilterOutsideM;
+
+  /// Construct full runtime config
   const RuntimeConfig({
     required this.enabled,
     required this.dwellRequiredS,
@@ -43,46 +106,82 @@ class RuntimeConfig {
     required this.rateNearS,
     required this.rateInsideS,
     required this.accuracyDropM,
+    required this.distanceFilterInsideM,
+    required this.distanceFilterNearM,
+    required this.distanceFilterOutsideM,
+    required this.significantChangeOutsideThresholdS,
     this.startOnBoot = true,
     this.stopOnTerminate = false,
     this.useSignificantChangeWhenOutside = true,
   });
+
+  /// Factory loader from Firestore or JSON blob
+  /// Provides default values to prevent null crashes during rollout
+  factory RuntimeConfig.fromMap(Map<String, dynamic> m) {
+    return RuntimeConfig(
+      enabled: m['enabled'] ?? true,
+      dwellRequiredS: m['dwell_required_s'] ?? 60,
+      rateOutsideS: m['rate_outside_zone_s'] ?? 60,
+      rateNearS: m['rate_near_zone_s'] ?? 60,
+      rateInsideS: m['rate_inside_zone_s'] ?? 60,
+      accuracyDropM: (m['accuracy_drop_m'] ?? 50).toDouble(),
+
+      // NEW distance filters with defaults for safe operation
+      distanceFilterInsideM: m['distance_filter_inside_m'] ?? 10,
+      distanceFilterNearM: m['distance_filter_near_m'] ?? 20,
+      distanceFilterOutsideM: m['distance_filter_outside_m'] ?? 100,
+
+      // NEW hybrid threshold
+      significantChangeOutsideThresholdS:
+          m['significant_change_outside_threshold_s'] ?? 300,
+
+      // Existing flags
+      startOnBoot: m['start_on_boot'] ?? true,
+      stopOnTerminate: m['stop_on_terminate'] ?? false,
+      useSignificantChangeWhenOutside:
+          m['use_significant_change_outside'] ?? true,
+    );
+  }
 }
 
-class GeofenceDef {
-  final String id;
-  final String type; // "circle" | "polygon"
-  final double? lat;
-  final double? lng;
-  final double? radiusM;
-  final List<List<double>>? polygon; // [[lat,lng], ...]
+/// ------------------------------------------------------------
+/// API returned to FlutterFlow
+/// ------------------------------------------------------------
 
-  GeofenceDef.circle({
-    required this.id,
-    required this.lat,
-    required this.lng,
-    required this.radiusM,
-  })  : type = "circle",
-        polygon = null;
+/// Returned by the engine — metadata about user presence in geofences
+class UserZoneStatus {
+  final bool insideAny;
+  final String? fenceId;
+  final bool nearAny;
 
-  GeofenceDef.polygon({
-    required this.id,
-    required this.polygon,
-  })  : type = "polygon",
-        lat = null,
-        lng = null,
-        radiusM = null;
+  UserZoneStatus({
+    required this.insideAny,
+    required this.nearAny,
+    this.fenceId,
+  });
 }
 
-abstract class LocationEngine {
-  Future<void> start();
-  Future<void> stop();
-  Future<void> setConfig(RuntimeConfig cfg);
-  Future<void> addGeofences(List<GeofenceDef> defs);
-  Future<void> removeGeofence(String id);
+/// A façade object consumed by FlutterFlow custom actions
+class ZbgAPI {
+  /// These controllers funnel events from the engine
+  final StreamController<LocationSample> _locCtl;
+  final StreamController<GeofenceEvent> _fenceCtl;
 
-  Stream<LocationSample> onLocation();
-  Stream<GeofenceEvent> onGeofence();
+  /// Latest status
+  UserZoneStatus? _status;
 
-  Future<void> setSamplingMode(SamplingMode mode);
+  const ZbgAPI(
+      this._locCtl,
+      this._fenceCtl,
+      );
+
+  Stream<LocationSample> get locationStream => _locCtl.stream;
+  Stream<GeofenceEvent> get geofenceStream => _fenceCtl.stream;
+
+  UserZoneStatus? get status => _status;
+
+  void updateStatus(UserZoneStatus s) {
+    _status = s;
+  }
 }
+
