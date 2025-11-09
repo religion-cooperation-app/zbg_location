@@ -47,8 +47,8 @@ class TsbgEngine {
         disableElasticity: true,
         // Keep idle relatively short so heartbeats are dependable.
         stopTimeout: 2,
+        reset: !_ready, // ✅ set here instead
       ),
-      reset: !_ready, // only reset on first load
     );
 
     if (!_ready) {

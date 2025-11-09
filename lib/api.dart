@@ -170,10 +170,10 @@ class ZbgAPI {
   /// Latest status
   UserZoneStatus? _status;
 
-  const ZbgAPI(
+  ZbgAPI(
       this._locCtl,
       this._fenceCtl,
-      );
+    );
 
   Stream<LocationSample> get locationStream => _locCtl.stream;
   Stream<GeofenceEvent> get geofenceStream => _fenceCtl.stream;
