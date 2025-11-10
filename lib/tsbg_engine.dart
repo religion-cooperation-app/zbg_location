@@ -1,13 +1,15 @@
 // zbg_location/lib/tsbg_engine.dart
 //
-// Hybrid emission rule (“whichever comes first”):
-//   • Emit on heartbeat at rate_{mode}_s
-//   • Emit immediately when movement since last emit ≥ distance_filter_{mode}_m
+// Emits breadcrumbs with a "whichever comes first" rule:
+//   • time-based (heartbeat) at rate_{mode}_s
+//   • movement-based when Δdistance ≥ distance_filter_{mode}_m
 //
-// Per-mode config applied on mode changes.
-// Geofence: ENTER/DWELL → inside; EXIT → outside.
-// Heartbeat is consumed (getCurrentPosition) to guarantee time-based cadence.
-// Emits a breadcrumb stream that higher layers can use for “opportunistic” checks.
+// Correct per-mode switching is handled by caller via setSamplingMode(...)
+// (GeoBootstrap sets outside/near/inside).
+//
+// No writer dependency here — app-level code can listen to breadcrumbStream.
+//
+// Compatible with your api.dart (RuntimeConfig, GeofenceDef, GeofenceEvent, LocationSample).
 
 import 'dart:async';
 import 'dart:math' as math;
@@ -16,19 +18,13 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
     as fbg;
 
-import 'api.dart'; // expects: RuntimeConfig, SamplingMode, GeofenceDef, GeofenceEvent, LocationSample
-
-typedef WriteFn = Future<void> Function(LocationSample sample);
-typedef FenceWriteFn = Future<void> Function(GeofenceEvent event);
+import 'api.dart';
 
 class TsbgEngine {
   TsbgEngine();
 
   RuntimeConfig? _cfg;
   SamplingMode _mode = SamplingMode.outside;
-
-  WriteFn? _writeBreadcrumb;
-  FenceWriteFn? _writeFenceEvent;
 
   // Baselines reset on every emission.
   DateTime? _lastEmitTs;
@@ -43,12 +39,6 @@ class TsbgEngine {
   // Geofences
   List<GeofenceDef> _fences = const [];
 
-  // Subscriptions
-  StreamSubscription<fbg.Location>? _locSub;
-  StreamSubscription<fbg.HeartbeatEvent>? _heartbeatSub;
-  StreamSubscription<fbg.GeofenceEvent>? _geofenceSub;
-  StreamSubscription<fbg.EnabledChangeEvent>? _enabledSub;
-
   // Outbound streams
   final _geofenceCtl = StreamController<GeofenceEvent>.broadcast();
   Stream<GeofenceEvent> get geofenceStream => _geofenceCtl.stream;
@@ -59,20 +49,12 @@ class TsbgEngine {
   bool get isStarted => _cfg != null;
   SamplingMode get mode => _mode;
 
-  // ---------------------------------------------------------------------------
-  // Public API
-  // ---------------------------------------------------------------------------
-
   Future<void> start({
     required RuntimeConfig config,
     required List<GeofenceDef> fences,
-    required WriteFn writeBreadcrumb,
-    FenceWriteFn? writeFenceEvent,
     SamplingMode initialMode = SamplingMode.outside,
   }) async {
     _cfg = config;
-    _writeBreadcrumb = writeBreadcrumb;
-    _writeFenceEvent = writeFenceEvent;
     _fences = fences;
     _mode = initialMode;
 
@@ -84,10 +66,13 @@ class TsbgEngine {
   }
 
   Future<void> stop() async {
-    await _detachListeners();
+    // This plugin exposes removeListeners() rather than returning StreamSubscriptions.
+    fbg.BackgroundGeolocation.removeListeners();
     await fbg.BackgroundGeolocation.stop();
+
     await _breadcrumbCtl.close();
     await _geofenceCtl.close();
+
     _cfg = null;
   }
 
@@ -98,19 +83,15 @@ class TsbgEngine {
   }
 
   // ---------------------------------------------------------------------------
-  // Internals
-  // ---------------------------------------------------------------------------
 
   Future<void> _configureSdkFirstBoot() async {
-    final c = _cfg!;
+    // Use conservative defaults; your RuntimeConfig does not expose these toggles directly.
     await fbg.BackgroundGeolocation.ready(fbg.Config(
-      debug: c.platformDebugLogs,
-      logLevel: c.platformDebugLogs
-          ? fbg.Config.LOG_LEVEL_VERBOSE
-          : fbg.Config.LOG_LEVEL_ERROR,
-      startOnBoot: c.platformStartOnBoot,
-      stopOnTerminate: c.platformStopOnTerminate,
-      preventSuspend: true,        // keep Dart running in background
+      debug: false,
+      logLevel: fbg.Config.LOG_LEVEL_ERROR,
+      startOnBoot: _cfg!.startOnBoot,
+      stopOnTerminate: _cfg!.stopOnTerminate,
+      preventSuspend: true,
       pausesLocationUpdatesAutomatically: false,
       reset: false,
     ));
@@ -119,11 +100,13 @@ class TsbgEngine {
   Future<void> _registerFences() async {
     await fbg.BackgroundGeolocation.removeGeofences();
     for (final g in _fences) {
+      // Defensive for nullable lat/lng/radiusM in your GeofenceDef.
+      if (g.lat == null || g.lng == null || g.radiusM == null) continue;
       await fbg.BackgroundGeolocation.addGeofence(fbg.Geofence(
-        identifier: g.id,
-        radius: g.radiusM.toDouble(),
-        latitude: g.centerLat,
-        longitude: g.centerLng,
+        identifier: g.ident,
+        radius: (g.radiusM!).toDouble(),
+        latitude: g.lat!,
+        longitude: g.lng!,
         notifyOnEntry: true,
         notifyOnExit: true,
         notifyOnDwell: true,
@@ -148,37 +131,32 @@ class TsbgEngine {
     await fbg.BackgroundGeolocation.setConfig(fbg.Config(
       heartbeatInterval: heartbeatS,
       distanceFilter: distanceM.toDouble(),
-      // Boolean-only behavior: SC outside if enabled; off otherwise.
+      // Boolean-only significant-change outside per your RuntimeConfig:
       useSignificantChangesOnly:
-          (m == SamplingMode.outside) ? c.useSignificantChangeOutside : false,
-      disableElasticity: true,  // keep heartbeats punctual
-      stopTimeout: 2,           // resume quickly from background
+          (m == SamplingMode.outside) ? c.useSignificantChangeWhenOutside : false,
+      disableElasticity: true,
+      stopTimeout: 2,
     ));
 
-    // Start timing from now if unset (first boot).
     _lastEmitTs ??= DateTime.now().toUtc();
   }
 
   void _attachListeners() {
-    _locSub?.cancel();
-    _heartbeatSub?.cancel();
-    _geofenceSub?.cancel();
-    _enabledSub?.cancel();
-
-    _locSub = fbg.BackgroundGeolocation.onLocation((fbg.Location l) async {
+    // onLocation(success, error) → returns void in your plugin version
+    fbg.BackgroundGeolocation.onLocation((fbg.Location l) async {
       _lastLocLat = l.coords.latitude;
       _lastLocLng = l.coords.longitude;
       _lastLocTs = _parseIso(l.timestamp);
 
-      // Movement-first: emit if moved enough since last emit.
       if (_shouldEmitForMovement()) {
-        await _emitFromSdkLocation(l, source: 'location');
+        await _emitFromSdkLocation(l);
       }
-    }, onError: (e) {
+    }, (e) {
       if (kDebugMode) print('[BG] onLocation error: $e');
     });
 
-    _heartbeatSub = fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent hb) async {
+    // onHeartbeat → returns void
+    fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent hb) async {
       final now = DateTime.now().toUtc();
       if (_shouldEmitForTime(now)) {
         try {
@@ -187,55 +165,31 @@ class TsbgEngine {
             persist: false,
             timeout: 30 * 1000,
           );
-          await _emitFromSdkLocation(l, source: 'heartbeat');
+          await _emitFromSdkLocation(l);
         } catch (e) {
-          if (kDebugMode) print('[BG] getCurrentPosition() on heartbeat failed: $e');
+          if (kDebugMode) print('[BG] getCurrentPosition on heartbeat failed: $e');
         }
       }
     });
 
-    _geofenceSub = fbg.BackgroundGeolocation.onGeofence((fbg.GeofenceEvent e) async {
-      final evt = GeofenceEvent(
-        fenceId: e.identifier,
-        type: switch (e.action) {
-          'ENTER' => 'ENTER',
-          'EXIT' => 'EXIT',
-          'DWELL' => 'DWELL',
-          _ => e.action ?? 'UNKNOWN',
-        },
-        ts: DateTime.now().toUtc(),
-      );
+    // onGeofence → returns void; map to your GeofenceEvent (with enum)
+    fbg.BackgroundGeolocation.onGeofence((fbg.GeofenceEvent e) async {
+      final typ = switch (e.action) {
+        'ENTER' => GeofenceEventType.enter,
+        'DWELL' => GeofenceEventType.dwell,
+        'EXIT' => GeofenceEventType.exit,
+        _ => GeofenceEventType.enter,
+      };
+      final evt = GeofenceEvent(e.identifier, typ, DateTime.now().toUtc());
       _geofenceCtl.add(evt);
-      if (_writeFenceEvent != null) {
-        await _writeFenceEvent!(evt);
-      }
-
-      // Default mode switching
-      if (evt.type == 'ENTER' || evt.type == 'DWELL') {
-        await setSamplingMode(SamplingMode.inside);
-      } else if (evt.type == 'EXIT') {
-        await setSamplingMode(SamplingMode.outside);
-      }
     });
 
-    _enabledSub = fbg.BackgroundGeolocation.onEnabledChange((e) {
-      if (kDebugMode) print('[BG] enabledChange: ${e.enabled}');
+    // onEnabledChange(bool enabled) → returns void
+    fbg.BackgroundGeolocation.onEnabledChange((bool enabled) {
+      if (kDebugMode) print('[BG] enabledChange: $enabled');
     });
   }
 
-  Future<void> _detachListeners() async {
-    await _locSub?.cancel();
-    await _heartbeatSub?.cancel();
-    await _geofenceSub?.cancel();
-    await _enabledSub?.cancel();
-    _locSub = null;
-    _heartbeatSub = null;
-    _geofenceSub = null;
-    _enabledSub = null;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Emission rules
   // ---------------------------------------------------------------------------
 
   bool _shouldEmitForTime(DateTime now) {
@@ -246,7 +200,6 @@ class TsbgEngine {
       SamplingMode.outside => _cfg!.rateOutsideS,
     };
     final dtMs = now.difference(_lastEmitTs!).inMilliseconds;
-    // small slack to avoid double-fire when heartbeat & onLocation arrive together
     return dtMs >= (rateS * 1000 * 0.95);
   }
 
@@ -268,32 +221,21 @@ class TsbgEngine {
     return dist >= gateM;
   }
 
-  Future<void> _emitFromSdkLocation(fbg.Location l, {required String source}) async {
+  Future<void> _emitFromSdkLocation(fbg.Location l) async {
     final ts = _parseIso(l.timestamp) ?? DateTime.now().toUtc();
     final lat = l.coords.latitude;
     final lng = l.coords.longitude;
     final acc = l.coords.accuracy?.toDouble() ?? 0.0;
 
-    final s = LocationSample(
-      ts: ts,
-      lat: lat,
-      lng: lng,
-      accuracyM: acc,
-      source: source,
-    );
-
-    // Write + fan-out
-    await _writeBreadcrumb?.call(s);
+    final s = LocationSample(lat, lng, acc, ts);
     _breadcrumbCtl.add(s);
 
-    // Reset baselines for both time & movement.
+    // Reset baselines
     _lastEmitTs = ts;
     _lastEmitLat = lat;
     _lastEmitLng = lng;
   }
 
-  // ---------------------------------------------------------------------------
-  // Utils
   // ---------------------------------------------------------------------------
 
   DateTime? _parseIso(String? iso) {
