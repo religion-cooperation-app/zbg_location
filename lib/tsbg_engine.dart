@@ -226,7 +226,7 @@ class TsbgEngine {
       fbg.Config(
         useSignificantChangesOnly: useSigChange,
         distanceFilter: distanceM.toDouble(),
-        heartbeatInterval: heartbeatS, // <- drives "time" side of rule
+        heartbeatInterval: _hbMinutesFromSeconds(heartbeatS), // <- convert seconds -> minutes
       ),
     );
 
@@ -342,4 +342,11 @@ class TsbgEngine {
   }
 
   double _deg2rad(double deg) => deg * (math.pi / 180.0);
+
+  /// Convert your per-mode seconds to the plugin's heartbeat minutes (Android).
+  /// Uses a floor of 1 minute; rounds to nearest minute for larger values.
+  int _hbMinutesFromSeconds(int seconds) {
+    if (seconds <= 60) return 1;
+    return (seconds / 60).round();
+  }
 }
