@@ -1,15 +1,7 @@
 // zbg_location/lib/tsbg_engine.dart
-//
-// Emits breadcrumbs with a "whichever comes first" rule:
-//   • time-based (heartbeat) at rate_{mode}_s
-//   • movement-based when Δdistance ≥ distance_filter_{mode}_m
-//
-// Correct per-mode switching is handled by caller via setSamplingMode(...)
-// (GeoBootstrap sets outside/near/inside).
-//
-// No writer dependency here — app-level code can listen to breadcrumbStream.
-//
-// Compatible with your api.dart (RuntimeConfig, GeofenceDef, GeofenceEvent, LocationSample).
+// DROP-IN REPLACEMENT — applies hybrid significant-change rule,
+// per-mode distance filters, SDK timestamps, and dwell alignment.
+// Updated to implement "whatever's first" emission rule (distance OR time).
 
 import 'dart:async';
 import 'dart:math' as math;
@@ -18,237 +10,326 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
     as fbg;
 
-import 'api.dart';
+import 'api.dart'; // RuntimeConfig, SamplingMode, GeofenceDef, GeofenceEvent, LocationSample
 
 class TsbgEngine {
   TsbgEngine();
 
+  /// Current effective runtime config (from Firestore via app layer).
   RuntimeConfig? _cfg;
+
+  /// Track current sampling mode (outside by default).
   SamplingMode _mode = SamplingMode.outside;
 
-  // Baselines reset on every emission.
-  DateTime? _lastEmitTs;
+  /// Keep geofence defs for optional "near" detection on location callbacks.
+  final List<GeofenceDef> _defs = [];
+
+  /// Streams exposed to app layer
+  final _locCtl = StreamController<LocationSample>.broadcast();
+  final _fenceCtl = StreamController<GeofenceEvent>.broadcast();
+
+  bool _ready = false;
+  bool _started = false;
+
+  /// "Whatever's first" bookkeeping
+  DateTime? _lastEmitUtc;
   double? _lastEmitLat;
   double? _lastEmitLng;
 
-  // Latest raw SDK location (for movement check).
-  double? _lastLocLat;
-  double? _lastLocLng;
-  DateTime? _lastLocTs;
+  /// --------------------------------------------
+  /// Public API
+  /// --------------------------------------------
 
-  // Geofences
-  List<GeofenceDef> _fences = const [];
+  Future<void> setConfig(RuntimeConfig cfg) async {
+    _cfg = cfg;
 
-  // Outbound streams
-  final _geofenceCtl = StreamController<GeofenceEvent>.broadcast();
-  Stream<GeofenceEvent> get geofenceStream => _geofenceCtl.stream;
+    // One-time BG Geolocation init
+    await fbg.BackgroundGeolocation.ready(
+      fbg.Config(
+        startOnBoot: cfg.startOnBoot,
+        stopOnTerminate: cfg.stopOnTerminate,
+        debug: false,
+        desiredAccuracy: fbg.Config.DESIRED_ACCURACY_HIGH,
+        disableElasticity: true,
+        // Keep idle relatively short so heartbeats are dependable.
+        stopTimeout: 2,
+        reset: !_ready, // ✅ set here instead
+      ),
+    );
 
-  final _breadcrumbCtl = StreamController<LocationSample>.broadcast();
-  Stream<LocationSample> get breadcrumbStream => _breadcrumbCtl.stream;
+    if (!_ready) {
+      _attachListeners();
+      _ready = true;
+    }
 
-  bool get isStarted => _cfg != null;
-  SamplingMode get mode => _mode;
-
-  Future<void> start({
-    required RuntimeConfig config,
-    required List<GeofenceDef> fences,
-    SamplingMode initialMode = SamplingMode.outside,
-  }) async {
-    _cfg = config;
-    _fences = fences;
-    _mode = initialMode;
-
-    await _configureSdkFirstBoot();
-    await _registerFences();
+    // Apply the current mode’s config (outside by default).
     await _applyMode(_mode);
-    _attachListeners();
-    await fbg.BackgroundGeolocation.start();
   }
 
-  Future<void> stop() async {
-    // This plugin exposes removeListeners() rather than returning StreamSubscriptions.
-    fbg.BackgroundGeolocation.removeListeners();
-    await fbg.BackgroundGeolocation.stop();
-
-    await _breadcrumbCtl.close();
-    await _geofenceCtl.close();
-
-    _cfg = null;
-  }
-
-  Future<void> setSamplingMode(SamplingMode m) async {
-    if (_mode == m) return;
-    _mode = m;
-    await _applyMode(m);
-  }
-
-  // ---------------------------------------------------------------------------
-
-  Future<void> _configureSdkFirstBoot() async {
-    // Use conservative defaults; your RuntimeConfig does not expose these toggles directly.
-    await fbg.BackgroundGeolocation.ready(fbg.Config(
-      debug: false,
-      logLevel: fbg.Config.LOG_LEVEL_ERROR,
-      startOnBoot: _cfg!.startOnBoot,
-      stopOnTerminate: _cfg!.stopOnTerminate,
-      preventSuspend: true,
-      pausesLocationUpdatesAutomatically: false,
-      reset: false,
-    ));
-  }
-
-  Future<void> _registerFences() async {
-    await fbg.BackgroundGeolocation.removeGeofences();
-    for (final g in _fences) {
-      // Defensive for nullable lat/lng/radiusM in your GeofenceDef.
-      if (g.lat == null || g.lng == null || g.radiusM == null) continue;
-      await fbg.BackgroundGeolocation.addGeofence(fbg.Geofence(
-        identifier: g.ident,
-        radius: (g.radiusM!).toDouble(),
-        latitude: g.lat!,
-        longitude: g.lng!,
-        notifyOnEntry: true,
-        notifyOnExit: true,
-        notifyOnDwell: true,
-        loiteringDelay: (_cfg?.dwellRequiredS ?? 60) * 1000, // ms
-      ));
+  Future<void> addGeofences(List<GeofenceDef> defs) async {
+    _defs.addAll(defs);
+    for (final d in defs) {
+      // Only circles for now. Polygons could be added here in future.
+      if (d.type == 'circle' && d.lat != null && d.lng != null && d.radiusM != null) {
+        await fbg.BackgroundGeolocation.addGeofence(
+          fbg.Geofence(
+            identifier: d.ident,
+            latitude: d.lat!,
+            longitude: d.lng!,
+            radius: d.radiusM!,
+            notifyOnEntry: true,
+            notifyOnExit: true,
+            notifyOnDwell: true,
+            // Align SDK dwell to your app-config dwell_required_s
+            loiteringDelay: (_cfg?.dwellRequiredS ?? 60) * 1000,
+          ),
+        );
+      }
     }
   }
 
-  Future<void> _applyMode(SamplingMode m) async {
-    final c = _cfg!;
-    final heartbeatS = switch (m) {
-      SamplingMode.inside => c.rateInsideS,
-      SamplingMode.near => c.rateNearS,
-      SamplingMode.outside => c.rateOutsideS,
-    };
-    final distanceM = switch (m) {
-      SamplingMode.inside => c.distanceFilterInsideM,
-      SamplingMode.near => c.distanceFilterNearM,
-      SamplingMode.outside => c.distanceFilterOutsideM,
-    };
-
-    await fbg.BackgroundGeolocation.setConfig(fbg.Config(
-      heartbeatInterval: heartbeatS,
-      distanceFilter: distanceM.toDouble(),
-      // Boolean-only significant-change outside per your RuntimeConfig:
-      useSignificantChangesOnly:
-          (m == SamplingMode.outside) ? c.useSignificantChangeWhenOutside : false,
-      disableElasticity: true,
-      stopTimeout: 2,
-    ));
-
-    _lastEmitTs ??= DateTime.now().toUtc();
+  Future<void> start() async {
+    if (_started) return;
+    await fbg.BackgroundGeolocation.start();
+    _started = true;
   }
 
+  Future<void> stop() async {
+    if (!_started) return;
+    await fbg.BackgroundGeolocation.stop();
+    _started = false;
+  }
+
+  /// Expose streams
+  Stream<LocationSample> onLocation() => _locCtl.stream;
+  Stream<GeofenceEvent> onGeofence() => _fenceCtl.stream;
+
+  /// Let the app switch modes directly (used by your app on ENTER/EXIT).
+  Future<void> setSamplingMode(SamplingMode mode) async {
+    await _applyMode(mode);
+  }
+
+  SamplingMode get currentMode => _mode;
+
+  /// --------------------------------------------
+  /// Internal wiring
+  /// --------------------------------------------
+
   void _attachListeners() {
-    // onLocation(success, error) → returns void in your plugin version
+    // LOCATION — gate emission by "whatever's first"
     fbg.BackgroundGeolocation.onLocation((fbg.Location l) async {
-      _lastLocLat = l.coords.latitude;
-      _lastLocLng = l.coords.longitude;
-      _lastLocTs = _parseIso(l.timestamp);
+      _maybeEmitFromFBGLocation(l, reason: 'location');
 
-      if (_shouldEmitForMovement()) {
-        await _emitFromSdkLocation(l);
-      }
-    }, (e) {
-      if (kDebugMode) print('[BG] onLocation error: $e');
-    });
-
-    // onHeartbeat → returns void
-    fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent hb) async {
-      final now = DateTime.now().toUtc();
-      if (_shouldEmitForTime(now)) {
-        try {
-          final l = await fbg.BackgroundGeolocation.getCurrentPosition(
-            samples: 1,
-            persist: false,
-            timeout: 30 * 1000,
-          );
-          await _emitFromSdkLocation(l);
-        } catch (e) {
-          if (kDebugMode) print('[BG] getCurrentPosition on heartbeat failed: $e');
+      // Optional: promote to NEAR when close to any fence (if not already inside).
+      final c = l.coords;
+      if (_mode != SamplingMode.inside) {
+        final near = _isNearAnyFence(c.latitude, c.longitude);
+        if (near && _mode != SamplingMode.near) {
+          await _applyMode(SamplingMode.near);
+        } else if (!near && _mode == SamplingMode.near) {
+          await _applyMode(SamplingMode.outside);
         }
       }
     });
 
-    // onGeofence → returns void; map to your GeofenceEvent (with enum)
+    // HEARTBEAT — ensures timed emission even when stationary
+    fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent e) async {
+      // Prefer last known location from SDK; fall back to a lightweight fetch.
+      fbg.Location? loc = e.location;
+      if (loc == null) {
+        try {
+          loc = await fbg.BackgroundGeolocation.getCurrentPosition(
+            samples: 1,
+            persist: false,
+            timeout: 10000,
+          );
+        } catch (_) {
+          // Ignore heartbeat if we can't get a position quickly.
+        }
+      }
+      if (loc != null) {
+        _maybeEmitFromFBGLocation(loc, reason: 'heartbeat');
+      }
+    });
+
+    // GEOFENCE
     fbg.BackgroundGeolocation.onGeofence((fbg.GeofenceEvent e) async {
-      final typ = switch (e.action) {
-        'ENTER' => GeofenceEventType.enter,
-        'DWELL' => GeofenceEventType.dwell,
-        'EXIT' => GeofenceEventType.exit,
-        _ => GeofenceEventType.enter,
-      };
-      final evt = GeofenceEvent(e.identifier, typ, DateTime.now().toUtc());
-      _geofenceCtl.add(evt);
+      final GeofenceEventType t;
+      switch (e.action) {
+        case 'ENTER':
+          t = GeofenceEventType.enter;
+          break;
+        case 'DWELL':
+          t = GeofenceEventType.dwell;
+          break;
+        case 'EXIT':
+          t = GeofenceEventType.exit;
+          break;
+        default:
+          t = GeofenceEventType.enter;
+      }
+
+      // Switch mode in response to fence transitions
+      if (t == GeofenceEventType.enter || t == GeofenceEventType.dwell) {
+        await _applyMode(SamplingMode.inside);
+      } else if (t == GeofenceEventType.exit) {
+        await _applyMode(SamplingMode.outside);
+      }
+
+      // Use SDK timestamp for event time
+      final ts = DateTime.tryParse(e.location.timestamp)?.toUtc() ?? DateTime.now().toUtc();
+
+      // Emit to app
+      _fenceCtl.add(GeofenceEvent(e.identifier, t, ts));
     });
 
-    // onEnabledChange(bool enabled) → returns void
-    fbg.BackgroundGeolocation.onEnabledChange((bool enabled) {
-      if (kDebugMode) print('[BG] enabledChange: $enabled');
-    });
+    // (Optional) Motion-change / provider-change handlers could be added here.
   }
 
-  // ---------------------------------------------------------------------------
+  Future<void> _applyMode(SamplingMode mode) async {
+    final cfg = _cfg;
+    if (cfg == null) return;
 
-  bool _shouldEmitForTime(DateTime now) {
-    if (_lastEmitTs == null) return true;
-    final rateS = switch (_mode) {
-      SamplingMode.inside => _cfg!.rateInsideS,
-      SamplingMode.near => _cfg!.rateNearS,
-      SamplingMode.outside => _cfg!.rateOutsideS,
-    };
-    final dtMs = now.difference(_lastEmitTs!).inMilliseconds;
-    return dtMs >= (rateS * 1000 * 0.95);
-  }
+    int heartbeatS;
+    int distanceM;
+    bool useSigChange;
 
-  bool _shouldEmitForMovement() {
-    if (_lastEmitLat == null ||
-        _lastEmitLng == null ||
-        _lastLocLat == null ||
-        _lastLocLng == null) {
-      return true; // first sample
+    switch (mode) {
+      case SamplingMode.inside:
+        // Cadence guaranteed inside.
+        heartbeatS = cfg.rateInsideS;
+        distanceM = cfg.distanceFilterInsideM;
+        useSigChange = false;
+        break;
+
+      case SamplingMode.near:
+        // Cadence guaranteed near.
+        heartbeatS = cfg.rateNearS;
+        distanceM = cfg.distanceFilterNearM;
+        useSigChange = false;
+        break;
+
+      case SamplingMode.outside:
+        // Hybrid rule: allow significant-change only if BOTH:
+        //  (1) config flag permits it, and
+        //  (2) outside rate >= threshold
+        final allowSigChange = cfg.useSignificantChangeWhenOutside &&
+            (cfg.rateOutsideS >= cfg.significantChangeOutsideThresholdS);
+
+        useSigChange = allowSigChange;
+        heartbeatS = cfg.rateOutsideS;
+        distanceM = cfg.distanceFilterOutsideM;
+        break;
     }
-    final dist = _haversineM(
-      _lastEmitLat!, _lastEmitLng!, _lastLocLat!, _lastLocLng!,
+
+    await fbg.BackgroundGeolocation.setConfig(
+      fbg.Config(
+        useSignificantChangesOnly: useSigChange,
+        distanceFilter: distanceM.toDouble(),
+        heartbeatInterval: heartbeatS, // <- drives "time" side of rule
+      ),
     );
-    final gateM = switch (_mode) {
-      SamplingMode.inside => _cfg!.distanceFilterInsideM,
-      SamplingMode.near => _cfg!.distanceFilterNearM,
-      SamplingMode.outside => _cfg!.distanceFilterOutsideM,
-    };
-    return dist >= gateM;
+
+    if (kDebugMode) {
+      debugPrint(
+          '[TsbgEngine] applyMode=$mode sc=$useSigChange hb=${heartbeatS}s df=${distanceM}m');
+    }
+
+    _mode = mode;
   }
 
-  Future<void> _emitFromSdkLocation(fbg.Location l) async {
-    final ts = _parseIso(l.timestamp) ?? DateTime.now().toUtc();
-    final lat = l.coords.latitude;
-    final lng = l.coords.longitude;
-    final acc = l.coords.accuracy?.toDouble() ?? 0.0;
+  /// Central gate for "whatever's first" (distance OR time) emission.
+  void _maybeEmitFromFBGLocation(fbg.Location l, {required String reason}) {
+    final cfg = _cfg;
+    if (cfg == null) return;
 
-    final s = LocationSample(lat, lng, acc, ts);
-    _breadcrumbCtl.add(s);
+    // Use SDK timestamp for truth (not DateTime.now()).
+    final nowUtc = DateTime.tryParse(l.timestamp)?.toUtc() ?? DateTime.now().toUtc();
+    final c = l.coords;
 
-    // Reset baselines
-    _lastEmitTs = ts;
-    _lastEmitLat = lat;
-    _lastEmitLng = lng;
-  }
+    final double lat = c.latitude;
+    final double lng = c.longitude;
+    final double acc = (c.accuracy ?? 9999.0);
 
-  // ---------------------------------------------------------------------------
+    // Accuracy gate
+    if (acc > cfg.accuracyDropM) return;
 
-  DateTime? _parseIso(String? iso) {
-    if (iso == null) return null;
-    try {
-      return DateTime.parse(iso).toUtc();
-    } catch (_) {
-      return null;
+    // Mode-specific thresholds
+    final int rateS = () {
+      switch (_mode) {
+        case SamplingMode.inside:
+          return cfg.rateInsideS;
+        case SamplingMode.near:
+          return cfg.rateNearS;
+        case SamplingMode.outside:
+          return cfg.rateOutsideS;
+      }
+    }();
+
+    final int distM = () {
+      switch (_mode) {
+        case SamplingMode.inside:
+          return cfg.distanceFilterInsideM;
+        case SamplingMode.near:
+          return cfg.distanceFilterNearM;
+        case SamplingMode.outside:
+          return cfg.distanceFilterOutsideM;
+      }
+    }();
+
+    // Distance since last emitted crumb
+    double movedM = 0.0;
+    if (_lastEmitLat != null && _lastEmitLng != null) {
+      movedM = _haversineMeters(_lastEmitLat!, _lastEmitLng!, lat, lng);
+    }
+
+    final bool timeDue = (_lastEmitUtc == null)
+        ? true
+        : nowUtc.difference(_lastEmitUtc!).inSeconds >= rateS;
+
+    final bool distDue = (_lastEmitLat == null || _lastEmitLng == null)
+        ? true
+        : movedM >= distM;
+
+    if (timeDue || distDue) {
+      // Emit a sample to app layer
+      _locCtl.add(LocationSample(
+        lat,
+        lng,
+        acc,
+        nowUtc,
+      ));
+
+      // Reset the emission reference
+      _lastEmitUtc = nowUtc;
+      _lastEmitLat = lat;
+      _lastEmitLng = lng;
+
+      if (kDebugMode) {
+        debugPrint('[TsbgEngine] emit reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue '
+            'moved=${movedM.toStringAsFixed(1)}m rate=${rateS}s dist=${distM}m acc=${acc.toStringAsFixed(1)}m');
+      }
     }
   }
 
-  double _haversineM(double lat1, double lon1, double lat2, double lon2) {
-    const R = 6371000.0; // meters
+  bool _isNearAnyFence(double lat, double lng) {
+    // Small buffer around each circular fence radius for "near".
+    // You can make this configurable later if desired.
+    const marginM = 25;
+    for (final d in _defs) {
+      if (d.type == 'circle' && d.lat != null && d.lng != null && d.radiusM != null) {
+        final dist = _haversineMeters(lat, lng, d.lat!, d.lng!);
+        if (dist <= d.radiusM! + marginM) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /// Haversine distance in meters
+  double _haversineMeters(double lat1, double lon1, double lat2, double lon2) {
+    const R = 6371000.0; // Earth radius (m)
     final dLat = _deg2rad(lat2 - lat1);
     final dLon = _deg2rad(lon2 - lon1);
     final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
