@@ -118,6 +118,16 @@ class RuntimeConfig {
   /// Factory loader from Firestore or JSON blob
   /// Provides default values to prevent null crashes during rollout
   factory RuntimeConfig.fromMap(Map<String, dynamic> m) {
+    // Support both flat keys and nested `platform` map:
+    // {
+    //   "start_on_boot": true,
+    //   "platform": { "start_on_boot": true, ... }
+    // }
+    final Map<String, dynamic> platform =
+        (m['platform'] is Map<String, dynamic>)
+            ? m['platform'] as Map<String, dynamic>
+            : const {};
+
     return RuntimeConfig(
       enabled: m['enabled'] ?? true,
       dwellRequiredS: m['dwell_required_s'] ?? 60,
@@ -131,15 +141,23 @@ class RuntimeConfig {
       distanceFilterNearM: m['distance_filter_near_m'] ?? 20,
       distanceFilterOutsideM: m['distance_filter_outside_m'] ?? 100,
 
-      // NEW hybrid threshold
+      // NEW hybrid threshold — allow override from nested platform map
       significantChangeOutsideThresholdS:
-          m['significant_change_outside_threshold_s'] ?? 300,
+          m['significant_change_outside_threshold_s'] ??
+              platform['significant_change_outside_threshold_s'] ??
+              300,
 
-      // Existing flags
-      startOnBoot: m['start_on_boot'] ?? true,
-      stopOnTerminate: m['stop_on_terminate'] ?? false,
+      // Existing flags (flat or nested under platform)
+      startOnBoot:
+          m['start_on_boot'] ?? platform['start_on_boot'] ?? true,
+      stopOnTerminate:
+          m['stop_on_terminate'] ??
+              platform['stop_on_terminate'] ??
+              false,
       useSignificantChangeWhenOutside:
-          m['use_significant_change_outside'] ?? true,
+          m['use_significant_change_outside'] ??
+              platform['use_significant_change_outside'] ??
+              true,
     );
   }
 }
@@ -184,4 +202,3 @@ class ZbgAPI {
     _status = s;
   }
 }
-
