@@ -12,8 +12,25 @@ import 'package:flutter_background_geolocation/flutter_background_geolocation.da
 
 import 'api.dart'; // RuntimeConfig, SamplingMode, GeofenceDef, GeofenceEvent, LocationSample
 
+// Native HTTP upload config for background ingestion.
+const String _zbgIngestUrl =
+    'https://us-central1-religion-and-cooperation.cloudfunctions.net/zbgIngest';
+// NOTE: For production, move this API key into a secure runtime channel / remote config.
+const String _zbgApiKey = 'religion-and-cooperation-key-123';
+
 class TsbgEngine {
   TsbgEngine();
+
+  // Identity for native HTTP uploads → Cloud Function.
+  String? _uid;
+  String? _regionId;
+
+  /// Called by app layer before setConfig/start to tag native HTTP uploads
+  /// with the signed-in user and active region.
+  void setIdentity({required String uid, required String regionId}) {
+    _uid = uid;
+    _regionId = regionId;
+  }
 
   /// Current effective runtime config (from Firestore via app layer).
   RuntimeConfig? _cfg;
@@ -28,20 +45,23 @@ class TsbgEngine {
   final _locCtl = StreamController<LocationSample>.broadcast();
   final _fenceCtl = StreamController<GeofenceEvent>.broadcast();
 
-  bool _ready = false;
+  /// Dwell alignment
+  LocationSample? _lastSample;
+  DateTime? _lastEmitTs;
   bool _started = false;
+  bool _ready = false;
 
-  /// "Whatever's first" bookkeeping
-  DateTime? _lastEmitUtc;
-  double? _lastEmitLat;
-  double? _lastEmitLng;
-
-  /// --------------------------------------------
   /// Public API
-  /// --------------------------------------------
-
   Future<void> setConfig(RuntimeConfig cfg) async {
     _cfg = cfg;
+
+    // Snapshot identity for HTTP params at config-time.
+    final uid = _uid;
+    final regionId = _regionId;
+
+    final httpParams = <String, dynamic>{};
+    if (uid != null) httpParams['uid'] = uid;
+    if (regionId != null) httpParams['regionId'] = regionId;
 
     // One-time BG Geolocation init
     await fbg.BackgroundGeolocation.ready(
@@ -54,6 +74,17 @@ class TsbgEngine {
         // Keep idle relatively short so heartbeats are dependable.
         stopTimeout: 2,
         reset: !_ready, // ✅ set here instead
+
+        // Native HTTP → Cloud Function (background-safe).
+        url: _zbgIngestUrl,
+        headers: const {
+          'X-Api-Key': _zbgApiKey,
+        },
+        params: httpParams,
+        autoSync: true,
+        batchSync: true,
+        maxBatchSize: 50,
+        httpRootProperty: '.', // zbgIngest expects root location / geofence objects
       ),
     );
 
@@ -64,28 +95,6 @@ class TsbgEngine {
 
     // Apply the current mode’s config (outside by default).
     await _applyMode(_mode);
-  }
-
-  Future<void> addGeofences(List<GeofenceDef> defs) async {
-    _defs.addAll(defs);
-    for (final d in defs) {
-      // Only circles for now. Polygons could be added here in future.
-      if (d.type == 'circle' && d.lat != null && d.lng != null && d.radiusM != null) {
-        await fbg.BackgroundGeolocation.addGeofence(
-          fbg.Geofence(
-            identifier: d.ident,
-            latitude: d.lat!,
-            longitude: d.lng!,
-            radius: d.radiusM!,
-            notifyOnEntry: true,
-            notifyOnExit: true,
-            notifyOnDwell: true,
-            // Align SDK dwell to your app-config dwell_required_s
-            loiteringDelay: (_cfg?.dwellRequiredS ?? 60) * 1000,
-          ),
-        );
-      }
-    }
   }
 
   Future<void> start() async {
@@ -119,17 +128,52 @@ class TsbgEngine {
     // LOCATION — gate emission by "whatever's first"
     fbg.BackgroundGeolocation.onLocation((fbg.Location l) async {
       _maybeEmitFromFBGLocation(l, reason: 'location');
+    });
 
-      // Optional: promote to NEAR when close to any fence (if not already inside).
-      final c = l.coords;
-      if (_mode != SamplingMode.inside) {
-        final near = _isNearAnyFence(c.latitude, c.longitude);
-        if (near && _mode != SamplingMode.near) {
-          await _applyMode(SamplingMode.near);
-        } else if (!near && _mode == SamplingMode.near) {
-          await _applyMode(SamplingMode.outside);
-        }
+    // MOTIONCHANGE — typically high-quality transition sample
+    fbg.BackgroundGeolocation.onMotionChange((fbg.Location l) async {
+      _maybeEmitFromFBGLocation(l, reason: 'motionchange');
+    });
+
+    // GEOFENCE — ENTER/DWELL/EXIT
+    fbg.BackgroundGeolocation.onGeofence((fbg.GeofenceEvent e) async {
+      final cfg = _cfg;
+      if (cfg == null || !cfg.enabled) return;
+
+      final type = e.action;
+      GeofenceEventType? t;
+      if (type == 'ENTER') {
+        t = GeofenceEventType.enter;
+      } else if (type == 'DWELL') {
+        t = GeofenceEventType.dwell;
+      } else if (type == 'EXIT') {
+        t = GeofenceEventType.exit;
       }
+
+      if (t == null) return;
+
+      // Switch mode in response to fence transitions
+      if (t == GeofenceEventType.enter || t == GeofenceEventType.dwell) {
+        await _applyMode(SamplingMode.inside);
+      } else if (t == GeofenceEventType.exit) {
+        await _applyMode(SamplingMode.outside);
+      }
+
+      // Use SDK timestamp for event time
+      final ts =
+          DateTime.tryParse(e.location.timestamp)?.toUtc() ?? DateTime.now().toUtc();
+
+      // Emit to app
+      _fenceCtl.add(
+        GeofenceEvent(
+          e.identifier,
+          t,
+          ts,
+          e.location.coords.latitude,
+          e.location.coords.longitude,
+          e.location.coords.accuracy ?? 9999.0,
+        ),
+      );
     });
 
     // HEARTBEAT — ensures timed emission even when stationary
@@ -141,80 +185,40 @@ class TsbgEngine {
           loc = await fbg.BackgroundGeolocation.getCurrentPosition(
             samples: 1,
             persist: false,
-            timeout: 10000,
           );
         } catch (_) {
-          // Ignore heartbeat if we can't get a position quickly.
+          return;
         }
       }
-      if (loc != null) {
-        _maybeEmitFromFBGLocation(loc, reason: 'heartbeat');
-      }
+      _maybeEmitFromFBGLocation(loc, reason: 'heartbeat');
     });
-
-    // GEOFENCE
-    fbg.BackgroundGeolocation.onGeofence((fbg.GeofenceEvent e) async {
-      final GeofenceEventType t;
-      switch (e.action) {
-        case 'ENTER':
-          t = GeofenceEventType.enter;
-          break;
-        case 'DWELL':
-          t = GeofenceEventType.dwell;
-          break;
-        case 'EXIT':
-          t = GeofenceEventType.exit;
-          break;
-        default:
-          t = GeofenceEventType.enter;
-      }
-
-      // Switch mode in response to fence transitions
-      if (t == GeofenceEventType.enter || t == GeofenceEventType.dwell) {
-        await _applyMode(SamplingMode.inside);
-      } else if (t == GeofenceEventType.exit) {
-        await _applyMode(SamplingMode.outside);
-      }
-
-      // Use SDK timestamp for event time
-      final ts = DateTime.tryParse(e.location.timestamp)?.toUtc() ?? DateTime.now().toUtc();
-
-      // Emit to app
-      _fenceCtl.add(GeofenceEvent(e.identifier, t, ts));
-    });
-
-    // (Optional) Motion-change / provider-change handlers could be added here.
   }
 
   Future<void> _applyMode(SamplingMode mode) async {
     final cfg = _cfg;
     if (cfg == null) return;
 
+    bool useSigChange = false;
     int heartbeatS;
     int distanceM;
-    bool useSigChange;
 
     switch (mode) {
       case SamplingMode.inside:
-        // Cadence guaranteed inside.
+        useSigChange = false;
         heartbeatS = cfg.rateInsideS;
         distanceM = cfg.distanceFilterInsideM;
-        useSigChange = false;
         break;
-
       case SamplingMode.near:
-        // Cadence guaranteed near.
+        useSigChange = false;
         heartbeatS = cfg.rateNearS;
         distanceM = cfg.distanceFilterNearM;
-        useSigChange = false;
         break;
-
       case SamplingMode.outside:
-        // Hybrid rule: allow significant-change only if BOTH:
-        //  (1) config flag permits it, and
-        //  (2) outside rate >= threshold
-        final allowSigChange = cfg.useSignificantChangeWhenOutside &&
-            (cfg.rateOutsideS >= cfg.significantChangeOutsideThresholdS);
+        // Outside uses hybrid: significant-change OR time-based heartbeats,
+        // depending on your threshold.
+        final allowSigChange =
+            cfg.useSignificantChangeWhenOutside &&
+                (cfg.rateOutsideS >= cfg.significantChangeOutsideThresholdS);
 
         useSigChange = allowSigChange;
         heartbeatS = cfg.rateOutsideS;
@@ -226,7 +230,8 @@ class TsbgEngine {
       fbg.Config(
         useSignificantChangesOnly: useSigChange,
         distanceFilter: distanceM.toDouble(),
-        heartbeatInterval: _hbMinutesFromSeconds(heartbeatS), // <- convert seconds -> minutes
+        heartbeatInterval:
+            _hbMinutesFromSeconds(heartbeatS), // <- convert seconds -> minutes
       ),
     );
 
@@ -241,10 +246,10 @@ class TsbgEngine {
   /// Central gate for "whatever's first" (distance OR time) emission.
   void _maybeEmitFromFBGLocation(fbg.Location l, {required String reason}) {
     final cfg = _cfg;
-    if (cfg == null) return;
+    if (cfg == null || !cfg.enabled) return;
 
-    // Use SDK timestamp for truth (not DateTime.now()).
-    final nowUtc = DateTime.tryParse(l.timestamp)?.toUtc() ?? DateTime.now().toUtc();
+    final nowUtc =
+        DateTime.tryParse(l.timestamp)?.toUtc() ?? DateTime.now().toUtc();
     final c = l.coords;
 
     final double lat = c.latitude;
@@ -277,59 +282,49 @@ class TsbgEngine {
       }
     }();
 
-    // Distance since last emitted crumb
-    double movedM = 0.0;
-    if (_lastEmitLat != null && _lastEmitLng != null) {
-      movedM = _haversineMeters(_lastEmitLat!, _lastEmitLng!, lat, lng);
-    }
+    final last = _lastSample;
+    final lastTs = _lastEmitTs ?? nowUtc;
 
-    final bool timeDue = (_lastEmitUtc == null)
-        ? true
-        : nowUtc.difference(_lastEmitUtc!).inSeconds >= rateS;
+    // Distance since last emitted sample
+    final double movedM = (last == null)
+        ? double.infinity
+        : _haversineM(last.lat, last.lng, lat, lng);
 
-    final bool distDue = (_lastEmitLat == null || _lastEmitLng == null)
-        ? true
-        : movedM >= distM;
+    // Time since last emitted sample
+    final dtS = nowUtc.difference(lastTs).inSeconds;
 
-    if (timeDue || distDue) {
-      // Emit a sample to app layer
-      _locCtl.add(LocationSample(
-        lat,
-        lng,
-        acc,
-        nowUtc,
-      ));
+    final bool distDue = movedM >= distM;
+    final bool timeDue = dtS >= rateS;
 
-      // Reset the emission reference
-      _lastEmitUtc = nowUtc;
-      _lastEmitLat = lat;
-      _lastEmitLng = lng;
-
+    if (!distDue && !timeDue && last != null) {
       if (kDebugMode) {
-        debugPrint('[TsbgEngine] emit reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue '
-            'moved=${movedM.toStringAsFixed(1)}m rate=${rateS}s dist=${distM}m acc=${acc.toStringAsFixed(1)}m');
+        debugPrint(
+            '[TsbgEngine] skip reason=$reason mode=$_mode moved=${movedM.toStringAsFixed(1)}m<${distM}m dt=${dtS}s<${rateS}s');
       }
+      return;
     }
+
+    final sample = LocationSample(
+      ts: nowUtc,
+      lat: lat,
+      lng: lng,
+      accuracyM: acc,
+      mode: _mode,
+      reason: reason,
+    );
+    _lastSample = sample;
+    _lastEmitTs = nowUtc;
+
+    if (kDebugMode) {
+      debugPrint(
+          '[TsbgEngine] emit reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue moved=${movedM.toStringAsFixed(1)}m rate=${rateS}s dist=${distM}m acc=${acc}m');
+    }
+
+    _locCtl.add(sample);
   }
 
-  bool _isNearAnyFence(double lat, double lng) {
-    // Small buffer around each circular fence radius for "near".
-    // You can make this configurable later if desired.
-    const marginM = 25;
-    for (final d in _defs) {
-      if (d.type == 'circle' && d.lat != null && d.lng != null && d.radiusM != null) {
-        final dist = _haversineMeters(lat, lng, d.lat!, d.lng!);
-        if (dist <= d.radiusM! + marginM) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  /// Haversine distance in meters
-  double _haversineMeters(double lat1, double lon1, double lat2, double lon2) {
-    const R = 6371000.0; // Earth radius (m)
+  double _haversineM(double lat1, double lon1, double lat2, double lon2) {
+    const R = 6371000.0; // Earth radius in meters
     final dLat = _deg2rad(lat2 - lat1);
     final dLon = _deg2rad(lon2 - lon1);
     final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
