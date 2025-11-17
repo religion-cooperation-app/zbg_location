@@ -69,6 +69,11 @@ class TsbgEngine {
     if (uid != null) httpParams['uid'] = uid;
     if (regionId != null) httpParams['regionId'] = regionId;
 
+    if (kDebugMode) {
+      debugPrint(
+          '[TsbgEngine] HTTP params at setConfig: uid=$uid regionId=$regionId httpParams=$httpParams');
+    }
+
     // One-time BG Geolocation init
     await fbg.BackgroundGeolocation.ready(
       fbg.Config(
@@ -79,19 +84,24 @@ class TsbgEngine {
         disableElasticity: true,
         // Keep idle relatively short so heartbeats are dependable.
         stopTimeout: 2,
-        reset: !_ready, // ✅ set here instead
+        reset: !_ready,
 
         // Native HTTP → Cloud Function (background-safe).
         url: _zbgIngestUrl,
         headers: const {
           'X-Api-Key': _zbgApiKey,
         },
+
+        // Sent with every request (query/body-level params)
         params: httpParams,
+
+        // Sent with each recorded location/geofence as `.extras`
         extras: httpParams,
+
         autoSync: true,
         batchSync: true,
         maxBatchSize: 50,
-         // NOTE: no httpRootProperty here; defaults to 'location'
+        // NOTE: no httpRootProperty here; defaults to 'location'
       ),
     );
 
@@ -214,8 +224,8 @@ class TsbgEngine {
       }
 
       // Use SDK timestamp for event time
-      final ts = DateTime.tryParse(e.location.timestamp)?.toUtc() ??
-          DateTime.now().toUtc();
+      final ts =
+          DateTime.tryParse(e.location.timestamp)?.toUtc() ?? DateTime.now().toUtc();
 
       // Emit to app (API: fenceId, type, ts)
       _fenceCtl.add(GeofenceEvent(e.identifier, t, ts));
