@@ -1,7 +1,8 @@
 // zbg_location/lib/tsbg_engine.dart
 // DROP-IN REPLACEMENT — applies hybrid significant-change rule,
 // per-mode distance filters, SDK timestamps, and dwell alignment.
-// Updated to implement "whatever's first" emission rule (distance OR time).
+// Updated to implement "whatever's first" emission rule (distance OR time)
+// and native HTTP uploads to Cloud Function (zbgIngest).
 
 import 'dart:async';
 import 'dart:math' as math;
@@ -21,17 +22,6 @@ const String _zbgApiKey = 'religion-and-cooperation-key-123';
 class TsbgEngine {
   TsbgEngine();
 
-  // Identity for native HTTP uploads → Cloud Function.
-  String? _uid;
-  String? _regionId;
-
-  /// Called by app layer before setConfig/start to tag native HTTP uploads
-  /// with the signed-in user and active region.
-  void setIdentity({required String uid, required String regionId}) {
-    _uid = uid;
-    _regionId = regionId;
-  }
-
   /// Current effective runtime config (from Firestore via app layer).
   RuntimeConfig? _cfg;
 
@@ -45,13 +35,29 @@ class TsbgEngine {
   final _locCtl = StreamController<LocationSample>.broadcast();
   final _fenceCtl = StreamController<GeofenceEvent>.broadcast();
 
-  /// Dwell alignment
-  LocationSample? _lastSample;
-  DateTime? _lastEmitTs;
-  bool _started = false;
   bool _ready = false;
+  bool _started = false;
 
+  /// "Whatever's first" bookkeeping
+  DateTime? _lastEmitUtc;
+  double? _lastEmitLat;
+  double? _lastEmitLng;
+
+  // Identity for native HTTP uploads → Cloud Function.
+  String? _uid;
+  String? _regionId;
+
+  /// Called by app layer before setConfig/start to tag native HTTP uploads
+  /// with the signed-in user and active region.
+  void setIdentity({required String uid, required String regionId}) {
+    _uid = uid;
+    _regionId = regionId;
+  }
+
+  /// --------------------------------------------
   /// Public API
+  /// --------------------------------------------
+
   Future<void> setConfig(RuntimeConfig cfg) async {
     _cfg = cfg;
 
@@ -97,6 +103,30 @@ class TsbgEngine {
     await _applyMode(_mode);
   }
 
+  Future<void> addGeofences(List<GeofenceDef> defs) async {
+    _defs.addAll(defs);
+    for (final d in defs) {
+      // Only circles for now. Polygons could be added here in future.
+      if (d.type == 'circle' &&
+          d.lat != null &&
+          d.lng != null &&
+          d.radiusM != null) {
+        await fbg.BackgroundGeolocation.addGeofence(
+          fbg.Geofence(
+            identifier: d.ident,
+            latitude: d.lat!,
+            longitude: d.lng!,
+            radius: d.radiusM!,
+            notifyOnEntry: true,
+            notifyOnExit: true,
+            notifyOnDwell: true,
+            loiteringDelay: (_cfg?.dwellRequiredS ?? 60) * 1000,
+          ),
+        );
+      }
+    }
+  }
+
   Future<void> start() async {
     if (_started) return;
     await fbg.BackgroundGeolocation.start();
@@ -128,52 +158,17 @@ class TsbgEngine {
     // LOCATION — gate emission by "whatever's first"
     fbg.BackgroundGeolocation.onLocation((fbg.Location l) async {
       _maybeEmitFromFBGLocation(l, reason: 'location');
-    });
 
-    // MOTIONCHANGE — typically high-quality transition sample
-    fbg.BackgroundGeolocation.onMotionChange((fbg.Location l) async {
-      _maybeEmitFromFBGLocation(l, reason: 'motionchange');
-    });
-
-    // GEOFENCE — ENTER/DWELL/EXIT
-    fbg.BackgroundGeolocation.onGeofence((fbg.GeofenceEvent e) async {
-      final cfg = _cfg;
-      if (cfg == null || !cfg.enabled) return;
-
-      final type = e.action;
-      GeofenceEventType? t;
-      if (type == 'ENTER') {
-        t = GeofenceEventType.enter;
-      } else if (type == 'DWELL') {
-        t = GeofenceEventType.dwell;
-      } else if (type == 'EXIT') {
-        t = GeofenceEventType.exit;
+      // Optional: promote to NEAR when close to any fence (if not already inside).
+      final c = l.coords;
+      if (_mode != SamplingMode.inside) {
+        final near = _isNearAnyFence(c.latitude, c.longitude);
+        if (near && _mode != SamplingMode.near) {
+          await _applyMode(SamplingMode.near);
+        } else if (!near && _mode == SamplingMode.near) {
+          await _applyMode(SamplingMode.outside);
+        }
       }
-
-      if (t == null) return;
-
-      // Switch mode in response to fence transitions
-      if (t == GeofenceEventType.enter || t == GeofenceEventType.dwell) {
-        await _applyMode(SamplingMode.inside);
-      } else if (t == GeofenceEventType.exit) {
-        await _applyMode(SamplingMode.outside);
-      }
-
-      // Use SDK timestamp for event time
-      final ts =
-          DateTime.tryParse(e.location.timestamp)?.toUtc() ?? DateTime.now().toUtc();
-
-      // Emit to app
-      _fenceCtl.add(
-        GeofenceEvent(
-          e.identifier,
-          t,
-          ts,
-          e.location.coords.latitude,
-          e.location.coords.longitude,
-          e.location.coords.accuracy ?? 9999.0,
-        ),
-      );
     });
 
     // HEARTBEAT — ensures timed emission even when stationary
@@ -192,15 +187,47 @@ class TsbgEngine {
       }
       _maybeEmitFromFBGLocation(loc, reason: 'heartbeat');
     });
+
+    // GEOFENCE
+    fbg.BackgroundGeolocation.onGeofence((fbg.GeofenceEvent e) async {
+      final GeofenceEventType t;
+      switch (e.action) {
+        case 'ENTER':
+          t = GeofenceEventType.enter;
+          break;
+        case 'DWELL':
+          t = GeofenceEventType.dwell;
+          break;
+        case 'EXIT':
+          t = GeofenceEventType.exit;
+          break;
+        default:
+          t = GeofenceEventType.enter;
+      }
+
+      // Switch mode in response to fence transitions
+      if (t == GeofenceEventType.enter || t == GeofenceEventType.dwell) {
+        await _applyMode(SamplingMode.inside);
+      } else if (t == GeofenceEventType.exit) {
+        await _applyMode(SamplingMode.outside);
+      }
+
+      // Use SDK timestamp for event time
+      final ts = DateTime.tryParse(e.location.timestamp)?.toUtc() ??
+          DateTime.now().toUtc();
+
+      // Emit to app (API: fenceId, type, ts)
+      _fenceCtl.add(GeofenceEvent(e.identifier, t, ts));
+    });
   }
 
   Future<void> _applyMode(SamplingMode mode) async {
     final cfg = _cfg;
     if (cfg == null) return;
 
-    bool useSigChange = false;
     int heartbeatS;
     int distanceM;
+    bool useSigChange;
 
     switch (mode) {
       case SamplingMode.inside:
@@ -214,12 +241,8 @@ class TsbgEngine {
         distanceM = cfg.distanceFilterNearM;
         break;
       case SamplingMode.outside:
-        // Outside uses hybrid: significant-change OR time-based heartbeats,
-        // depending on your threshold.
-        final allowSigChange =
-            cfg.useSignificantChangeWhenOutside &&
-                (cfg.rateOutsideS >= cfg.significantChangeOutsideThresholdS);
-
+        final allowSigChange = cfg.useSignificantChangeWhenOutside &&
+            (cfg.rateOutsideS >= cfg.significantChangeOutsideThresholdS);
         useSigChange = allowSigChange;
         heartbeatS = cfg.rateOutsideS;
         distanceM = cfg.distanceFilterOutsideM;
@@ -260,67 +283,76 @@ class TsbgEngine {
     if (acc > cfg.accuracyDropM) return;
 
     // Mode-specific thresholds
-    final int rateS = () {
-      switch (_mode) {
-        case SamplingMode.inside:
-          return cfg.rateInsideS;
-        case SamplingMode.near:
-          return cfg.rateNearS;
-        case SamplingMode.outside:
-          return cfg.rateOutsideS;
-      }
-    }();
+    final int rateS;
+    final int distM;
+    switch (_mode) {
+      case SamplingMode.inside:
+        rateS = cfg.rateInsideS;
+        distM = cfg.distanceFilterInsideM;
+        break;
+      case SamplingMode.near:
+        rateS = cfg.rateNearS;
+        distM = cfg.distanceFilterNearM;
+        break;
+      case SamplingMode.outside:
+        rateS = cfg.rateOutsideS;
+        distM = cfg.distanceFilterOutsideM;
+        break;
+    }
 
-    final int distM = () {
-      switch (_mode) {
-        case SamplingMode.inside:
-          return cfg.distanceFilterInsideM;
-        case SamplingMode.near:
-          return cfg.distanceFilterNearM;
-        case SamplingMode.outside:
-          return cfg.distanceFilterOutsideM;
-      }
-    }();
+    final lastLat = _lastEmitLat;
+    final lastLng = _lastEmitLng;
+    final lastTs = _lastEmitUtc;
 
-    final last = _lastSample;
-    final lastTs = _lastEmitTs ?? nowUtc;
+    final bool timeDue = (lastTs == null)
+        ? true
+        : nowUtc.difference(lastTs).inSeconds >= rateS;
 
-    // Distance since last emitted sample
-    final double movedM = (last == null)
+    final double movedM = (lastLat == null || lastLng == null)
         ? double.infinity
-        : _haversineM(last.lat, last.lng, lat, lng);
+        : _haversineM(lastLat, lastLng, lat, lng);
 
-    // Time since last emitted sample
-    final dtS = nowUtc.difference(lastTs).inSeconds;
+    final bool distDue =
+        (lastLat == null || lastLng == null) ? true : movedM >= distM;
 
-    final bool distDue = movedM >= distM;
-    final bool timeDue = dtS >= rateS;
+    if (timeDue || distDue) {
+      // Emit a sample to app layer (positional ctor: lat, lng, acc, ts)
+      _locCtl.add(LocationSample(
+        lat,
+        lng,
+        acc,
+        nowUtc,
+      ));
 
-    if (!distDue && !timeDue && last != null) {
+      // Reset the emission reference
+      _lastEmitUtc = nowUtc;
+      _lastEmitLat = lat;
+      _lastEmitLng = lng;
+
       if (kDebugMode) {
         debugPrint(
-            '[TsbgEngine] skip reason=$reason mode=$_mode moved=${movedM.toStringAsFixed(1)}m<${distM}m dt=${dtS}s<${rateS}s');
+            '[TsbgEngine] emit reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue moved=${movedM.toStringAsFixed(1)}m rate=${rateS}s dist=${distM}m acc=${acc}m');
       }
-      return;
+    } else {
+      if (kDebugMode) {
+        debugPrint(
+            '[TsbgEngine] skip reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue');
+      }
     }
+  }
 
-    final sample = LocationSample(
-      ts: nowUtc,
-      lat: lat,
-      lng: lng,
-      accuracyM: acc,
-      mode: _mode,
-      reason: reason,
-    );
-    _lastSample = sample;
-    _lastEmitTs = nowUtc;
-
-    if (kDebugMode) {
-      debugPrint(
-          '[TsbgEngine] emit reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue moved=${movedM.toStringAsFixed(1)}m rate=${rateS}s dist=${distM}m acc=${acc}m');
+  bool _isNearAnyFence(double lat, double lng) {
+    // Simple radial check against all circle geofences with a fixed NEAR radius
+    const nearRadiusM = 150.0; // can be tuned or moved into RuntimeConfig
+    for (final d in _defs) {
+      if (d.type != 'circle' ||
+          d.lat == null ||
+          d.lng == null ||
+          d.radiusM == null) continue;
+      final dist = _haversineM(lat, lng, d.lat!, d.lng!);
+      if (dist <= d.radiusM! + nearRadiusM) return true;
     }
-
-    _locCtl.add(sample);
+    return false;
   }
 
   double _haversineM(double lat1, double lon1, double lat2, double lon2) {
