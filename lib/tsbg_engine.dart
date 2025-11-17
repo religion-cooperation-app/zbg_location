@@ -87,10 +87,11 @@ class TsbgEngine {
           'X-Api-Key': _zbgApiKey,
         },
         params: httpParams,
+        extras: httpParams,
         autoSync: true,
         batchSync: true,
         maxBatchSize: 50,
-        httpRootProperty: '.', // zbgIngest expects root location / geofence objects
+         // NOTE: no httpRootProperty here; defaults to 'location'
       ),
     );
 
