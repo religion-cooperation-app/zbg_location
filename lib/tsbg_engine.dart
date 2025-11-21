@@ -282,10 +282,16 @@ class TsbgEngine {
     final cfg = _cfg;
     if (cfg == null || !cfg.enabled) return;
 
-    final nowUtc =
+    // SDK timestamp for the sample itself.
+    final DateTime locTsUtc =
         DateTime.tryParse(l.timestamp)?.toUtc() ?? DateTime.now().toUtc();
-    final c = l.coords;
 
+    // For HEARTBEAT, use wall-clock time for the time gate so we don't get "stuck"
+    // on a stale SDK timestamp. For LOCATION, use the location timestamp as before.
+    final DateTime gateNowUtc =
+        (reason == 'heartbeat') ? DateTime.now().toUtc() : locTsUtc;
+
+    final c = l.coords;
     final double lat = c.latitude;
     final double lng = c.longitude;
     final double acc = (c.accuracy ?? 9999.0);
@@ -315,16 +321,24 @@ class TsbgEngine {
     final lastLng = _lastEmitLng;
     final lastTs = _lastEmitUtc;
 
-    final bool timeDue = (lastTs == null)
-        ? true
-        : nowUtc.difference(lastTs).inSeconds >= rateS;
+    final int? dtS =
+        (lastTs == null) ? null : gateNowUtc.difference(lastTs).inSeconds;
+
+    final bool timeDue = (lastTs == null) ? true : (dtS! >= rateS);
 
     final double movedM = (lastLat == null || lastLng == null)
         ? double.infinity
         : _haversineM(lastLat, lastLng, lat, lng);
 
-    final bool distDue =
-        (lastLat == null || lastLng == null) ? true : movedM >= distM;
+    bool distDue;
+    if (lastLat == null || lastLng == null) {
+      distDue = true;
+    } else if (reason == 'heartbeat') {
+      // 💡 For heartbeats, relax distance gating so that time-alone can trigger emits.
+      distDue = true;
+    } else {
+      distDue = movedM >= distM;
+    }
 
     if (timeDue || distDue) {
       // Emit a sample to app layer (positional ctor: lat, lng, acc, ts)
@@ -332,22 +346,34 @@ class TsbgEngine {
         lat,
         lng,
         acc,
-        nowUtc,
+        locTsUtc, // keep the actual location timestamp in the sample
       ));
 
-      // Reset the emission reference
-      _lastEmitUtc = nowUtc;
+      // Reset the emission reference using the gate time.
+      _lastEmitUtc = gateNowUtc;
       _lastEmitLat = lat;
       _lastEmitLng = lng;
 
       if (kDebugMode) {
+        final movedStr =
+            movedM.isInfinite ? 'Inf' : movedM.toStringAsFixed(1);
         debugPrint(
-            '[TsbgEngine] emit reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue moved=${movedM.toStringAsFixed(1)}m rate=${rateS}s dist=${distM}m acc=${acc}m');
+            '[TsbgEngine] emit reason=$reason mode=$_mode '
+            'locTs=$locTsUtc gateNow=$gateNowUtc '
+            'timeDue=$timeDue distDue=$distDue '
+            'dt=${dtS?.toString() ?? 'null'}s '
+            'moved=${movedStr}m rate=${rateS}s dist=${distM}m acc=${acc}m');
       }
     } else {
       if (kDebugMode) {
+        final movedStr =
+            movedM.isInfinite ? 'Inf' : movedM.toStringAsFixed(1);
         debugPrint(
-            '[TsbgEngine] skip reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue');
+            '[TsbgEngine] skip reason=$reason mode=$_mode '
+            'locTs=$locTsUtc gateNow=$gateNowUtc '
+            'timeDue=$timeDue distDue=$distDue '
+            'dt=${dtS?.toString() ?? 'null'}s '
+            'moved=${movedStr}m rate=${rateS}s dist=${distM}m acc=${acc}m');
       }
     }
   }
