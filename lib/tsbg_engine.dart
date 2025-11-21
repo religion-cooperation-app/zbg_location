@@ -99,7 +99,7 @@ class TsbgEngine {
         extras: httpParams,
 
         autoSync: true,
-        batchSync: true,
+        batchSync: false,
         maxBatchSize: 50,
         // NOTE: no httpRootProperty here; defaults to 'location'
       ),
