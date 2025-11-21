@@ -78,7 +78,7 @@ class TsbgEngine {
     await fbg.BackgroundGeolocation.ready(
       fbg.Config(
         startOnBoot: cfg.startOnBoot,
-        stopOnTerminate: cfg.stopOn_terminate,
+        stopOnTerminate: cfg.stopOnTerminate, // ✅ fixed name
         debug: false,
         desiredAccuracy: fbg.Config.DESIRED_ACCURACY_HIGH,
         disableElasticity: true,
@@ -379,7 +379,7 @@ class TsbgEngine {
   double _haversineM(double lat1, double lon1, double lat2, double lon2) {
     const R = 6371000.0; // Earth radius in meters
     final dLat = _deg2rad(lat2 - lat1);
-    final dLon = _deg2rad(lat2 - lon1);
+    final dLon = _deg2rad(lon2 - lon1); // ✅ fixed
     final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
         math.cos(_deg2rad(lat1)) *
             math.cos(_deg2rad(lat2)) *
