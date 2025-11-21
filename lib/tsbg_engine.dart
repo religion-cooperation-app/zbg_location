@@ -38,7 +38,7 @@ class TsbgEngine {
   bool _ready = false;
   bool _started = false;
 
-  /// "Whatever's first" bookkeeping
+  /// "Whatever's first" bookkeeping (what we last EMITTED).
   DateTime? _lastEmitUtc;
   double? _lastEmitLat;
   double? _lastEmitLng;
@@ -78,7 +78,7 @@ class TsbgEngine {
     await fbg.BackgroundGeolocation.ready(
       fbg.Config(
         startOnBoot: cfg.startOnBoot,
-        stopOnTerminate: cfg.stopOnTerminate,
+        stopOnTerminate: cfg.stopOn_terminate,
         debug: false,
         desiredAccuracy: fbg.Config.DESIRED_ACCURACY_HIGH,
         disableElasticity: true,
@@ -182,15 +182,17 @@ class TsbgEngine {
       }
     });
 
-    // HEARTBEAT — ensures timed emission even when stationary
+    // HEARTBEAT — ensures timed emission even when SDK is idle.
     fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent e) async {
       // Prefer last known location from SDK; fall back to a lightweight fetch.
       fbg.Location? loc = e.location;
       if (loc == null) {
         try {
+          // IMPORTANT: persist = true so the plugin stores & uploads this fix
+          // via native HTTP → zbgIngest.
           loc = await fbg.BackgroundGeolocation.getCurrentPosition(
             samples: 1,
-            persist: false,
+            persist: true,
           );
         } catch (_) {
           return;
@@ -223,9 +225,9 @@ class TsbgEngine {
         await _applyMode(SamplingMode.outside);
       }
 
-      // Use SDK timestamp for event time
-      final ts =
-          DateTime.tryParse(e.location.timestamp)?.toUtc() ?? DateTime.now().toUtc();
+      // Use SDK timestamp for event time (fallback to now if missing)
+      final ts = DateTime.tryParse(e.location.timestamp)?.toUtc() ??
+          DateTime.now().toUtc();
 
       // Emit to app (API: fenceId, type, ts)
       _fenceCtl.add(GeofenceEvent(e.identifier, t, ts));
@@ -265,7 +267,7 @@ class TsbgEngine {
         useSignificantChangesOnly: useSigChange,
         distanceFilter: distanceM.toDouble(),
         heartbeatInterval:
-            _hbMinutesFromSeconds(heartbeatS), // <- convert seconds -> minutes
+            _hbMinutesFromSeconds(heartbeatS), // seconds -> minutes
       ),
     );
 
@@ -278,20 +280,22 @@ class TsbgEngine {
   }
 
   /// Central gate for "whatever's first" (distance OR time) emission.
-  void _maybeEmitFromFBGLocation(fbg.Location l, {required String reason}) {
+  void _maybeEmitFromFBGLocation(
+    fbg.Location l, {
+    required String reason,
+  }) {
     final cfg = _cfg;
     if (cfg == null || !cfg.enabled) return;
 
-    // SDK timestamp for the sample itself.
-    final DateTime locTsUtc =
-        DateTime.tryParse(l.timestamp)?.toUtc() ?? DateTime.now().toUtc();
+    // Real wall-clock time for RATE gating.
+    final nowUtc = DateTime.now().toUtc();
 
-    // For HEARTBEAT, use wall-clock time for the time gate so we don't get "stuck"
-    // on a stale SDK timestamp. For LOCATION, use the location timestamp as before.
-    final DateTime gateNowUtc =
-        (reason == 'heartbeat') ? DateTime.now().toUtc() : locTsUtc;
+    // SDK timestamp (may be stale); we still record it as the sample's ts if present.
+    final fixTs = DateTime.tryParse(l.timestamp)?.toUtc();
+    final effectiveTs = fixTs ?? nowUtc;
 
     final c = l.coords;
+
     final double lat = c.latitude;
     final double lng = c.longitude;
     final double acc = (c.accuracy ?? 9999.0);
@@ -321,59 +325,39 @@ class TsbgEngine {
     final lastLng = _lastEmitLng;
     final lastTs = _lastEmitUtc;
 
-    final int? dtS =
-        (lastTs == null) ? null : gateNowUtc.difference(lastTs).inSeconds;
-
-    final bool timeDue = (lastTs == null) ? true : (dtS! >= rateS);
+    // TIME gate uses real elapsed time, not the SDK timestamp.
+    final bool timeDue = (lastTs == null)
+        ? true
+        : nowUtc.difference(lastTs).inSeconds >= rateS;
 
     final double movedM = (lastLat == null || lastLng == null)
         ? double.infinity
         : _haversineM(lastLat, lastLng, lat, lng);
 
-    bool distDue;
-    if (lastLat == null || lastLng == null) {
-      distDue = true;
-    } else if (reason == 'heartbeat') {
-      // 💡 For heartbeats, relax distance gating so that time-alone can trigger emits.
-      distDue = true;
-    } else {
-      distDue = movedM >= distM;
-    }
+    final bool distDue =
+        (lastLat == null || lastLng == null) ? true : movedM >= distM;
 
+    // "Whatever's first": emit if either gate is satisfied.
     if (timeDue || distDue) {
-      // Emit a sample to app layer (positional ctor: lat, lng, acc, ts)
       _locCtl.add(LocationSample(
         lat,
         lng,
         acc,
-        locTsUtc, // keep the actual location timestamp in the sample
+        effectiveTs,
       ));
 
-      // Reset the emission reference using the gate time.
-      _lastEmitUtc = gateNowUtc;
+      _lastEmitUtc = nowUtc;
       _lastEmitLat = lat;
       _lastEmitLng = lng;
 
       if (kDebugMode) {
-        final movedStr =
-            movedM.isInfinite ? 'Inf' : movedM.toStringAsFixed(1);
         debugPrint(
-            '[TsbgEngine] emit reason=$reason mode=$_mode '
-            'locTs=$locTsUtc gateNow=$gateNowUtc '
-            'timeDue=$timeDue distDue=$distDue '
-            'dt=${dtS?.toString() ?? 'null'}s '
-            'moved=${movedStr}m rate=${rateS}s dist=${distM}m acc=${acc}m');
+            '[TsbgEngine] emit reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue moved=${movedM.toStringAsFixed(1)}m rate=${rateS}s dist=${distM}m acc=${acc}m ts=$effectiveTs');
       }
     } else {
       if (kDebugMode) {
-        final movedStr =
-            movedM.isInfinite ? 'Inf' : movedM.toStringAsFixed(1);
         debugPrint(
-            '[TsbgEngine] skip reason=$reason mode=$_mode '
-            'locTs=$locTsUtc gateNow=$gateNowUtc '
-            'timeDue=$timeDue distDue=$distDue '
-            'dt=${dtS?.toString() ?? 'null'}s '
-            'moved=${movedStr}m rate=${rateS}s dist=${distM}m acc=${acc}m');
+            '[TsbgEngine] skip reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue');
       }
     }
   }
@@ -395,7 +379,7 @@ class TsbgEngine {
   double _haversineM(double lat1, double lon1, double lat2, double lon2) {
     const R = 6371000.0; // Earth radius in meters
     final dLat = _deg2rad(lat2 - lat1);
-    final dLon = _deg2rad(lon2 - lon1);
+    final dLon = _deg2rad(lat2 - lon1);
     final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
         math.cos(_deg2rad(lat1)) *
             math.cos(_deg2rad(lat2)) *
