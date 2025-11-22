@@ -86,6 +86,10 @@ class TsbgEngine {
         stopTimeout: 2,
         reset: !_ready,
 
+        // **NEW** – keep a foreground service so Android is more willing
+        // to deliver frequent updates, especially screen-off.
+        foregroundService: true,
+
         // Native HTTP → Cloud Function (background-safe).
         url: _zbgIngestUrl,
         headers: const {
@@ -239,17 +243,20 @@ class TsbgEngine {
     int heartbeatS;
     int distanceM;
     bool useSigChange;
+    int? locationUpdateMs; // NEW: per-mode locationUpdateInterval
 
     switch (mode) {
       case SamplingMode.inside:
         useSigChange = false;
         heartbeatS = cfg.rateInsideS;
         distanceM = cfg.distanceFilterInsideM;
+        locationUpdateMs = null; // rely on distanceFilter + heartbeats
         break;
       case SamplingMode.near:
         useSigChange = false;
         heartbeatS = cfg.rateNearS;
         distanceM = cfg.distanceFilterNearM;
+        locationUpdateMs = null; // same here
         break;
       case SamplingMode.outside:
         final allowSigChange = cfg.useSignificantChangeWhenOutside &&
@@ -257,6 +264,10 @@ class TsbgEngine {
         useSigChange = allowSigChange;
         heartbeatS = cfg.rateOutsideS;
         distanceM = cfg.distanceFilterOutsideM;
+
+        // NEW: when you're "outside", ask the plugin for more frequent updates
+        // tied to your configured rate (in seconds).
+        locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
         break;
     }
 
@@ -265,13 +276,15 @@ class TsbgEngine {
         useSignificantChangesOnly: useSigChange,
         distanceFilter: distanceM.toDouble(),
         heartbeatInterval:
-            _hbMinutesFromSeconds(heartbeatS), // <- convert seconds -> minutes
+            _hbMinutesFromSeconds(heartbeatS), // seconds -> minutes (Android)
+        locationUpdateInterval:
+            locationUpdateMs, // can be null in inside/near; active in outside
       ),
     );
 
     if (kDebugMode) {
       debugPrint(
-          '[TsbgEngine] applyMode=$mode sc=$useSigChange hb=${heartbeatS}s df=${distanceM}m');
+          '[TsbgEngine] applyMode=$mode sc=$useSigChange hb=${heartbeatS}s df=${distanceM}m locUpdateMs=$locationUpdateMs');
     }
 
     _mode = mode;
