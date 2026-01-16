@@ -1,6 +1,6 @@
 name: zbg_location
 description: Reusable geolocation engine for FlutterFlow (FBG adapter).
-version: 0.1.0
+version: 0.1.1
 publish_to: "none"
 homepage:
 
@@ -13,7 +13,7 @@ dependencies:
   flutter:
     sdk: flutter
   # Transistorsoft Background Geolocation (works in DEBUG without a license)
-  flutter_background_geolocation: ^4.13.0
+  flutter_background_geolocation: ^5.0.1
   # Handy collection helpers (optional, but useful)
   collection: ^1.18.0
 
