@@ -82,8 +82,8 @@ class TsbgEngine {
         debug: false,
         desiredAccuracy: fbg.Config.DESIRED_ACCURACY_HIGH,
         disableElasticity: true,
-        // Keep idle relatively short so heartbeats are dependable.
-        stopTimeout: 2,
+        // Configurable from Firestore — how long before FBG stops GPS after no motion.
+        stopTimeout: cfg.stopTimeoutMinutes,
         reset: !_ready,
 
         // **NEW** – keep a foreground service so Android is more willing
@@ -165,6 +165,26 @@ class TsbgEngine {
 
   SamplingMode get currentMode => _mode;
 
+  /// Update native HTTP extras with current zone context so zbgIngest
+  /// breadcrumbs carry correct zoneId and inside_zone fields.
+  /// Call this from the app layer whenever a geofence event fires.
+  Future<void> setZoneContext({
+    required String? zoneId,
+    required bool insideZone,
+  }) async {
+    final uid = _uid;
+    final regionId = _regionId;
+    final updatedExtras = <String, dynamic>{
+      if (uid != null) 'uid': uid,
+      if (regionId != null) 'regionId': regionId,
+      if (zoneId != null) 'zoneId': zoneId,
+      'inside_zone': insideZone,
+    };
+    await fbg.BackgroundGeolocation.setConfig(
+      fbg.Config(extras: updatedExtras),
+    );
+  }
+
   /// --------------------------------------------
   /// Internal wiring
   /// --------------------------------------------
@@ -194,7 +214,7 @@ class TsbgEngine {
         try {
           loc = await fbg.BackgroundGeolocation.getCurrentPosition(
             samples: 1,
-            persist: false,
+            persist: true,
           );
         } catch (_) {
           return;
@@ -250,13 +270,13 @@ class TsbgEngine {
         useSigChange = false;
         heartbeatS = cfg.rateInsideS;
         distanceM = cfg.distanceFilterInsideM;
-        locationUpdateMs = null; // rely on distanceFilter + heartbeats
+        locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
         break;
       case SamplingMode.near:
         useSigChange = false;
         heartbeatS = cfg.rateNearS;
         distanceM = cfg.distanceFilterNearM;
-        locationUpdateMs = null; // same here
+        locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
         break;
       case SamplingMode.outside:
         final allowSigChange = cfg.useSignificantChangeWhenOutside &&

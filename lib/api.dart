@@ -98,6 +98,10 @@ class RuntimeConfig {
   final int distanceFilterNearM;
   final int distanceFilterOutsideM;
 
+  /// Minutes before FBG stops GPS engine after no motion detected.
+  /// After this, heartbeat (persist:true) keeps breadcrumbs flowing.
+  final int stopTimeoutMinutes;
+
   /// Construct full runtime config
   const RuntimeConfig({
     required this.enabled,
@@ -110,6 +114,7 @@ class RuntimeConfig {
     required this.distanceFilterNearM,
     required this.distanceFilterOutsideM,
     required this.significantChangeOutsideThresholdS,
+    required this.stopTimeoutMinutes,
     this.startOnBoot = true,
     this.stopOnTerminate = false,
     this.useSignificantChangeWhenOutside = true,
@@ -134,6 +139,9 @@ class RuntimeConfig {
       // NEW hybrid threshold
       significantChangeOutsideThresholdS:
           m['significant_change_outside_threshold_s'] ?? 300,
+
+      // Stop timeout — how long before FBG stops GPS after no motion
+      stopTimeoutMinutes: m['stop_timeout_minutes'] ?? 60,
 
       // Existing flags
       startOnBoot: m['start_on_boot'] ?? true,
