@@ -165,6 +165,33 @@ class TsbgEngine {
 
   SamplingMode get currentMode => _mode;
 
+  /// Re-registers all geofences with the FBG plugin.
+  /// Call after an EXIT event to force Android's Geofencing API to re-arm
+  /// ENTER monitoring. Works around FBG's internal re-arming failure after
+  /// the DWELL → EXIT state transition.
+  Future<void> refreshGeofences() async {
+    await fbg.BackgroundGeolocation.removeGeofences();
+    for (final d in _defs) {
+      if (d.type == 'circle' &&
+          d.lat != null &&
+          d.lng != null &&
+          d.radiusM != null) {
+        await fbg.BackgroundGeolocation.addGeofence(
+          fbg.Geofence(
+            identifier: d.ident,
+            latitude: d.lat!,
+            longitude: d.lng!,
+            radius: d.radiusM!,
+            notifyOnEntry: true,
+            notifyOnExit: true,
+            notifyOnDwell: true,
+            loiteringDelay: (_cfg?.dwellRequiredS ?? 60) * 1000,
+          ),
+        );
+      }
+    }
+  }
+
   /// Update native HTTP extras with current zone context so zbgIngest
   /// breadcrumbs carry correct zoneId and inside_zone fields.
   /// Call this from the app layer whenever a geofence event fires.
@@ -240,19 +267,21 @@ class TsbgEngine {
           t = GeofenceEventType.enter;
       }
 
-      // Switch mode in response to fence transitions
+      // Use SDK timestamp for event time
+      final ts =
+          DateTime.tryParse(e.location.timestamp)?.toUtc() ?? DateTime.now().toUtc();
+
+      // Emit to app FIRST — before calling setConfig back into FBG native,
+      // so geo_bootstrap can update zone context while FBG callback is still clean.
+      _fenceCtl.add(GeofenceEvent(e.identifier, t, ts));
+
+      // Switch mode AFTER emitting, so _applyMode's setConfig() call does not
+      // re-enter FBG native while the geofence callback is still mid-execution.
       if (t == GeofenceEventType.enter || t == GeofenceEventType.dwell) {
         await _applyMode(SamplingMode.inside);
       } else if (t == GeofenceEventType.exit) {
         await _applyMode(SamplingMode.outside);
       }
-
-      // Use SDK timestamp for event time
-      final ts =
-          DateTime.tryParse(e.location.timestamp)?.toUtc() ?? DateTime.now().toUtc();
-
-      // Emit to app (API: fenceId, type, ts)
-      _fenceCtl.add(GeofenceEvent(e.identifier, t, ts));
     });
   }
 
