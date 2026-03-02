@@ -119,7 +119,14 @@ class TsbgEngine {
   }
 
   Future<void> addGeofences(List<GeofenceDef> defs) async {
-    _defs.addAll(defs);
+    _defs
+      ..clear()
+      ..addAll(defs);
+    // Clear any persisted FBG geofence state from previous sessions before
+    // re-registering. Without this, FBG's SQLite may still show a geofence as
+    // "inside" from an ENTER event that fired while Dart was dead, preventing
+    // a new ENTER from being delivered when the session restarts.
+    await fbg.BackgroundGeolocation.removeGeofences();
     for (final d in defs) {
       // Only circles for now. Polygons could be added here in future.
       if (d.type == 'circle' &&
