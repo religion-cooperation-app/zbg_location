@@ -102,6 +102,12 @@ class RuntimeConfig {
   /// After this, heartbeat (persist:true) keeps breadcrumbs flowing.
   final int stopTimeoutMinutes;
 
+  /// Native HTTP batch upload settings (transistorsoft batchSync).
+  /// When true, fixes are buffered in SQLite and sent in a single HTTP POST
+  /// when [maxBatchSize] fixes accumulate. Reduces HTTP request volume at scale.
+  final bool batchSync;
+  final int maxBatchSize;
+
   /// Construct full runtime config
   const RuntimeConfig({
     required this.enabled,
@@ -118,6 +124,8 @@ class RuntimeConfig {
     this.startOnBoot = true,
     this.stopOnTerminate = false,
     this.useSignificantChangeWhenOutside = true,
+    this.batchSync = true,
+    this.maxBatchSize = 8,
   });
 
   /// Factory loader from Firestore or JSON blob
@@ -148,6 +156,10 @@ class RuntimeConfig {
       stopOnTerminate: m['stop_on_terminate'] ?? false,
       useSignificantChangeWhenOutside:
           m['use_significant_change_outside'] ?? true,
+
+      // Batch upload settings
+      batchSync: m['batch_sync'] ?? true,
+      maxBatchSize: m['max_batch_size'] ?? 8,
     );
   }
 }

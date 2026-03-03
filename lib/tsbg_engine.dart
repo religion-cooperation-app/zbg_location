@@ -38,6 +38,8 @@ class TsbgEngine {
   bool _ready = false;
   bool _started = false;
 
+  Timer? _exitHysteresisTimer;
+
   /// "Whatever's first" bookkeeping
   DateTime? _lastEmitUtc;
   double? _lastEmitLat;
@@ -103,8 +105,8 @@ class TsbgEngine {
         extras: httpParams,
 
         autoSync: true,
-        batchSync: false,
-        maxBatchSize: 50,
+        batchSync: cfg.batchSync,
+        maxBatchSize: cfg.maxBatchSize,
         // NOTE: no httpRootProperty here; defaults to 'location'
       ),
     );
@@ -157,6 +159,8 @@ class TsbgEngine {
 
   Future<void> stop() async {
     if (!_started) return;
+    _exitHysteresisTimer?.cancel();
+    _exitHysteresisTimer = null;
     await fbg.BackgroundGeolocation.stop();
     _started = false;
   }
@@ -285,9 +289,19 @@ class TsbgEngine {
       // Switch mode AFTER emitting, so _applyMode's setConfig() call does not
       // re-enter FBG native while the geofence callback is still mid-execution.
       if (t == GeofenceEventType.enter || t == GeofenceEventType.dwell) {
+        // Cancel any pending exit — device is still inside the geofence.
+        _exitHysteresisTimer?.cancel();
+        _exitHysteresisTimer = null;
         await _applyMode(SamplingMode.inside);
       } else if (t == GeofenceEventType.exit) {
-        await _applyMode(SamplingMode.outside);
+        // Delay the outside-mode switch by 2 minutes. GPS jitter can fire a
+        // spurious EXIT while the device is physically still inside the fence;
+        // if a new ENTER arrives before the timer fires we stay in inside mode.
+        _exitHysteresisTimer?.cancel();
+        _exitHysteresisTimer = Timer(const Duration(minutes: 2), () {
+          _applyMode(SamplingMode.outside);
+          _exitHysteresisTimer = null;
+        });
       }
     });
   }
