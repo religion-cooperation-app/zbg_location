@@ -88,9 +88,16 @@ class TsbgEngine {
         stopTimeout: cfg.stopTimeoutMinutes,
         reset: !_ready,
 
-        // **NEW** – keep a foreground service so Android is more willing
-        // to deliver frequent updates, especially screen-off.
+        // Keep a foreground service so Android is more willing to deliver
+        // frequent updates, especially screen-off.
         foregroundService: true,
+
+        // iOS: prevent CoreLocation from pausing updates on stationary devices.
+        pausesLocationUpdatesAutomatically: false,
+
+        // Prevent FBG's own motion-based stop detection from killing GPS when
+        // the device is stationary (e.g. participant sitting in a study room).
+        disableStopDetection: true,
 
         // Native HTTP → Cloud Function (background-safe).
         url: _zbgIngestUrl,
