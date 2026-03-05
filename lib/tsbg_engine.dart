@@ -99,6 +99,16 @@ class TsbgEngine {
         // the device is stationary (e.g. participant sitting in a study room).
         disableStopDetection: true,
 
+        // iOS: periodically invalidate/recreate CLLocationManager via the
+        // background task API to prevent iOS from suspending the process
+        // between GPS wakeups. Closes most remaining background data gaps.
+        preventSuspend: true,
+
+        // iOS: declare walking/non-automotive movement so CoreLocation applies
+        // less aggressive power management in background. FBG silently ignores
+        // this on Android — no platform guard needed.
+        activityType: fbg.Config.ACTIVITY_TYPE_OTHER_NAVIGATION,
+
         // Native HTTP → Cloud Function (background-safe).
         url: _zbgIngestUrl,
         headers: const {
@@ -170,6 +180,14 @@ class TsbgEngine {
     _exitHysteresisTimer = null;
     await fbg.BackgroundGeolocation.stop();
     _started = false;
+  }
+
+  /// Flush any locations accumulated in FBG's SQLite buffer (e.g. from
+  /// terminated-state significant-change wakeups) by forcing an immediate
+  /// sync POST to zbgingest. Safe to call before start() — no-ops if not ready.
+  Future<void> flushBuffer() async {
+    if (!_ready) return;
+    await fbg.BackgroundGeolocation.sync();
   }
 
   /// Expose streams
