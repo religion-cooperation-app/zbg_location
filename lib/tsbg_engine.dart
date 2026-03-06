@@ -126,6 +126,15 @@ class TsbgEngine {
         maxBatchSize: cfg.maxBatchSize,
         // NOTE: no httpRootProperty here; defaults to 'location'
 
+        // Keep unsynced SQLite records for 30 days so locations accumulated
+        // during extended offline periods are still recoverable on next open.
+        maxDaysToPersist: 30,
+
+        // 25s timeout fits within iOS SLC / background-fetch wakeup windows
+        // (~30s), giving FBG the best chance of completing a POST before iOS
+        // reclaims the process. Default of 60s exceeds the wakeup window.
+        httpTimeout: 25000,
+
         // Suppress heads-up banner and status bar icon on Android.
         // The notification still appears in the shade (OS requirement for
         // foreground services) but is otherwise invisible during normal use.
