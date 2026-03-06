@@ -139,8 +139,8 @@ class TsbgEngine {
         // The notification still appears in the shade (OS requirement for
         // foreground services) but is otherwise invisible during normal use.
         notification: fbg.Notification(
-          title: 'UConn Research Study',
-          text: 'Location study active',
+          title: 'Location Detection',
+          text: 'SPARRC is tracking device location changes',
           priority: fbg.NotificationPriority.min,
           sticky: false,
         ),
