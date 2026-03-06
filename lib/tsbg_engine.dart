@@ -141,7 +141,7 @@ class TsbgEngine {
         notification: fbg.Notification(
           title: 'UConn Research Study',
           text: 'Location study active',
-          priority: fbg.Config.NOTIFICATION_PRIORITY_MIN,
+          priority: fbg.NotificationPriority.min,
           sticky: false,
         ),
       ),
