@@ -125,6 +125,16 @@ class TsbgEngine {
         batchSync: cfg.batchSync,
         maxBatchSize: cfg.maxBatchSize,
         // NOTE: no httpRootProperty here; defaults to 'location'
+
+        // Suppress heads-up banner and status bar icon on Android.
+        // The notification still appears in the shade (OS requirement for
+        // foreground services) but is otherwise invisible during normal use.
+        notification: fbg.Notification(
+          title: 'UConn Research Study',
+          text: 'Location study active',
+          priority: fbg.Config.NOTIFICATION_PRIORITY_MIN,
+          sticky: false,
+        ),
       ),
     );
 
