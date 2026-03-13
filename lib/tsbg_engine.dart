@@ -507,12 +507,12 @@ class TsbgEngine {
 
     // Dwell milestone check — runs on every heartbeat/location callback.
     // Emits a synthetic DWELL event at each dwell_every_s boundary while inside.
-    final cfg = _cfg;
+    final dwellCfg = _cfg;
     final enteredAt = _enteredAt;
     final enteredFenceId = _enteredFenceId;
-    if (cfg != null && cfg.dwellEveryS > 0 && enteredAt != null && enteredFenceId != null) {
+    if (dwellCfg != null && dwellCfg.dwellEveryS > 0 && enteredAt != null && enteredFenceId != null) {
       final elapsedS = nowUtc.difference(enteredAt).inSeconds;
-      final milestone = (elapsedS ~/ cfg.dwellEveryS) * cfg.dwellEveryS;
+      final milestone = (elapsedS ~/ dwellCfg.dwellEveryS) * dwellCfg.dwellEveryS;
       if (milestone > 0 && !_firedMilestones.contains(milestone)) {
         _firedMilestones.add(milestone);
         _fenceCtl.add(GeofenceEvent(
