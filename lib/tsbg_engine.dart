@@ -40,6 +40,11 @@ class TsbgEngine {
 
   Timer? _exitHysteresisTimer;
 
+  /// Dwell milestone tracking
+  DateTime? _enteredAt;
+  String? _enteredFenceId;
+  final Set<int> _firedMilestones = {};
+
   /// "Whatever's first" bookkeeping
   DateTime? _lastEmitUtc;
   double? _lastEmitLat;
@@ -326,9 +331,31 @@ class TsbgEngine {
       final ts =
           DateTime.tryParse(e.location.timestamp)?.toUtc() ?? DateTime.now().toUtc();
 
+      // Dwell tracking state machine
+      int? dwellSeconds;
+      if (t == GeofenceEventType.enter) {
+        _enteredAt = ts;
+        _enteredFenceId = e.identifier;
+        _firedMilestones.clear();
+      } else if (t == GeofenceEventType.dwell) {
+        // Initial FBG dwell: record the configured threshold as dwell_seconds
+        final cfg = _cfg;
+        dwellSeconds = cfg?.dwellRequiredS;
+        if (dwellSeconds != null) _firedMilestones.add(dwellSeconds);
+      } else if (t == GeofenceEventType.exit) {
+        // Record total time inside since ENTER
+        final enteredAt = _enteredAt;
+        if (enteredAt != null) {
+          dwellSeconds = ts.difference(enteredAt).inSeconds;
+        }
+        _enteredAt = null;
+        _enteredFenceId = null;
+        _firedMilestones.clear();
+      }
+
       // Emit to app FIRST — before calling setConfig back into FBG native,
       // so geo_bootstrap can update zone context while FBG callback is still clean.
-      _fenceCtl.add(GeofenceEvent(e.identifier, t, ts));
+      _fenceCtl.add(GeofenceEvent(e.identifier, t, ts, dwellSeconds: dwellSeconds));
 
       // Switch mode AFTER emitting, so _applyMode's setConfig() call does not
       // re-enter FBG native while the geofence callback is still mid-execution.
@@ -475,6 +502,28 @@ class TsbgEngine {
       if (kDebugMode) {
         debugPrint(
             '[TsbgEngine] skip reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue');
+      }
+    }
+
+    // Dwell milestone check — runs on every heartbeat/location callback.
+    // Emits a synthetic DWELL event at each dwell_every_s boundary while inside.
+    final cfg = _cfg;
+    final enteredAt = _enteredAt;
+    final enteredFenceId = _enteredFenceId;
+    if (cfg != null && cfg.dwellEveryS > 0 && enteredAt != null && enteredFenceId != null) {
+      final elapsedS = nowUtc.difference(enteredAt).inSeconds;
+      final milestone = (elapsedS ~/ cfg.dwellEveryS) * cfg.dwellEveryS;
+      if (milestone > 0 && !_firedMilestones.contains(milestone)) {
+        _firedMilestones.add(milestone);
+        _fenceCtl.add(GeofenceEvent(
+          enteredFenceId,
+          GeofenceEventType.dwell,
+          nowUtc,
+          dwellSeconds: milestone,
+        ));
+        if (kDebugMode) {
+          debugPrint('[TsbgEngine] dwell milestone fired: ${milestone}s for fence $enteredFenceId');
+        }
       }
     }
   }

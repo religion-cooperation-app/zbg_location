@@ -93,6 +93,7 @@ class FirestoreWriter {
     required String event,   // 'ENTER' | 'DWELL' | 'EXIT'
     required String tsIso,
     String? zoneId,
+    int? dwellSeconds,       // seconds dwelled; set on DWELL and EXIT events
     Map<String, dynamic>? extra,
     String? fixedId,
   }) async {
@@ -102,6 +103,7 @@ class FirestoreWriter {
       event: event,
       tsIso: tsIso,
       zoneId: zoneId,
+      dwellSeconds: dwellSeconds,
       extra: extra,
     );
     return await writeFn(config.geofenceEventsCol, doc, fixedId: fixedId);
@@ -144,6 +146,7 @@ class FirestoreWriter {
     required String event,
     required String tsIso,
     String? zoneId,
+    int? dwellSeconds,
     Map<String, dynamic>? extra,
   }) {
     final m = <String, dynamic>{
@@ -153,6 +156,7 @@ class FirestoreWriter {
       'ts_iso': tsIso,
     };
     if (zoneId != null) m['zoneId'] = zoneId;
+    if (dwellSeconds != null) m['dwell_seconds'] = dwellSeconds;
     if (extra != null) m.addAll(extra);
     return m;
   }

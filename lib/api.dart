@@ -46,7 +46,12 @@ class GeofenceEvent {
   final GeofenceEventType type;
   final DateTime ts;
 
-  GeofenceEvent(this.fenceId, this.type, this.ts);
+  /// Seconds of dwell at the time of this event.
+  /// Set on DWELL events (initial threshold + milestones) and EXIT events
+  /// (total time spent inside since ENTER).
+  final int? dwellSeconds;
+
+  GeofenceEvent(this.fenceId, this.type, this.ts, {this.dwellSeconds});
 }
 
 /// A location sample emitted by the engine
@@ -72,6 +77,10 @@ class RuntimeConfig {
 
   /// Required dwell duration before a DWELL event fires
   final int dwellRequiredS;
+
+  /// After the initial DWELL, emit additional DWELL events every N seconds
+  /// of continued presence. 0 = disabled (no repeat milestones).
+  final int dwellEveryS;
 
   /// Sampling rates (seconds) applied depending on zone state
   final int rateOutsideS;
@@ -112,6 +121,7 @@ class RuntimeConfig {
   const RuntimeConfig({
     required this.enabled,
     required this.dwellRequiredS,
+    this.dwellEveryS = 0,
     required this.rateOutsideS,
     required this.rateNearS,
     required this.rateInsideS,
@@ -134,6 +144,7 @@ class RuntimeConfig {
     return RuntimeConfig(
       enabled: m['enabled'] ?? true,
       dwellRequiredS: m['dwell_required_s'] ?? 60,
+      dwellEveryS: m['dwell_every_s'] ?? 0,
       rateOutsideS: m['rate_outside_zone_s'] ?? 60,
       rateNearS: m['rate_near_zone_s'] ?? 60,
       rateInsideS: m['rate_inside_zone_s'] ?? 60,
