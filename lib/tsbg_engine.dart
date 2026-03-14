@@ -532,6 +532,45 @@ class TsbgEngine {
         }
       }
     }
+
+    // Software EXIT check — guards against Android Geofencing API missing EXIT events.
+    // If we believe we're inside a fence but GPS shows us beyond radius + 30m, synthesize
+    // an EXIT through the normal stream so geo_bootstrap can update zone context and
+    // call refreshGeofences(). Fires at most once per entry (state cleared before emit).
+    final softExitFenceId = _enteredFenceId;
+    if (softExitFenceId != null) {
+      GeofenceDef? def;
+      for (final d in _defs) {
+        if (d.ident == softExitFenceId) {
+          def = d;
+          break;
+        }
+      }
+      if (def != null && def.lat != null && def.lng != null && def.radiusM != null) {
+        final distToCenter = _haversineM(lat, lng, def.lat!, def.lng!);
+        if (distToCenter > def.radiusM! + 30.0) {
+          final softExitEnteredAt = _enteredAt;
+          final dwellSecs = softExitEnteredAt != null
+              ? nowUtc.difference(softExitEnteredAt).inSeconds
+              : null;
+          // Clear state before emitting so a re-entrant callback cannot re-fire.
+          _enteredAt = null;
+          _enteredFenceId = null;
+          _firedMilestones.clear();
+          _fenceCtl.add(GeofenceEvent(
+            softExitFenceId,
+            GeofenceEventType.exit,
+            nowUtc,
+            dwellSeconds: dwellSecs,
+          ));
+          if (kDebugMode) {
+            debugPrint(
+                '[TsbgEngine] software EXIT: ${distToCenter.toStringAsFixed(1)}m > '
+                '${def.radiusM! + 30.0}m threshold for fence $softExitFenceId');
+          }
+        }
+      }
+    }
   }
 
   bool _isNearAnyFence(double lat, double lng) {
