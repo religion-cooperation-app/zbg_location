@@ -338,10 +338,16 @@ class TsbgEngine {
         _enteredFenceId = e.identifier;
         _firedMilestones.clear();
       } else if (t == GeofenceEventType.dwell) {
-        // Initial FBG dwell: record the configured threshold as dwell_seconds
+        // Initial FBG dwell: record actual elapsed time since ENTER.
+        // Add dwellRequiredS to firedMilestones so the heartbeat-based milestone
+        // check doesn't re-fire near the same boundary.
         final cfg = _cfg;
-        dwellSeconds = cfg?.dwellRequiredS;
-        if (dwellSeconds != null) _firedMilestones.add(dwellSeconds);
+        final enteredAt = _enteredAt;
+        dwellSeconds = enteredAt != null
+            ? ts.difference(enteredAt).inSeconds
+            : cfg?.dwellRequiredS;
+        final threshold = cfg?.dwellRequiredS;
+        if (threshold != null) _firedMilestones.add(threshold);
       } else if (t == GeofenceEventType.exit) {
         // Record total time inside since ENTER
         final enteredAt = _enteredAt;
@@ -514,12 +520,12 @@ class TsbgEngine {
       final elapsedS = nowUtc.difference(enteredAt).inSeconds;
       final milestone = (elapsedS ~/ dwellCfg.dwellEveryS) * dwellCfg.dwellEveryS;
       if (milestone > 0 && !_firedMilestones.contains(milestone)) {
-        _firedMilestones.add(milestone);
+        _firedMilestones.add(milestone); // boundary used as dedup key
         _fenceCtl.add(GeofenceEvent(
           enteredFenceId,
           GeofenceEventType.dwell,
           nowUtc,
-          dwellSeconds: milestone,
+          dwellSeconds: elapsedS, // actual elapsed time, not the rounded boundary
         ));
         if (kDebugMode) {
           debugPrint('[TsbgEngine] dwell milestone fired: ${milestone}s for fence $enteredFenceId');
