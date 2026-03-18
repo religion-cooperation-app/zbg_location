@@ -149,6 +149,18 @@ class TsbgEngine {
           priority: fbg.NotificationPriority.min,
           sticky: false,
         ),
+
+        // Android: rationale shown when upgrading to Always Allow permission.
+        // Only message is set — FBG defaults are used for title and buttons.
+        backgroundPermissionRationale: fbg.PermissionRationale(
+          message: 'SPARRC uses location to log entry and exit from study locations and to log participation events.',
+        ),
+
+        // iOS: rationale shown in FBG\'s location authorisation alert.
+        // Only instructions is set — FBG defaults are used for all other keys.
+        locationAuthorizationAlert: {
+          'instructions': 'SPARRC uses location to log entry and exit from study locations and to log participation events.',
+        },
       ),
     );
 
