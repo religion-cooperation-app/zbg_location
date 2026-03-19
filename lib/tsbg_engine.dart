@@ -75,6 +75,7 @@ class TsbgEngine {
     final httpParams = <String, dynamic>{};
     if (uid != null) httpParams['uid'] = uid;
     if (regionId != null) httpParams['regionId'] = regionId;
+    httpParams['mode'] = geoSystemMode;
 
     if (kDebugMode) {
       debugPrint(
@@ -113,6 +114,12 @@ class TsbgEngine {
         // less aggressive power management in background. FBG silently ignores
         // this on Android — no platform guard needed.
         activityType: fbg.Config.ACTIVITY_TYPE_OTHER_NAVIGATION,
+
+        // Always-on: ensures Android uses active GPS (foreground service) for
+        // geofence EXIT detection. Without this, Android may miss EXIT events
+        // when the device is stationary. Required in both full_tracking and
+        // geofence_only modes.
+        geofenceModeHighAccuracy: true,
 
         // Native HTTP → Cloud Function (background-safe).
         url: _zbgIngestUrl,
@@ -206,7 +213,11 @@ class TsbgEngine {
 
   Future<void> start() async {
     if (_started) return;
-    await fbg.BackgroundGeolocation.start();
+    if (_cfg?.geofenceOnlyMode == true) {
+      await fbg.BackgroundGeolocation.startGeofences();
+    } else {
+      await fbg.BackgroundGeolocation.start();
+    }
     _started = true;
   }
 
@@ -236,6 +247,11 @@ class TsbgEngine {
   }
 
   SamplingMode get currentMode => _mode;
+
+  /// Returns 'geofence_only' or 'full_tracking' — written into extras so
+  /// zbgIngest can apply mode-specific server-side logic per breadcrumb.
+  String get geoSystemMode =>
+      (_cfg?.geofenceOnlyMode == true) ? 'geofence_only' : 'full_tracking';
 
   /// Re-registers all geofences with the FBG plugin.
   /// Call after an EXIT event to force Android's Geofencing API to re-arm
@@ -278,6 +294,7 @@ class TsbgEngine {
       if (regionId != null) 'regionId': regionId,
       if (zoneId != null) 'zoneId': zoneId,
       'inside_zone': insideZone,
+      'mode': geoSystemMode,
     };
     await fbg.BackgroundGeolocation.setConfig(
       fbg.Config(extras: updatedExtras),
@@ -399,6 +416,15 @@ class TsbgEngine {
     final cfg = _cfg;
     if (cfg == null) return;
 
+    // In geofence-only mode, startGeofences() + geofenceModeHighAccuracy manage
+    // GPS entirely. Applying outside/near configs would conflict with that and
+    // waste power. Only inside-mode config (closer heartbeat/distance filter) is
+    // meaningful while the user is actually inside a fence.
+    if (cfg.geofenceOnlyMode && mode != SamplingMode.inside) {
+      _mode = mode;
+      return;
+    }
+
     int heartbeatS;
     int distanceM;
     bool useSigChange;
@@ -464,6 +490,11 @@ class TsbgEngine {
 
     // Accuracy gate
     if (acc > cfg.accuracyDropM) return;
+
+    // Geofence-only mode: suppress breadcrumb emission while outside all fences.
+    // Server-side zbgIngest applies the same rule, but gating here avoids writing
+    // to the app-layer stream and prevents SQLite accumulation of outside fixes.
+    if (cfg.geofenceOnlyMode && _enteredFenceId == null) return;
 
     // Mode-specific thresholds
     final int rateS;

@@ -117,6 +117,10 @@ class RuntimeConfig {
   final bool batchSync;
   final int maxBatchSize;
 
+  /// When true, only emit breadcrumbs while inside a geofence.
+  /// Tracking engine calls startGeofences() instead of start().
+  final bool geofenceOnlyMode;
+
   /// Construct full runtime config
   const RuntimeConfig({
     required this.enabled,
@@ -136,6 +140,7 @@ class RuntimeConfig {
     this.useSignificantChangeWhenOutside = true,
     this.batchSync = true,
     this.maxBatchSize = 8,
+    this.geofenceOnlyMode = false,
   });
 
   /// Factory loader from Firestore or JSON blob
@@ -171,6 +176,9 @@ class RuntimeConfig {
       // Batch upload settings
       batchSync: m['batch_sync'] ?? true,
       maxBatchSize: m['max_batch_size'] ?? 8,
+
+      // Geofence-only mode — default false so old builds are unaffected
+      geofenceOnlyMode: m['platform']?['geofence_only_mode'] ?? false,
     );
   }
 }
