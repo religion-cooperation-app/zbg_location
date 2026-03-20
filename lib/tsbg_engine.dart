@@ -5,6 +5,7 @@
 // and native HTTP uploads to Cloud Function (zbgIngest).
 
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
@@ -576,11 +577,17 @@ class TsbgEngine {
       }
     }
 
-    // Software EXIT check — guards against Android Geofencing API missing EXIT events.
-    // If we believe we're inside a fence but GPS shows us beyond radius + 30m, synthesize
-    // an EXIT through the normal stream so geo_bootstrap can update zone context and
-    // call refreshGeofences(). Fires at most once per entry (state cleared before emit).
-    final softExitFenceId = _enteredFenceId;
+    // Software EXIT check — Android only.
+    // Guards against Android's Geofencing API missing EXIT events after DWELL.
+    // If we believe we're inside a fence but GPS shows us beyond radius + 30m,
+    // synthesize an EXIT so geo_bootstrap can update zone context and call
+    // refreshGeofences() to re-arm Android ENTER monitoring.
+    //
+    // Not used on iOS: CLRegionMonitoring re-arms EXIT detection automatically,
+    // and calling removeGeofences() on iOS resets region monitoring state —
+    // preventing timely ENTER detection for other zones (e.g. food_coop) that
+    // the user enters shortly after leaving the previous zone.
+    final softExitFenceId = Platform.isAndroid ? _enteredFenceId : null;
     if (softExitFenceId != null) {
       GeofenceDef? def;
       for (final d in _defs) {
