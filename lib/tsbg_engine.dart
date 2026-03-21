@@ -228,6 +228,56 @@ class TsbgEngine {
     _exitHysteresisTimer = null;
     await fbg.BackgroundGeolocation.stop();
     _started = false;
+    // Reset dwell state so a subsequent session (e.g. sign-out/sign-in or user
+    // switch) starts clean. Without this, stale _enteredAt / _enteredFenceId
+    // from the previous user would immediately fire spurious dwell milestones.
+    _enteredAt = null;
+    _enteredFenceId = null;
+    _firedMilestones.clear();
+  }
+
+  /// Check current GPS position and emit a synthetic ENTER if the device is
+  /// already inside a registered geofence but _enteredAt is not set.
+  ///
+  /// Call this from GeoBootstrap after engine.start() with _fenceSub attached.
+  /// Catches the race where FBG fires an ENTER during addGeofences() (step 2)
+  /// before the broadcast stream listener is attached (step 4), causing the
+  /// event to be silently dropped.
+  Future<void> synthesizeEnterIfInside() async {
+    if (!_ready || _enteredFenceId != null || _defs.isEmpty) return;
+    try {
+      final loc = await fbg.BackgroundGeolocation.getCurrentPosition(
+        samples: 1,
+        persist: false,
+        timeout: 10,
+      );
+      final lat = loc.coords.latitude;
+      final lng = loc.coords.longitude;
+      for (final def in _defs) {
+        if (def.type != 'circle' ||
+            def.lat == null ||
+            def.lng == null ||
+            def.radiusM == null) continue;
+        final dist = _haversineM(lat, lng, def.lat!, def.lng!);
+        if (dist <= def.radiusM!) {
+          final ts = DateTime.now().toUtc();
+          _enteredAt = ts;
+          _enteredFenceId = def.ident;
+          _firedMilestones.clear();
+          _fenceCtl.add(GeofenceEvent(def.ident, GeofenceEventType.enter, ts));
+          await _applyMode(SamplingMode.inside);
+          if (kDebugMode) {
+            debugPrint(
+                '[TsbgEngine] synthesizeEnterIfInside: inside ${def.ident} '
+                '(${dist.toStringAsFixed(1)}m <= ${def.radiusM}m)');
+          }
+          break; // only one zone active at a time
+        }
+      }
+    } catch (_) {
+      // GPS unavailable or timed out — no synthetic ENTER; zbgIngest computed
+      // path will detect the ENTER from the next breadcrumb batch.
+    }
   }
 
   /// Flush any locations accumulated in FBG's SQLite buffer (e.g. from
