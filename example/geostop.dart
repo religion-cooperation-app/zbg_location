@@ -4,10 +4,7 @@
 //
 // Stops geolocation and writes geo_running: false + geo_session_stopped to
 // the user document. Safe to call even if geo was never started — the write
-// is skipped if no session is active.
-// Returns 'success' on success, or an error message string on failure.
-// NOTE: wrap in try-catch (as below) so failures do not block subsequent
-// actions in the FlutterFlow action sequence.
+// is skipped if no session is active (_uid null guard in GeoBootstrap.stop()).
 
 // Automatic FlutterFlow imports
 import '/backend/backend.dart';
@@ -23,11 +20,6 @@ import 'package:flutter/material.dart';
 
 import '/custom_code/geo_bootstrap.dart';
 
-Future<String> geostop() async {
-  try {
-    await GeoBootstrap.instance.stop();
-    return 'success';
-  } catch (e) {
-    return e.toString();
-  }
+Future geostop() async {
+  await GeoBootstrap.instance.stop();
 }

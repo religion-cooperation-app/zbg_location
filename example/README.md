@@ -25,6 +25,18 @@ FlutterFlow custom action that calls `GeoBootstrap.instance.stop()`. Returns `'s
 
 Copy to: `lib/custom_code/actions/geostop.dart`.
 
+### `zbgIngest.js`
+The Firebase Cloud Functions v2 HTTP endpoint that receives GPS fix batches from FBG's native HTTP transport. This is the server-side counterpart to `TsbgEngine` — it runs a zone state machine that persists zone entry timestamps and dwell state across HTTP batch boundaries (including terminated-state wakeups where each POST is a single location), computes ENTER/DWELL/EXIT events from raw GPS coordinates, and writes breadcrumbs and geofence events to Firestore. It also handles native geofence events posted by FBG in background/terminated state.
+
+Key behaviours:
+- **Dual gate**: breadcrumbs are gated by `breadcrumbs.enabled` + region allowlist; geofence events bypass the breadcrumb switch (geofence-only gate) so critical events are never silenced
+- **Zone state machine**: seeds `prevZoneId`, `enteredAt`, and `lastFiredMilestoneS` from the user doc on each invocation, writes them back at the end — surviving across batch boundaries
+- **EXIT hysteresis buffer** (30 m): prevents flickering EXIT when GPS is near the fence edge
+- **Geofence-only mode**: suppresses outside-zone breadcrumbs when `mode === 'geofence_only'`
+- **Fence geometry cache**: loads from `regions/{regionId}/meta/geofenceIndex` with a 5-minute in-process cache
+
+In production this function lives in `functions/index.js` alongside the rest of the project's Cloud Functions. It is extracted here for review.
+
 ## Additional custom files (not included here)
 
 The following files are also required in the FlutterFlow project but are more project-specific:
