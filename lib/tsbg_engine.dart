@@ -36,6 +36,7 @@ class TsbgEngine {
   final _locCtl = StreamController<LocationSample>.broadcast();
   final _fenceCtl = StreamController<GeofenceEvent>.broadcast();
 
+  bool _listenersAttached = false;
   bool _ready = false;
   bool _started = false;
 
@@ -84,6 +85,14 @@ class TsbgEngine {
     }
 
     // One-time BG Geolocation init
+    // Attach listeners before ready() so events fired during init are not missed.
+    // _listenersAttached ensures this only happens once — FBG listener registration
+    // is additive and calling onGeofence/onLocation twice stacks duplicate handlers.
+    if (!_listenersAttached) {
+      _attachListeners();
+      _listenersAttached = true;
+    }
+
     await fbg.BackgroundGeolocation.ready(
       fbg.Config(
         startOnBoot: cfg.startOnBoot,
@@ -172,10 +181,9 @@ class TsbgEngine {
       ),
     );
 
-    if (!_ready) {
-      _attachListeners();
-      _ready = true;
-    }
+    // Only mark ready after success — if ready() threw, _ready stays false
+    // so the next start attempt retries with reset: true.
+    _ready = true;
 
     // Apply the current mode’s config (outside by default).
     await _applyMode(_mode);
