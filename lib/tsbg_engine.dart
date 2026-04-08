@@ -6,19 +6,16 @@
 
 import 'dart:async';
 import 'dart:io' show Platform;
-import 'dart:math' as math;
-
 import 'package:flutter/foundation.dart';
 import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
     as fbg;
 
 import 'api.dart'; // RuntimeConfig, SamplingMode, GeofenceDef, GeofenceEvent, LocationSample
+import 'utils.dart'; // haversineMeters
 
 // Native HTTP upload config for background ingestion.
 const String _zbgIngestUrl =
     'https://us-central1-religion-and-cooperation.cloudfunctions.net/zbgIngest';
-// NOTE: For production, move this API key into a secure runtime channel / remote config.
-const String _zbgApiKey = 'religion-and-cooperation-key-123';
 
 class TsbgEngine {
   TsbgEngine();
@@ -95,89 +92,114 @@ class TsbgEngine {
 
     await fbg.BackgroundGeolocation.ready(
       fbg.Config(
-        startOnBoot: cfg.startOnBoot,
-        stopOnTerminate: cfg.stopOnTerminate,
-        debug: false,
-        desiredAccuracy: fbg.Config.DESIRED_ACCURACY_HIGH,
-        disableElasticity: true,
-        // Configurable from Firestore — how long before FBG stops GPS after no motion.
-        stopTimeout: cfg.stopTimeoutMinutes,
+        // reset and foregroundService remain on Config (not deprecated in v5)
         reset: !_ready,
-
-        // Keep a foreground service so Android is more willing to deliver
-        // frequent updates, especially screen-off.
         foregroundService: true,
 
-        // iOS: prevent CoreLocation from pausing updates on stationary devices.
-        pausesLocationUpdatesAutomatically: false,
-
-        // Prevent FBG's own motion-based stop detection from killing GPS when
-        // the device is stationary (e.g. participant sitting in a study room).
-        disableStopDetection: true,
-
-        // iOS: periodically invalidate/recreate CLLocationManager via the
-        // background task API to prevent iOS from suspending the process
-        // between GPS wakeups. Closes most remaining background data gaps.
-        preventSuspend: true,
-
-        // iOS: declare walking/non-automotive movement so CoreLocation applies
-        // less aggressive power management in background. FBG silently ignores
-        // this on Android — no platform guard needed.
-        activityType: fbg.Config.ACTIVITY_TYPE_OTHER_NAVIGATION,
-
-        // Always-on: ensures Android uses active GPS (foreground service) for
-        // geofence EXIT detection. Without this, Android may miss EXIT events
-        // when the device is stationary. Required in both full_tracking and
-        // geofence_only modes.
-        geofenceModeHighAccuracy: true,
-
-        // Native HTTP → Cloud Function (background-safe).
-        url: _zbgIngestUrl,
-        headers: const {
-          'X-Api-Key': _zbgApiKey,
-        },
-
-        // Sent with every request (query/body-level params)
-        params: httpParams,
-
-        // Sent with each recorded location/geofence as `.extras`
-        extras: httpParams,
-
-        autoSync: true,
-        batchSync: cfg.batchSync,
-        maxBatchSize: cfg.maxBatchSize,
-        // NOTE: no httpRootProperty here; defaults to 'location'
-
-        // Keep unsynced SQLite records for 30 days so locations accumulated
-        // during extended offline periods are still recoverable on next open.
-        maxDaysToPersist: 30,
-
-        // 25s timeout fits within iOS SLC / background-fetch wakeup windows
-        // (~30s), giving FBG the best chance of completing a POST before iOS
-        // reclaims the process. Default of 60s exceeds the wakeup window.
-        httpTimeout: 25000,
-
-        // Suppress heads-up banner and status bar icon on Android.
-        // The notification still appears in the shade (OS requirement for
-        // foreground services) but is otherwise invisible during normal use.
-        notification: fbg.Notification(
-          title: 'Location Detection',
-          text: 'SPARRC is tracking device location changes',
-          priority: fbg.NotificationPriority.min,
-          sticky: false,
+        geolocation: fbg.GeoConfig(
+          desiredAccuracy: fbg.DesiredAccuracy.high,
+          // Allow FBG to scale distanceFilter with speed (elasticity).
+          // At rest/walking: baseline distanceFilter applies. At speed: FBG
+          // multiplies it proportionally, reducing GPS polling when moving fast.
+          // distanceFilter per mode is the minimum floor — never scaled below it.
+          disableElasticity: false,
+          // Configurable from Firestore — how long before FBG stops GPS after no motion.
+          stopTimeout: cfg.stopTimeoutMinutes,
+          // iOS: prevent CoreLocation from pausing updates on stationary devices.
+          pausesLocationUpdatesAutomatically: false,
+          // iOS: declare walking/non-automotive movement so CoreLocation applies
+          // less aggressive power management in background. FBG silently ignores
+          // this on Android — no platform guard needed.
+          activityType: fbg.ActivityType.otherNavigation,
+          // Minimum distance device must move from stationary position before
+          // FBG transitions to moving state. 25 is FBG's enforced minimum.
+          // iOS applies its own ~200m floor in terminated state regardless.
+          stationaryRadius: 25,
+          // Fire ENTER immediately if device is already inside a fence when
+          // geofences are registered. Complements synthesizeEnterIfInside()
+          // with a native-layer check that requires no GPS fetch.
+          geofenceInitialTriggerEntry: true,
+          // Android-only per FBG docs — enables active GPS for geofence EXIT
+          // detection. Has no effect on iOS (CLRegionMonitoring handles that).
+          geofenceModeHighAccuracy: Platform.isAndroid,
+          // iOS: request Always authorisation explicitly and provide all required
+          // dialog keys so FBG can render the upgrade prompt on iOS 13+.
+          // Without the full key set, FBG cannot show the Settings shortcut for
+          // users who previously denied or downgraded permission.
+          locationAuthorizationRequest: 'Always',
+          locationAuthorizationAlert: {
+            'titleWhenNotEnabled': 'Location services disabled',
+            'titleWhenInUse': 'Background location required',
+            'instructions': 'SPARRC uses location to detect entry and exit from study locations. Please enable Always Allow.',
+            'cancelButton': 'Cancel',
+            'settingsButton': 'Settings',
+          },
         ),
 
-        // Android: rationale shown when upgrading to Always Allow permission.
-        // Only message is set — FBG defaults are used for title and buttons.
-        backgroundPermissionRationale: fbg.PermissionRationale(
-          message: 'SPARRC uses location to log entry and exit from study locations and to log participation events.',
+        app: fbg.AppConfig(
+          startOnBoot: cfg.startOnBoot,
+          stopOnTerminate: cfg.stopOnTerminate,
+          // Android: required to invoke geoFbgHeadlessTask in terminated state.
+          // Always pair with stopOnTerminate: false per FBG docs.
+          enableHeadless: true,
+          // iOS: periodically invalidate/recreate CLLocationManager via the
+          // background task API to prevent iOS from suspending the process
+          // between GPS wakeups. Closes most remaining background data gaps.
+          preventSuspend: true,
+          // Suppress heads-up banner and status bar icon on Android.
+          // The notification still appears in the shade (OS requirement for
+          // foreground services) but is otherwise invisible during normal use.
+          notification: fbg.Notification(
+            title: 'Location Detection',
+            text: 'SPARRC is tracking device location changes',
+            priority: fbg.NotificationPriority.min,
+            sticky: false,
+          ),
+          // Android: rationale shown when upgrading to Always Allow permission.
+          backgroundPermissionRationale: fbg.PermissionRationale(
+            message: 'SPARRC uses location to log entry and exit from study locations and to log participation events.',
+          ),
         ),
 
-        // iOS: rationale shown in FBG\'s location authorisation alert.
-        // Only instructions is set — FBG defaults are used for all other keys.
-        locationAuthorizationAlert: {
-          'instructions': 'SPARRC uses location to log entry and exit from study locations and to log participation events.',
-        },
+        http: fbg.HttpConfig(
+          // Native HTTP → Cloud Function (background-safe).
+          url: _zbgIngestUrl,
+          headers: {
+            'X-Api-Key': cfg.ingestApiKey ??
+                (throw StateError(
+                    'ingestApiKey is null — add ingest_api_key to appConfig/runtime')),
+          },
+          // Sent with every request (query/body-level params)
+          params: httpParams,
+          autoSync: true,
+          batchSync: cfg.batchSync,
+          maxBatchSize: cfg.maxBatchSize,
+          // NOTE: no rootProperty here; defaults to 'location'
+          // 25s timeout fits within iOS SLC / background-fetch wakeup windows
+          // (~30s), giving FBG the best chance of completing a POST before iOS
+          // reclaims the process. Default of 60s exceeds the wakeup window.
+          timeout: 25000,
+        ),
+
+        persistence: fbg.PersistenceConfig(
+          // Sent with each recorded location/geofence as .extras
+          extras: httpParams,
+          // Keep unsynced SQLite records for 30 days so locations accumulated
+          // during extended offline periods are still recoverable on next open.
+          maxDaysToPersist: 30,
+        ),
+
+        activity: fbg.ActivityConfig(
+          // Allow FBG to enter low-power stationary mode when the device stops
+          // moving. The heartbeat handles breadcrumb emission while stationary;
+          // the accelerometer wakes FBG when motion resumes. Keeping this true
+          // burns maximum battery and causes iOS to throttle/kill the process.
+          disableStopDetection: false,
+        ),
+
+        logger: fbg.LoggerConfig(
+          debug: false,
+        ),
       ),
     );
 
@@ -190,20 +212,35 @@ class TsbgEngine {
   }
 
   Future<void> addGeofences(List<GeofenceDef> defs) async {
-    _defs
-      ..clear()
-      ..addAll(defs);
-    // Clear any persisted FBG geofence state from previous sessions before
-    // re-registering. Without this, FBG's SQLite may still show a geofence as
-    // "inside" from an ENTER event that fired while Dart was dead, preventing
-    // a new ENTER from being delivered when the session restarts.
-    await fbg.BackgroundGeolocation.removeGeofences();
-    for (final d in defs) {
-      // Only circles for now. Polygons could be added here in future.
-      if (d.type == 'circle' &&
-          d.lat != null &&
-          d.lng != null &&
-          d.radiusM != null) {
+    // Diff incoming defs against current _defs so we only add/remove what
+    // actually changed. Calling removeGeofences() on every update tears down
+    // CLRegionMonitoring entirely on iOS, creating a blind window where
+    // crossings are missed until re-registration completes.
+    final incoming = <String, GeofenceDef>{
+      for (final d in defs)
+        if (d.type == 'circle' &&
+            d.lat != null &&
+            d.lng != null &&
+            d.radiusM != null)
+          d.ident: d,
+    };
+    final current = <String, GeofenceDef>{for (final d in _defs) d.ident: d};
+
+    // Remove fences that are no longer in the incoming list
+    for (final ident in current.keys) {
+      if (!incoming.containsKey(ident)) {
+        await fbg.BackgroundGeolocation.removeGeofence(ident);
+      }
+    }
+
+    // Add fences that are new or whose geometry has changed
+    for (final d in incoming.values) {
+      final existing = current[d.ident];
+      final changed = existing == null ||
+          existing.lat != d.lat ||
+          existing.lng != d.lng ||
+          existing.radiusM != d.radiusM;
+      if (changed) {
         await fbg.BackgroundGeolocation.addGeofence(
           fbg.Geofence(
             identifier: d.ident,
@@ -218,6 +255,10 @@ class TsbgEngine {
         );
       }
     }
+
+    _defs
+      ..clear()
+      ..addAll(defs);
   }
 
   Future<void> start() async {
@@ -266,7 +307,7 @@ class TsbgEngine {
             def.lat == null ||
             def.lng == null ||
             def.radiusM == null) continue;
-        final dist = _haversineM(lat, lng, def.lat!, def.lng!);
+        final dist = haversineMeters(lat, lng, def.lat!, def.lng!);
         if (dist <= def.radiusM!) {
           final ts = DateTime.now().toUtc();
           _enteredAt = ts;
@@ -356,7 +397,9 @@ class TsbgEngine {
       'mode': geoSystemMode,
     };
     await fbg.BackgroundGeolocation.setConfig(
-      fbg.Config(extras: updatedExtras),
+      fbg.Config(
+        persistence: fbg.PersistenceConfig(extras: updatedExtras),
+      ),
     );
   }
 
@@ -517,12 +560,19 @@ class TsbgEngine {
 
     await fbg.BackgroundGeolocation.setConfig(
       fbg.Config(
-        useSignificantChangesOnly: useSigChange,
-        distanceFilter: distanceM.toDouble(),
-        heartbeatInterval:
-            _hbMinutesFromSeconds(heartbeatS), // seconds -> minutes (Android)
-        locationUpdateInterval:
-            locationUpdateMs, // can be null in inside/near; active in outside
+        geolocation: fbg.GeoConfig(
+          useSignificantChangesOnly: useSigChange,
+          distanceFilter: distanceM.toDouble(),
+          locationUpdateInterval: locationUpdateMs,
+        ),
+        app: fbg.AppConfig(
+          heartbeatInterval: heartbeatS.toDouble(), // seconds, per AppConfig v5 API (Android min: 60s)
+          // iOS only — engage preventSuspend while inside a zone so heartbeat
+          // breadcrumbs fire reliably while stationary. Off outside/near so iOS
+          // manages the process normally and CLRegionMonitoring handles wakeups.
+          // cfg.preventSuspendInsideZone is a Firestore kill switch (default true).
+          preventSuspend: (mode == SamplingMode.inside) && cfg.preventSuspendInsideZone,
+        ),
       ),
     );
 
@@ -583,7 +633,7 @@ class TsbgEngine {
 
     final double movedM = (lastLat == null || lastLng == null)
         ? double.infinity
-        : _haversineM(lastLat, lastLng, lat, lng);
+        : haversineMeters(lastLat, lastLng, lat, lng);
 
     final bool distDue =
         (lastLat == null || lastLng == null) ? true : movedM >= distM;
@@ -655,7 +705,7 @@ class TsbgEngine {
         }
       }
       if (def != null && def.lat != null && def.lng != null && def.radiusM != null) {
-        final distToCenter = _haversineM(lat, lng, def.lat!, def.lng!);
+        final distToCenter = haversineMeters(lat, lng, def.lat!, def.lng!);
         if (distToCenter > def.radiusM! + 30.0) {
           final softExitEnteredAt = _enteredAt;
           final dwellSecs = softExitEnteredAt != null
@@ -689,31 +739,10 @@ class TsbgEngine {
           d.lat == null ||
           d.lng == null ||
           d.radiusM == null) continue;
-      final dist = _haversineM(lat, lng, d.lat!, d.lng!);
+      final dist = haversineMeters(lat, lng, d.lat!, d.lng!);
       if (dist <= d.radiusM! + nearRadiusM) return true;
     }
     return false;
   }
 
-  double _haversineM(double lat1, double lon1, double lat2, double lon2) {
-    const R = 6371000.0; // Earth radius in meters
-    final dLat = _deg2rad(lat2 - lat1);
-    final dLon = _deg2rad(lon2 - lon1);
-    final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
-        math.cos(_deg2rad(lat1)) *
-            math.cos(_deg2rad(lat2)) *
-            math.sin(dLon / 2) *
-            math.sin(dLon / 2);
-    final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
-    return R * c;
-  }
-
-  double _deg2rad(double deg) => deg * (math.pi / 180.0);
-
-  /// Convert your per-mode seconds to the plugin's heartbeat minutes (Android).
-  /// Uses a floor of 1 minute; rounds to nearest minute for larger values.
-  int _hbMinutesFromSeconds(int seconds) {
-    if (seconds <= 60) return 1;
-    return (seconds / 60).round();
-  }
 }

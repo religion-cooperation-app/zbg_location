@@ -121,6 +121,16 @@ class RuntimeConfig {
   /// Tracking engine calls startGeofences() instead of start().
   final bool geofenceOnlyMode;
 
+  /// iOS only — allow preventSuspend to engage while inside a zone.
+  /// When true (default), preventSuspend: true is set in inside mode so
+  /// heartbeat breadcrumbs fire reliably while stationary. Set false via
+  /// Firestore to disable preventSuspend entirely as a kill switch.
+  final bool preventSuspendInsideZone;
+
+  /// API key for the zbgIngest Cloud Function, fetched from appConfig/runtime.
+  /// Null means the field is absent from Firestore — engine will throw on start.
+  final String? ingestApiKey;
+
   /// Construct full runtime config
   const RuntimeConfig({
     required this.enabled,
@@ -141,6 +151,8 @@ class RuntimeConfig {
     this.batchSync = true,
     this.maxBatchSize = 8,
     this.geofenceOnlyMode = false,
+    this.preventSuspendInsideZone = true,
+    this.ingestApiKey,
   });
 
   /// Factory loader from Firestore or JSON blob
@@ -179,48 +191,13 @@ class RuntimeConfig {
 
       // Geofence-only mode — default false so old builds are unaffected
       geofenceOnlyMode: m['platform']?['geofence_only_mode'] ?? false,
+      // preventSuspend kill switch — default true so existing behavior is preserved
+      preventSuspendInsideZone: m['platform']?['prevent_suspend_inside_zone'] ?? true,
+
+      // API key sourced from Firestore — null if field absent
+      ingestApiKey: m['ingest_api_key'] as String?,
     );
   }
 }
 
-/// ------------------------------------------------------------
-/// API returned to FlutterFlow
-/// ------------------------------------------------------------
-
-/// Returned by the engine — metadata about user presence in geofences
-class UserZoneStatus {
-  final bool insideAny;
-  final String? fenceId;
-  final bool nearAny;
-
-  UserZoneStatus({
-    required this.insideAny,
-    required this.nearAny,
-    this.fenceId,
-  });
-}
-
-/// A façade object consumed by FlutterFlow custom actions
-class ZbgAPI {
-  /// These controllers funnel events from the engine
-  final StreamController<LocationSample> _locCtl;
-  final StreamController<GeofenceEvent> _fenceCtl;
-
-  /// Latest status
-  UserZoneStatus? _status;
-
-  ZbgAPI(
-      this._locCtl,
-      this._fenceCtl,
-    );
-
-  Stream<LocationSample> get locationStream => _locCtl.stream;
-  Stream<GeofenceEvent> get geofenceStream => _fenceCtl.stream;
-
-  UserZoneStatus? get status => _status;
-
-  void updateStatus(UserZoneStatus s) {
-    _status = s;
-  }
-}
 
