@@ -262,7 +262,14 @@ class TsbgEngine {
   }
 
   Future<void> start() async {
-    if (_started) return;
+    if (_started) {
+      // Guard against _started drifting out of sync with the native layer
+      // (e.g. after a failed stop or process restart). If FBG reports it is
+      // not actually running, reset our flag and proceed with a real start.
+      final state = await fbg.BackgroundGeolocation.state;
+      if (state.enabled) return;
+      _started = false;
+    }
     if (_cfg?.geofenceOnlyMode == true) {
       await fbg.BackgroundGeolocation.startGeofences();
     } else {
@@ -275,14 +282,24 @@ class TsbgEngine {
     if (!_started) return;
     _exitHysteresisTimer?.cancel();
     _exitHysteresisTimer = null;
-    await fbg.BackgroundGeolocation.stop();
-    _started = false;
-    // Reset dwell state so a subsequent session (e.g. sign-out/sign-in or user
-    // switch) starts clean. Without this, stale _enteredAt / _enteredFenceId
-    // from the previous user would immediately fire spurious dwell milestones.
-    _enteredAt = null;
-    _enteredFenceId = null;
-    _firedMilestones.clear();
+    try {
+      await fbg.BackgroundGeolocation.stop();
+    } finally {
+      // Always clear all state — even if the native stop() threw — so a
+      // subsequent start() call is not blocked by a stale _started flag.
+      _started = false;
+      // Reset dwell state so a subsequent session (e.g. sign-out/sign-in or
+      // user switch) starts clean. Without this, stale _enteredAt /
+      // _enteredFenceId from the previous user would immediately fire spurious
+      // dwell milestones.
+      _enteredAt = null;
+      _enteredFenceId = null;
+      _firedMilestones.clear();
+      _mode = SamplingMode.outside;
+      _lastEmitUtc = null;
+      _lastEmitLat = null;
+      _lastEmitLng = null;
+    }
   }
 
   /// Check current GPS position and emit a synthetic ENTER if the device is
