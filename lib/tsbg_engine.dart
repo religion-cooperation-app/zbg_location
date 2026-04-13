@@ -44,6 +44,13 @@ class TsbgEngine {
   String? _enteredFenceId;
   final Set<int> _firedMilestones = {};
 
+  // Near-zone tracking (Fix 2)
+  final Set<String> _activeNearFences = {};
+
+  // Inside-mode position reconciliation counter (Fix 3b)
+  int _insideFixCount = 0;
+  String? _insideFixFenceId;
+
   /// "Whatever's first" bookkeeping
   DateTime? _lastEmitUtc;
   double? _lastEmitLat;
@@ -207,6 +214,12 @@ class TsbgEngine {
     // so the next start attempt retries with reset: true.
     _ready = true;
 
+    // Fix 1: Explicitly clear any stale persistence.extras from a previous session.
+    // ready() with reset:false silently ignores extras changes; direct setConfig() always applies.
+    await fbg.BackgroundGeolocation.setConfig(fbg.Config(
+      persistence: fbg.PersistenceConfig(extras: httpParams),
+    ));
+
     // Apply the current mode’s config (outside by default).
     await _applyMode(_mode);
   }
@@ -226,10 +239,11 @@ class TsbgEngine {
     };
     final current = <String, GeofenceDef>{for (final d in _defs) d.ident: d};
 
-    // Remove fences that are no longer in the incoming list
+    // Remove fences that are no longer in the incoming list (inner + outer near-zone)
     for (final ident in current.keys) {
       if (!incoming.containsKey(ident)) {
         await fbg.BackgroundGeolocation.removeGeofence(ident);
+        await fbg.BackgroundGeolocation.removeGeofence('${ident}_near');
       }
     }
 
@@ -251,6 +265,19 @@ class TsbgEngine {
             notifyOnExit: true,
             notifyOnDwell: true,
             loiteringDelay: (_cfg?.dwellRequiredS ?? 60) * 1000,
+          ),
+        );
+        final nearRadiusM = (_cfg?.nearZoneRadiusM ?? 100).toDouble();
+        await fbg.BackgroundGeolocation.addGeofence(
+          fbg.Geofence(
+            identifier: '${d.ident}_near',
+            latitude: d.lat!,
+            longitude: d.lng!,
+            radius: d.radiusM! + nearRadiusM,
+            notifyOnEntry: true,
+            notifyOnExit: true,
+            notifyOnDwell: false,
+            loiteringDelay: 0,
           ),
         );
       }
@@ -295,6 +322,9 @@ class TsbgEngine {
       _enteredAt = null;
       _enteredFenceId = null;
       _firedMilestones.clear();
+      _activeNearFences.clear();
+      _insideFixCount = 0;
+      _insideFixFenceId = null;
       _mode = SamplingMode.outside;
       _lastEmitUtc = null;
       _lastEmitLat = null;
@@ -375,12 +405,10 @@ class TsbgEngine {
   /// ENTER monitoring. Works around FBG's internal re-arming failure after
   /// the DWELL → EXIT state transition.
   Future<void> refreshGeofences() async {
+    final nearRadiusM = (_cfg?.nearZoneRadiusM ?? 100).toDouble();
     await fbg.BackgroundGeolocation.removeGeofences();
     for (final d in _defs) {
-      if (d.type == 'circle' &&
-          d.lat != null &&
-          d.lng != null &&
-          d.radiusM != null) {
+      if (d.type == 'circle' && d.lat != null && d.lng != null && d.radiusM != null) {
         await fbg.BackgroundGeolocation.addGeofence(
           fbg.Geofence(
             identifier: d.ident,
@@ -391,6 +419,18 @@ class TsbgEngine {
             notifyOnExit: true,
             notifyOnDwell: true,
             loiteringDelay: (_cfg?.dwellRequiredS ?? 60) * 1000,
+          ),
+        );
+        await fbg.BackgroundGeolocation.addGeofence(
+          fbg.Geofence(
+            identifier: '${d.ident}_near',
+            latitude: d.lat!,
+            longitude: d.lng!,
+            radius: d.radiusM! + nearRadiusM,
+            notifyOnEntry: true,
+            notifyOnExit: true,
+            notifyOnDwell: false,
+            loiteringDelay: 0,
           ),
         );
       }
@@ -428,17 +468,6 @@ class TsbgEngine {
     // LOCATION — gate emission by "whatever's first"
     fbg.BackgroundGeolocation.onLocation((fbg.Location l) async {
       _maybeEmitFromFBGLocation(l, reason: 'location');
-
-      // Optional: promote to NEAR when close to any fence (if not already inside).
-      final c = l.coords;
-      if (_mode != SamplingMode.inside) {
-        final near = _isNearAnyFence(c.latitude, c.longitude);
-        if (near && _mode != SamplingMode.near) {
-          await _applyMode(SamplingMode.near);
-        } else if (!near && _mode == SamplingMode.near) {
-          await _applyMode(SamplingMode.outside);
-        }
-      }
     });
 
     // HEARTBEAT — ensures timed emission even when stationary
@@ -460,6 +489,20 @@ class TsbgEngine {
 
     // GEOFENCE
     fbg.BackgroundGeolocation.onGeofence((fbg.GeofenceEvent e) async {
+      // Handle outer near-zone fence events (Fix 2) — internal mode switching only, not emitted.
+      if (e.identifier.endsWith('_near')) {
+        if (e.action == 'ENTER') {
+          _activeNearFences.add(e.identifier);
+          if (_enteredFenceId == null) await _applyMode(SamplingMode.near);
+        } else if (e.action == 'EXIT') {
+          _activeNearFences.remove(e.identifier);
+          if (_enteredFenceId == null && _activeNearFences.isEmpty) {
+            await _applyMode(SamplingMode.outside);
+          }
+        }
+        return;
+      }
+
       final GeofenceEventType t;
       switch (e.action) {
         case 'ENTER':
@@ -485,6 +528,8 @@ class TsbgEngine {
         _enteredAt = ts;
         _enteredFenceId = e.identifier;
         _firedMilestones.clear();
+        _insideFixCount = 0;
+        _insideFixFenceId = null;
       } else if (t == GeofenceEventType.dwell) {
         // Initial FBG dwell: record actual elapsed time since ENTER.
         // Add dwellRequiredS to firedMilestones so the heartbeat-based milestone
@@ -524,7 +569,11 @@ class TsbgEngine {
         // if a new ENTER arrives before the timer fires we stay in inside mode.
         _exitHysteresisTimer?.cancel();
         _exitHysteresisTimer = Timer(const Duration(minutes: 2), () {
-          _applyMode(SamplingMode.outside);
+          if (_activeNearFences.isEmpty) {
+            _applyMode(SamplingMode.outside);
+          } else {
+            _applyMode(SamplingMode.near);
+          }
           _exitHysteresisTimer = null;
         });
       }
@@ -680,6 +729,51 @@ class TsbgEngine {
       }
     }
 
+    // Fix 3a: Near mode reconciliation — if GPS shows us inside the near radius but
+    // the outer geofence ENTER was missed (e.g. device was already nearby when fences
+    // were registered), switch to near mode now.
+    if (_enteredFenceId == null && _activeNearFences.isEmpty && _mode == SamplingMode.outside) {
+      final nearRadiusM = (_cfg?.nearZoneRadiusM ?? 100).toDouble();
+      for (final d in _defs) {
+        if (d.type != 'circle' || d.lat == null || d.lng == null || d.radiusM == null) continue;
+        if (haversineMeters(lat, lng, d.lat!, d.lng!) <= d.radiusM! + nearRadiusM) {
+          await _applyMode(SamplingMode.near);
+          if (kDebugMode) debugPrint('[TsbgEngine] near-mode reconciliation: within near zone of ${d.ident}');
+          break;
+        }
+      }
+    }
+
+    // Fix 3b: Inside mode reconciliation — N=2 consecutive GPS fixes inside a fence
+    // synthesizes an ENTER. Guards against missed native ENTER events (FBG accuracy
+    // limitations, fence registered after user was already inside).
+    if (_enteredFenceId == null) {
+      String? containingFence;
+      for (final d in _defs) {
+        if (d.type != 'circle' || d.lat == null || d.lng == null || d.radiusM == null) continue;
+        if (haversineMeters(lat, lng, d.lat!, d.lng!) <= d.radiusM!) {
+          containingFence = d.ident;
+          break;
+        }
+      }
+      if (containingFence != null && containingFence == _insideFixFenceId) {
+        _insideFixCount++;
+        if (_insideFixCount >= 2) {
+          _insideFixCount = 0;
+          _insideFixFenceId = null;
+          _enteredAt = nowUtc;
+          _enteredFenceId = containingFence;
+          _firedMilestones.clear();
+          _fenceCtl.add(GeofenceEvent(containingFence, GeofenceEventType.enter, nowUtc));
+          await _applyMode(SamplingMode.inside);
+          if (kDebugMode) debugPrint('[TsbgEngine] synthetic ENTER (reconciliation): $containingFence');
+        }
+      } else {
+        _insideFixFenceId = containingFence;
+        _insideFixCount = containingFence != null ? 1 : 0;
+      }
+    }
+
     // Dwell milestone check — runs on every heartbeat/location callback.
     // Emits a synthetic DWELL event at each dwell_every_s boundary while inside.
     final dwellCfg = _cfg;
@@ -746,20 +840,6 @@ class TsbgEngine {
         }
       }
     }
-  }
-
-  bool _isNearAnyFence(double lat, double lng) {
-    // Simple radial check against all circle geofences with a fixed NEAR radius
-    const nearRadiusM = 150.0; // can be tuned or moved into RuntimeConfig
-    for (final d in _defs) {
-      if (d.type != 'circle' ||
-          d.lat == null ||
-          d.lng == null ||
-          d.radiusM == null) continue;
-      final dist = haversineMeters(lat, lng, d.lat!, d.lng!);
-      if (dist <= d.radiusM! + nearRadiusM) return true;
-    }
-    return false;
   }
 
 }

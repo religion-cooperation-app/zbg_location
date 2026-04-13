@@ -131,6 +131,10 @@ class RuntimeConfig {
   /// Null means the field is absent from Firestore — engine will throw on start.
   final String? ingestApiKey;
 
+  /// Outer near-zone radius added to each geofence's radius for NEAR detection.
+  /// Sourced from appConfig/runtime geofenceDetect.near_zone_radius_m (default 100m).
+  final int nearZoneRadiusM;
+
   /// Construct full runtime config
   const RuntimeConfig({
     required this.enabled,
@@ -153,6 +157,7 @@ class RuntimeConfig {
     this.geofenceOnlyMode = false,
     this.preventSuspendInsideZone = true,
     this.ingestApiKey,
+    this.nearZoneRadiusM = 100,
   });
 
   /// Factory loader from Firestore or JSON blob
@@ -196,6 +201,9 @@ class RuntimeConfig {
 
       // API key sourced from Firestore — null if field absent
       ingestApiKey: m['ingest_api_key'] as String?,
+
+      // Near-zone radius sourced from geofenceDetect sub-map
+      nearZoneRadiusM: (m['geofenceDetect']?['near_zone_radius_m'] as num?)?.toInt() ?? 100,
     );
   }
 }
