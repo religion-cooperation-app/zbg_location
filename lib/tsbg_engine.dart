@@ -467,7 +467,7 @@ class TsbgEngine {
   void _attachListeners() {
     // LOCATION — gate emission by "whatever's first"
     fbg.BackgroundGeolocation.onLocation((fbg.Location l) async {
-      _maybeEmitFromFBGLocation(l, reason: 'location');
+      await _maybeEmitFromFBGLocation(l, reason: 'location');
     });
 
     // HEARTBEAT — ensures timed emission even when stationary
@@ -484,7 +484,7 @@ class TsbgEngine {
           return;
         }
       }
-      _maybeEmitFromFBGLocation(loc, reason: 'heartbeat');
+      await _maybeEmitFromFBGLocation(loc, reason: 'heartbeat');
     });
 
     // GEOFENCE
@@ -651,7 +651,7 @@ class TsbgEngine {
   }
 
   /// Central gate for "whatever's first" (distance OR time) emission.
-  void _maybeEmitFromFBGLocation(fbg.Location l, {required String reason}) {
+  Future<void> _maybeEmitFromFBGLocation(fbg.Location l, {required String reason}) async {
     final cfg = _cfg;
     if (cfg == null || !cfg.enabled) return;
 
