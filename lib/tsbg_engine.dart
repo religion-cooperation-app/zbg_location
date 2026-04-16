@@ -738,18 +738,40 @@ class TsbgEngine {
       }
     }
 
-    // Fix 3a: Near mode reconciliation — if GPS shows us inside the near radius but
-    // the outer geofence ENTER was missed (e.g. device was already nearby when fences
-    // were registered), switch to near mode now.
+    // Fix 3a (entry): Near mode reconciliation — if GPS shows us inside the near radius
+    // but the outer geofence ENTER was missed (e.g. device was already nearby when
+    // fences were registered), switch to near mode now.
     if (_enteredFenceId == null && _activeNearFences.isEmpty && _mode == SamplingMode.outside) {
       final nearRadiusM = (_cfg?.nearZoneRadiusM ?? 100).toDouble();
       for (final d in _defs) {
         if (d.type != 'circle' || d.lat == null || d.lng == null || d.radiusM == null) continue;
         if (haversineMeters(lat, lng, d.lat!, d.lng!) <= d.radiusM! + nearRadiusM) {
           await _applyMode(SamplingMode.near);
-          if (kDebugMode) debugPrint('[TsbgEngine] near-mode reconciliation: within near zone of ${d.ident}');
+          if (kDebugMode) debugPrint('[TsbgEngine] near-mode entry reconciliation: within near zone of ${d.ident}');
           break;
         }
+      }
+    }
+
+    // Fix 3a (exit): GPS-based exit from near mode when native _near fence EXIT is
+    // delayed. Android geofence EXIT events can lag by minutes; if GPS confirms we
+    // are outside all near zones, switch back to outside immediately rather than
+    // waiting. Does not check _activeNearFences — the delayed EXIT is exactly the
+    // case where that set is non-empty but stale.
+    if (_enteredFenceId == null && _mode == SamplingMode.near) {
+      final nearRadiusM = (_cfg?.nearZoneRadiusM ?? 100).toDouble();
+      bool stillNear = false;
+      for (final d in _defs) {
+        if (d.type != 'circle' || d.lat == null || d.lng == null || d.radiusM == null) continue;
+        if (haversineMeters(lat, lng, d.lat!, d.lng!) <= d.radiusM! + nearRadiusM) {
+          stillNear = true;
+          break;
+        }
+      }
+      if (!stillNear) {
+        _activeNearFences.clear(); // stale — native EXIT never fired; GPS confirms outside
+        await _applyMode(SamplingMode.outside);
+        if (kDebugMode) debugPrint('[TsbgEngine] near-mode exit reconciliation: GPS confirms outside all near zones');
       }
     }
 
