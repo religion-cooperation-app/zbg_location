@@ -297,10 +297,19 @@ class TsbgEngine {
       if (state.enabled) return;
       _started = false;
     }
-    if (_cfg?.geofenceOnlyMode == true) {
-      await fbg.BackgroundGeolocation.startGeofences();
-    } else {
-      await fbg.BackgroundGeolocation.start();
+    try {
+      if (_cfg?.geofenceOnlyMode == true) {
+        await fbg.BackgroundGeolocation.startGeofences();
+      } else {
+        await fbg.BackgroundGeolocation.start();
+      }
+    } catch (_) {
+      // FBG may throw a permission error (e.g. Android ACCESS_BACKGROUND_LOCATION
+      // not resolved via onRequestPermissionsResult, or iOS "When In Use" instead
+      // of "Always") even though the native location service actually started.
+      // Check state.enabled — if the engine is running, treat this as success.
+      final state = await fbg.BackgroundGeolocation.state;
+      if (!state.enabled) rethrow;
     }
     _started = true;
   }
