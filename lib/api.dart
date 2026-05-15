@@ -135,6 +135,12 @@ class RuntimeConfig {
   /// Sourced from appConfig/runtime geofenceDetect.near_zone_radius_m (default 100m).
   final int nearZoneRadiusM;
 
+  /// Minimum number of SQLite records to accumulate before FBG fires an upload.
+  /// 0 = disabled (sync on every record). Sourced from appConfig/runtime
+  /// platform.auto_sync_threshold. Reduces function invocations and radio
+  /// wake-ups at the cost of a short upload delay.
+  final int autoSyncThreshold;
+
   /// Construct full runtime config
   const RuntimeConfig({
     required this.enabled,
@@ -158,6 +164,7 @@ class RuntimeConfig {
     this.preventSuspendInsideZone = true,
     this.ingestApiKey,
     this.nearZoneRadiusM = 100,
+    this.autoSyncThreshold = 0,
   });
 
   /// Factory loader from Firestore or JSON blob
@@ -204,6 +211,9 @@ class RuntimeConfig {
 
       // Near-zone radius sourced from geofenceDetect sub-map
       nearZoneRadiusM: (m['geofenceDetect']?['near_zone_radius_m'] as num?)?.toInt() ?? 100,
+
+      // Accumulate this many records before syncing; 0 = sync immediately
+      autoSyncThreshold: (m['platform']?['auto_sync_threshold'] as num?)?.toInt() ?? 0,
     );
   }
 }

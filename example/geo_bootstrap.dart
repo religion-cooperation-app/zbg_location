@@ -403,6 +403,7 @@ class GeoBootstrap {
       stopTimeoutMinutes: (platform['stop_timeout_minutes'] ?? 60) as int,
       batchSync: (platform['batch_sync'] ?? true) as bool,
       maxBatchSize: (platform['max_batch_size'] ?? 8) as int,
+      autoSyncThreshold: (platform['auto_sync_threshold'] ?? 0) as int,
       // Geofence-only mode — default false so existing builds are unaffected
       geofenceOnlyMode: (platform['geofence_only_mode'] ?? false) as bool,
       // preventSuspend kill switch — default true so existing behavior is preserved

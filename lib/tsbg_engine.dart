@@ -181,6 +181,7 @@ class TsbgEngine {
           autoSync: true,
           batchSync: cfg.batchSync,
           maxBatchSize: cfg.maxBatchSize,
+          autoSyncThreshold: cfg.autoSyncThreshold,
           // NOTE: no rootProperty here; defaults to 'location'
           // 25s timeout fits within iOS SLC / background-fetch wakeup windows
           // (~30s), giving FBG the best chance of completing a POST before iOS
@@ -216,7 +217,10 @@ class TsbgEngine {
 
     // Fix 1: Explicitly clear any stale persistence.extras from a previous session.
     // ready() with reset:false silently ignores extras changes; direct setConfig() always applies.
+    // autoSyncThreshold is also applied here so live Firestore config changes propagate
+    // to the running engine (ready() with reset:false does not re-apply these).
     await fbg.BackgroundGeolocation.setConfig(fbg.Config(
+      autoSyncThreshold: cfg.autoSyncThreshold,
       persistence: fbg.PersistenceConfig(extras: httpParams),
     ));
 
