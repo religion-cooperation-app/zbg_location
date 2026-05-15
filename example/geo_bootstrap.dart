@@ -1,11 +1,7 @@
-// example/geo_bootstrap.dart
-// FlutterFlow custom code file — copy into your FlutterFlow project under
-// custom_code/geo_bootstrap.dart
-//
-// Bootstrap orchestrator. Reads appConfig/runtime and geofences from Firestore
-// to build a RuntimeConfig, configures the geofence engine, and writes
-// session state to the user document. Also exposes an onZoneChange stream
-// consumed by BtBootstrap for BLE proximity gating.
+// lib/custom_code/geo_bootstrap.dart
+// bootstrap orchestrator. reads appconfig/runtime and geofences from firestore
+// to build a runtime config, configures geofence engine and writes data to firestore
+// also streams for bluetooth system. updated 2/23/26. Most recent backup in firestore_export/_backup and in github backup
 
 import 'dart:async';
 import 'dart:io' show Platform;
@@ -36,7 +32,8 @@ class GeoBootstrap {
   String? _uid;
   String? _currentZoneId;
   bool _inside = false;
-  bool _starting = false; // concurrency guard — prevents overlapping startFromFirestore calls
+  bool _starting =
+      false; // concurrency guard — prevents overlapping startFromFirestore calls
 
   // Broadcasts zone state changes to any subscriber (e.g. BtBootstrap).
   // Purely in-memory — no network involved.
@@ -44,10 +41,10 @@ class GeoBootstrap {
   Stream<ZoneState> get onZoneChange => _zoneCtl.stream;
 
   Future<void> startFromFirestore(String regionId) async {
-    if (_starting) return; // prevent overlapping calls (e.g. rapid homepage reloads)
+    if (_starting) return;
     _starting = true;
     try {
-    await _startFromFirestoreInner(regionId);
+      await _startFromFirestoreInner(regionId);
     } finally {
       _starting = false;
     }
@@ -57,41 +54,48 @@ class GeoBootstrap {
     final fs = FirebaseFirestore.instance;
 
     // ----- 0) Get user + set identity FIRST -----
+    // NOTE: _uid is intentionally NOT set here. It is set only at step 7 after
+    // full successful startup, so isRunning accurately reflects engine state.
     final uid = FirebaseAuth.instance.currentUser?.uid;
-    if (uid == null) throw StateError('No signed-in user.');
+    if (uid == null) throw StateError('geo:no_user');
 
     // Tell the engine who we are + what region we're in
     _engine.setIdentity(uid: uid, regionId: regionId);
-    _uid = uid;
 
     // ----- 0b) Register background wakeup handlers -----
     // FCM silent-push handler: invoked by firebase_messaging when a
     // data-only 'geo_wakeup' message arrives (backgrounded/OS-terminated, not
     // force-quit). Idempotent — safe to call on every startFromFirestore.
-    FirebaseMessaging.onBackgroundMessage(geoFirebaseMessagingBackgroundHandler);
+    FirebaseMessaging.onBackgroundMessage(
+        geoFirebaseMessagingBackgroundHandler);
 
     // Background fetch (iOS only): OS-triggered periodic wakeup ~every 15–30 min.
     // Complements silent push with time-based wakeups that require no server
     // infrastructure. fetch UIBackgroundMode is already in Info.plist.
     if (Platform.isIOS) {
-      await BackgroundFetch.configure(
-        BackgroundFetchConfig(
-          minimumFetchInterval: 15,
-          stopOnTerminate: false, // keep running when app is OS-terminated
-          enableHeadless: true, // allow headless task in terminated state
-          startOnBoot: true,
-        ),
-        (String taskId) async {
-          // Foreground/background callback (app is running)
-          await GeoBootstrap.instance.flushBuffer();
-          BackgroundFetch.finish(taskId);
-        },
-        (String taskId) async {
-          // Timeout — must finish quickly
-          BackgroundFetch.finish(taskId);
-        },
-      );
-      await BackgroundFetch.registerHeadlessTask(geoBackgroundFetchHeadlessTask);
+      try {
+        await BackgroundFetch.configure(
+          BackgroundFetchConfig(
+            minimumFetchInterval: 15,
+            stopOnTerminate: false, // keep running when app is OS-terminated
+            enableHeadless: true, // allow headless task in terminated state
+            startOnBoot: true,
+          ),
+          (String taskId) async {
+            // Foreground/background callback (app is running)
+            await GeoBootstrap.instance.flushBuffer();
+            BackgroundFetch.finish(taskId);
+          },
+          (String taskId) async {
+            // Timeout — must finish quickly
+            BackgroundFetch.finish(taskId);
+          },
+        );
+        await BackgroundFetch.registerHeadlessTask(
+            geoBackgroundFetchHeadlessTask);
+      } catch (_) {
+        throw StateError('geo:background_fetch_failed');
+      }
     }
 
     // FBG Android geofence headless task: invoked by FBG's native service when
@@ -99,14 +103,17 @@ class GeoBootstrap {
     // re-arms Android's Geofencing API on EXIT. Android-only — on iOS,
     // CLRegionMonitoring re-arms automatically and BackgroundFetch handles wakeups.
     if (Platform.isAndroid) {
-      await fbg.BackgroundGeolocation.registerHeadlessTask(geoFbgHeadlessTask);
+      try {
+        await fbg.BackgroundGeolocation.registerHeadlessTask(
+            geoFbgHeadlessTask);
+      } catch (_) {
+        throw StateError('geo:headless_task_failed');
+      }
     }
 
     // ----- 1) Check region exists -----
     final regionSnap = await fs.doc('appConfig_regions/$regionId').get();
-    if (!regionSnap.exists) {
-      throw StateError('Missing appConfig_regions/$regionId');
-    }
+    if (!regionSnap.exists) throw StateError('geo:missing_region');
 
     // ----- 1b) Attach runtime config listener -----
     // First emission initialises the engine; subsequent emissions update it
@@ -117,46 +124,38 @@ class GeoBootstrap {
     _configSub = fs.doc('appConfig/runtime').snapshots().listen(
       (snap) {
         if (!snap.exists) {
-          if (!configReady.isCompleted) {
-            configReady.completeError(StateError('Missing appConfig/runtime'));
-          }
+          if (!configReady.isCompleted)
+            configReady.completeError(StateError('geo:missing_runtime_config'));
           return;
         }
         final fut = _engine.setConfig(
           _buildRuntimeConfig(snap.data()! as Map<String, dynamic>),
         );
         if (!configReady.isCompleted) {
-          fut.then((_) => configReady.complete());
+          fut.then((_) => configReady.complete()).catchError((e) {
+            if (!configReady.isCompleted)
+              configReady.completeError(StateError('geo:fbg_init_failed'));
+          });
         }
       },
       onError: (e) {
-        if (!configReady.isCompleted) configReady.completeError(e);
+        if (!configReady.isCompleted)
+          configReady.completeError(StateError('geo:config_load_failed'));
       },
     );
-    await configReady.future;
+    try {
+      await configReady.future.timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      throw StateError('geo:config_timeout');
+    }
 
-    // ----- 2) Attach live geofence listener -----
-    // First emission registers geofences with the engine at startup.
-    // Subsequent emissions re-register whenever a geofence document is added,
-    // changed (center, radius), or removed in Firestore — no app restart needed.
-    _geofenceSub?.cancel();
-    final geofencesReady = Completer<void>();
-    _geofenceSub = fs.collection('regions/$regionId/geofences').snapshots().listen(
-      (snap) async {
-        final defs = _parseGeofenceDocs(snap.docs);
-        if (defs.isNotEmpty) await _engine.addGeofences(defs);
-        if (!geofencesReady.isCompleted) geofencesReady.complete();
-      },
-      onError: (e) {
-        if (!geofencesReady.isCompleted) geofencesReady.completeError(e);
-      },
-    );
-    await geofencesReady.future;
-
-    // ----- 3) Writer (shared) -----
+    // ----- 2) Writer (shared) -----
     _writer = FirestoreWriter(uid: uid, writeFn: firestoreWriteAdapter);
 
-    // ----- 4) Listen → write geofence events & breadcrumbs -----
+    // ----- 3) Listen → write geofence events & breadcrumbs -----
+    // Attached before addGeofences() (step 4) so any ENTER that FBG fires
+    // during geofence registration is caught here rather than dropped into
+    // the broadcast stream with no subscriber.
     _fenceSub?.cancel();
     _fenceSub = _engine.onGeofence().listen((e) async {
       final isEnterOrDwell = (e.type == GeofenceEventType.enter ||
@@ -200,6 +199,32 @@ class GeoBootstrap {
       );
     });
 
+    // ----- 4) Attach live geofence listener -----
+    // Runs after _fenceSub is attached (step 3) so the ENTER that FBG may fire
+    // during addGeofences() is not lost.
+    // First emission registers geofences with the engine at startup.
+    // Subsequent emissions re-register whenever a geofence document is added,
+    // changed (center, radius), or removed in Firestore — no app restart needed.
+    _geofenceSub?.cancel();
+    final geofencesReady = Completer<void>();
+    _geofenceSub =
+        fs.collection('regions/$regionId/geofences').snapshots().listen(
+      (snap) async {
+        final defs = _parseGeofenceDocs(snap.docs);
+        if (defs.isNotEmpty) await _engine.addGeofences(defs);
+        if (!geofencesReady.isCompleted) geofencesReady.complete();
+      },
+      onError: (e) {
+        if (!geofencesReady.isCompleted)
+          geofencesReady.completeError(StateError('geo:geofences_load_failed'));
+      },
+    );
+    try {
+      await geofencesReady.future.timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      throw StateError('geo:geofences_timeout');
+    }
+
     // ----- 5) Dart breadcrumb writes (foreground + background) -----
     // Uses the same fixed document ID as zbgingest ({uid}_{tsIso}) so there
     // are never duplicate documents — whichever path writes second is an
@@ -225,7 +250,11 @@ class GeoBootstrap {
     });
 
     // ----- 6) Start engine -----
-    await _engine.start();
+    try {
+      await _engine.start();
+    } catch (_) {
+      throw StateError('geo:engine_start_failed');
+    }
 
     // ----- 6b) Synthesize ENTER if already inside a fence at startup -----
     // FBG may fire an ENTER during addGeofences() (step 2) before _fenceSub is
@@ -233,27 +262,38 @@ class GeoBootstrap {
     // dropped — _enteredAt is never set and zone context stays wrong.
     // synthesizeEnterIfInside() checks current GPS position now that _fenceSub
     // is listening, and emits a synthetic ENTER if inside any registered fence.
-    await _engine.synthesizeEnterIfInside();
+    try {
+      await _engine.synthesizeEnterIfInside();
+    } catch (_) {
+      throw StateError('geo:synthesize_failed');
+    }
 
     // ----- 7) Mark geo as running on user doc -----
+    // _uid is set here — only after all prior steps succeed.
+    // isRunning (== _uid != null) therefore only returns true on full success.
     // geoWakeupSweep queries geo_running == true to find users with breadcrumb
     // gaps. Written after engine.start() so it is only set if startup succeeded.
     // geo_session_started records the last time geo was started or restarted
     // (including homepage-triggered restarts — not just sign-in).
     // geo_mode records the active tracking mode so geoWakeupSweep can skip
     // users in geofence_only mode (they only emit breadcrumbs inside fences).
-    await fs.doc('users/$uid').set(
-      {
-        'geo_running': true,
-        'geo_session_started': FieldValue.serverTimestamp(),
-        // tz_offset_minutes: device UTC offset in minutes (e.g. -300 for EST,
-        // 330 for IST). Written each session start so it stays current across
-        // DST changes. Used by geoWakeupSweep to evaluate local-time window.
-        'tz_offset_minutes': DateTime.now().timeZoneOffset.inMinutes,
-        'geo_mode': _engine.geoSystemMode,
-      },
-      SetOptions(merge: true),
-    );
+    _uid = uid;
+    try {
+      await fs.doc('users/$uid').set(
+        {
+          'geo_running': true,
+          'geo_session_started': FieldValue.serverTimestamp(),
+          // tz_offset_minutes: device UTC offset in minutes (e.g. -300 for EST,
+          // 330 for IST). Written each session start so it stays current across
+          // DST changes. Used by geoWakeupSweep to evaluate local-time window.
+          'tz_offset_minutes': DateTime.now().timeZoneOffset.inMinutes,
+          'geo_mode': _engine.geoSystemMode,
+        },
+        SetOptions(merge: true),
+      );
+    } catch (_) {
+      throw StateError('geo:user_doc_write_failed');
+    }
   }
 
   Future<void> stop() async {
@@ -263,19 +303,38 @@ class GeoBootstrap {
     _configSub = null;
     _geofenceSub?.cancel();
     _geofenceSub = null;
-    await _engine.stop();
+
+    // Track the first error that occurs during cleanup so we can surface it
+    // after all cleanup steps complete (never short-circuit on a single failure).
+    String? errorCode;
+
+    try {
+      await _engine.stop();
+    } catch (_) {
+      errorCode = 'geo:stop_engine_failed';
+    }
+
     _currentZoneId = null;
     _inside = false;
     _zoneCtl.add(ZoneState.outside);
 
     // Mark geo as stopped so geoWakeupSweep no longer targets this user.
     if (_uid != null) {
-      await FirebaseFirestore.instance.doc('users/$_uid').set(
-        {'geo_running': false, 'geo_session_stopped': FieldValue.serverTimestamp()},
-        SetOptions(merge: true),
-      );
+      try {
+        await FirebaseFirestore.instance.doc('users/$_uid').set(
+          {
+            'geo_running': false,
+            'geo_session_stopped': FieldValue.serverTimestamp()
+          },
+          SetOptions(merge: true),
+        );
+      } catch (_) {
+        errorCode ??= 'geo:stop_doc_write_failed';
+      }
       _uid = null;
     }
+
+    if (errorCode != null) throw StateError(errorCode);
   }
 
   /// Returns true if geo is currently running in this process.
@@ -332,8 +391,7 @@ class GeoBootstrap {
       accuracyDropM: (breadcrumbs['accuracy_drop_m'] ?? 50).toDouble(),
       distanceFilterInsideM:
           (breadcrumbs['distance_filter_inside_m'] ?? 10) as int,
-      distanceFilterNearM:
-          (breadcrumbs['distance_filter_near_m'] ?? 20) as int,
+      distanceFilterNearM: (breadcrumbs['distance_filter_near_m'] ?? 20) as int,
       distanceFilterOutsideM:
           (breadcrumbs['distance_filter_outside_m'] ?? 100) as int,
       startOnBoot: (platform['start_on_boot'] ?? true) as bool,
@@ -347,6 +405,15 @@ class GeoBootstrap {
       maxBatchSize: (platform['max_batch_size'] ?? 8) as int,
       // Geofence-only mode — default false so existing builds are unaffected
       geofenceOnlyMode: (platform['geofence_only_mode'] ?? false) as bool,
+      // preventSuspend kill switch — default true so existing behavior is preserved
+      preventSuspendInsideZone:
+          (platform['prevent_suspend_inside_zone'] ?? true) as bool,
+
+      // API key sourced from Firestore — null if field absent
+      ingestApiKey: r['ingest_api_key'] as String?,
+
+      // Near-zone radius for outer geofences
+      nearZoneRadiusM: (geoDetect['near_zone_radius_m'] ?? 100) as int,
     );
   }
 }

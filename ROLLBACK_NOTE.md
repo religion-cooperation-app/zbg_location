@@ -1,0 +1,1 @@
+Rollback point: tsbg async fix fbg_5_upgrade branch commit e5be1b0 + current geo bootstrap. geo_bootstrap included in example folder is current to project as of May 15, not the geo_bootstrap that would have been associated with e5be1b0. If this commit does not work well, consider rolling back geo_bootstrap further.
