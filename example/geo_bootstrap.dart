@@ -6,6 +6,7 @@
 import 'dart:async';
 import 'dart:io' show Platform;
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:background_fetch/background_fetch.dart';
@@ -93,7 +94,8 @@ class GeoBootstrap {
         );
         await BackgroundFetch.registerHeadlessTask(
             geoBackgroundFetchHeadlessTask);
-      } catch (_) {
+      } catch (e, st) {
+        FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'background_fetch_configure_failed');
         throw StateError('geo:background_fetch_failed');
       }
     }
@@ -106,7 +108,8 @@ class GeoBootstrap {
       try {
         await fbg.BackgroundGeolocation.registerHeadlessTask(
             geoFbgHeadlessTask);
-      } catch (_) {
+      } catch (e, st) {
+        FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'headless_task_registration_failed');
         throw StateError('geo:headless_task_failed');
       }
     }
@@ -128,13 +131,25 @@ class GeoBootstrap {
             configReady.completeError(StateError('geo:missing_runtime_config'));
           return;
         }
-        final fut = _engine.setConfig(
-          _buildRuntimeConfig(snap.data()! as Map<String, dynamic>),
-        );
+        RuntimeConfig cfg;
+        try {
+          cfg = _buildRuntimeConfig(snap.data()! as Map<String, dynamic>);
+        } catch (e, st) {
+          FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'runtime_config_parse_failed');
+          if (!configReady.isCompleted)
+            configReady.completeError(StateError('geo:config_parse_failed'));
+          return;
+        }
+        final fut = _engine.setConfig(cfg);
         if (!configReady.isCompleted) {
-          fut.then((_) => configReady.complete()).catchError((e) {
+          fut.then((_) => configReady.complete()).catchError((Object e, StackTrace st) {
+            FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'fbg_init_failed');
             if (!configReady.isCompleted)
               configReady.completeError(StateError('geo:fbg_init_failed'));
+          });
+        } else {
+          fut.catchError((Object e, StackTrace st) {
+            FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'live_config_update_failed');
           });
         }
       },
@@ -158,6 +173,9 @@ class GeoBootstrap {
     // the broadcast stream with no subscriber.
     _fenceSub?.cancel();
     _fenceSub = _engine.onGeofence().listen((e) async {
+      FirebaseCrashlytics.instance.log('fence ${e.type.name} zone=${e.fenceId}${e.dwellSeconds != null ? ' dwell=${e.dwellSeconds}s' : ''}');
+      FirebaseCrashlytics.instance.setCustomKey('last_fence_event', e.type.name);
+      FirebaseCrashlytics.instance.setCustomKey('last_fence_id', e.fenceId);
       final isEnterOrDwell = (e.type == GeofenceEventType.enter ||
           e.type == GeofenceEventType.dwell);
       _inside = isEnterOrDwell;
@@ -252,7 +270,8 @@ class GeoBootstrap {
     // ----- 6) Start engine -----
     try {
       await _engine.start();
-    } catch (_) {
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'engine_start_failed');
       throw StateError('geo:engine_start_failed');
     }
 
@@ -264,7 +283,8 @@ class GeoBootstrap {
     // is listening, and emits a synthetic ENTER if inside any registered fence.
     try {
       await _engine.synthesizeEnterIfInside();
-    } catch (_) {
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'synthesize_enter_failed');
       throw StateError('geo:synthesize_failed');
     }
 
@@ -278,6 +298,7 @@ class GeoBootstrap {
     // geo_mode records the active tracking mode so geoWakeupSweep can skip
     // users in geofence_only mode (they only emit breadcrumbs inside fences).
     _uid = uid;
+    FirebaseCrashlytics.instance.setUserIdentifier(uid);
     try {
       await fs.doc('users/$uid').set(
         {
@@ -291,7 +312,8 @@ class GeoBootstrap {
         },
         SetOptions(merge: true),
       );
-    } catch (_) {
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'user_doc_start_write_failed');
       throw StateError('geo:user_doc_write_failed');
     }
   }
@@ -310,7 +332,8 @@ class GeoBootstrap {
 
     try {
       await _engine.stop();
-    } catch (_) {
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'engine_stop_failed');
       errorCode = 'geo:stop_engine_failed';
     }
 
@@ -328,10 +351,12 @@ class GeoBootstrap {
           },
           SetOptions(merge: true),
         );
-      } catch (_) {
+      } catch (e, st) {
+        FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'user_doc_stop_write_failed');
         errorCode ??= 'geo:stop_doc_write_failed';
       }
       _uid = null;
+      FirebaseCrashlytics.instance.setUserIdentifier('');
     }
 
     if (errorCode != null) throw StateError(errorCode);

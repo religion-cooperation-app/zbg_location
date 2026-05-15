@@ -16,6 +16,8 @@ dependencies:
   flutter_background_geolocation: ^5.0.1
   # Handy collection helpers (optional, but useful)
   collection: ^1.18.0
+  # Production crash reporting — must be enabled in host app (FlutterFlow Crashlytics toggle)
+  firebase_crashlytics: ^4.0.0
 
 dev_dependencies:
   flutter_lints: ^5.0.0

@@ -10,6 +10,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
     as fbg;
 
+import 'package:firebase_crashlytics/firebase_crashlytics.dart';
+
 import 'api.dart'; // RuntimeConfig, SamplingMode, GeofenceDef, GeofenceEvent, LocationSample
 import 'utils.dart'; // haversineMeters
 
@@ -97,6 +99,7 @@ class TsbgEngine {
       _listenersAttached = true;
     }
 
+    try {
     await fbg.BackgroundGeolocation.ready(
       fbg.Config(
         // reset and foregroundService remain on Config (not deprecated in v5)
@@ -210,25 +213,39 @@ class TsbgEngine {
         ),
       ),
     );
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'fbg_ready_failed');
+      rethrow;
+    }
 
     // Only mark ready after success — if ready() threw, _ready stays false
     // so the next start attempt retries with reset: true.
     _ready = true;
 
+    FirebaseCrashlytics.instance.setCustomKey('geofence_only_mode', cfg.geofenceOnlyMode.toString());
+    FirebaseCrashlytics.instance.setCustomKey('auto_sync_threshold', cfg.autoSyncThreshold);
+    FirebaseCrashlytics.instance.setCustomKey('batch_sync', cfg.batchSync.toString());
+    FirebaseCrashlytics.instance.setCustomKey('prevent_suspend_inside', cfg.preventSuspendInsideZone.toString());
+
     // Fix 1: Explicitly clear any stale persistence.extras from a previous session.
     // ready() with reset:false silently ignores extras changes; direct setConfig() always applies.
     // autoSyncThreshold is also applied here so live Firestore config changes propagate
     // to the running engine (ready() with reset:false does not re-apply these).
-    await fbg.BackgroundGeolocation.setConfig(fbg.Config(
-      autoSyncThreshold: cfg.autoSyncThreshold,
-      persistence: fbg.PersistenceConfig(extras: httpParams),
-    ));
+    try {
+      await fbg.BackgroundGeolocation.setConfig(fbg.Config(
+        autoSyncThreshold: cfg.autoSyncThreshold,
+        persistence: fbg.PersistenceConfig(extras: httpParams),
+      ));
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'fbg_setconfig_failed');
+    }
 
     // Apply the current mode’s config (outside by default).
     await _applyMode(_mode);
   }
 
   Future<void> addGeofences(List<GeofenceDef> defs) async {
+    try {
     // Diff incoming defs against current _defs so we only add/remove what
     // actually changed. Calling removeGeofences() on every update tears down
     // CLRegionMonitoring entirely on iOS, creating a blind window where
@@ -290,6 +307,11 @@ class TsbgEngine {
     _defs
       ..clear()
       ..addAll(defs);
+    FirebaseCrashlytics.instance.setCustomKey('fence_count', _defs.length);
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'geofence_registration_failed');
+      rethrow;
+    }
   }
 
   Future<void> start() async {
@@ -301,12 +323,40 @@ class TsbgEngine {
       if (state.enabled) return;
       _started = false;
     }
-    if (_cfg?.geofenceOnlyMode == true) {
-      await fbg.BackgroundGeolocation.startGeofences();
-    } else {
-      await fbg.BackgroundGeolocation.start();
+    try {
+      if (_cfg?.geofenceOnlyMode == true) {
+        await fbg.BackgroundGeolocation.startGeofences();
+      } else {
+        await fbg.BackgroundGeolocation.start();
+      }
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'fbg_start_failed');
+      rethrow;
     }
     _started = true;
+
+    // Startup diagnostics — silent; must not block normal startup path.
+    try {
+      final state = await fbg.BackgroundGeolocation.state;
+      if (!state.enabled) {
+        FirebaseCrashlytics.instance.recordError(
+          StateError('fbg_not_enabled_after_start'),
+          StackTrace.current,
+          fatal: false,
+        );
+      }
+      if (Platform.isAndroid) {
+        final ds = await fbg.BackgroundGeolocation.deviceSettings;
+        if (!ds.isIgnoringBatteryOptimizations) {
+          FirebaseCrashlytics.instance.recordError(
+            StateError('battery_optimization_not_disabled'),
+            StackTrace.current,
+            fatal: false,
+            reason: 'App is not on battery whitelist — OEM kill risk elevated',
+          );
+        }
+      }
+    } catch (_) {}
   }
 
   Future<void> stop() async {
@@ -315,6 +365,9 @@ class TsbgEngine {
     _exitHysteresisTimer = null;
     try {
       await fbg.BackgroundGeolocation.stop();
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'fbg_stop_failed');
+      rethrow;
     } finally {
       // Always clear all state — even if the native stop() threw — so a
       // subsequent start() call is not blocked by a stale _started flag.
@@ -374,9 +427,8 @@ class TsbgEngine {
           break; // only one zone active at a time
         }
       }
-    } catch (_) {
-      // GPS unavailable or timed out — no synthetic ENTER; zbgIngest computed
-      // path will detect the ENTER from the next breadcrumb batch.
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'synthesize_enter_gps_unavailable');
     }
   }
 
@@ -476,6 +528,7 @@ class TsbgEngine {
 
     // HEARTBEAT — ensures timed emission even when stationary
     fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent e) async {
+      FirebaseCrashlytics.instance.log('hb mode=${_mode.name} ts=${DateTime.now().toUtc().toIso8601String()}');
       // Prefer last known location from SDK; fall back to a lightweight fetch.
       fbg.Location? loc = e.location;
       if (loc == null) {
@@ -484,11 +537,49 @@ class TsbgEngine {
             samples: 1,
             persist: true,
           );
-        } catch (_) {
+        } catch (e, st) {
+          FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'heartbeat_gps_unavailable');
           return;
         }
       }
       await _maybeEmitFromFBGLocation(loc, reason: 'heartbeat');
+    });
+
+    // OEM / OS interference monitoring
+    fbg.BackgroundGeolocation.onPowerSaveChange((bool isPowerSave) {
+      FirebaseCrashlytics.instance.log('power_save: $isPowerSave');
+      if (isPowerSave) {
+        FirebaseCrashlytics.instance.recordError(
+          StateError('oem_power_save_enabled'),
+          StackTrace.current,
+          fatal: false,
+          reason: 'Device entered power-save mode — OEM may kill background service',
+        );
+      }
+    });
+
+    fbg.BackgroundGeolocation.onProviderChange((fbg.ProviderChangeEvent e) {
+      FirebaseCrashlytics.instance.log('provider: gps=${e.gps} network=${e.network} enabled=${e.enabled}');
+      if (!e.enabled) {
+        FirebaseCrashlytics.instance.recordError(
+          StateError('location_provider_disabled'),
+          StackTrace.current,
+          fatal: false,
+          reason: 'Location provider disabled (airplane mode or user toggle)',
+        );
+      }
+    });
+
+    fbg.BackgroundGeolocation.onEnabledChange((bool enabled) {
+      FirebaseCrashlytics.instance.log('fbg_enabled: $enabled');
+      if (!enabled && _started) {
+        FirebaseCrashlytics.instance.recordError(
+          StateError('fbg_disabled_while_running'),
+          StackTrace.current,
+          fatal: false,
+          reason: 'FBG was disabled while engine believed it was running — possible OEM kill',
+        );
+      }
     });
 
     // GEOFENCE
@@ -652,6 +743,8 @@ class TsbgEngine {
     }
 
     _mode = mode;
+    FirebaseCrashlytics.instance.setCustomKey('zone_state', mode.name);
+    FirebaseCrashlytics.instance.log('zone_transition: ${mode.name}');
   }
 
   /// Central gate for "whatever's first" (distance OR time) emission.
