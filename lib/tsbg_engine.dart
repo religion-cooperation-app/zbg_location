@@ -13,6 +13,7 @@ import 'package:flutter_background_geolocation/flutter_background_geolocation.da
 import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 
 import 'api.dart'; // RuntimeConfig, SamplingMode, GeofenceDef, GeofenceEvent, LocationSample
+import 'src/battery_check.dart';
 import 'utils.dart'; // haversineMeters
 
 // Native HTTP upload config for background ingestion.
@@ -345,16 +346,14 @@ class TsbgEngine {
           fatal: false,
         );
       }
-      if (Platform.isAndroid) {
-        final ds = await fbg.BackgroundGeolocation.deviceSettings;
-        if (!ds.isIgnoringBatteryOptimizations) {
-          FirebaseCrashlytics.instance.recordError(
-            StateError('battery_optimization_not_disabled'),
-            StackTrace.current,
-            fatal: false,
-            reason: 'App is not on battery whitelist — OEM kill risk elevated',
-          );
-        }
+      final ignoring = await isIgnoringBatteryOptimizations();
+      if (!ignoring) {
+        FirebaseCrashlytics.instance.recordError(
+          StateError('battery_optimization_not_disabled'),
+          StackTrace.current,
+          fatal: false,
+          reason: 'App is not on battery whitelist — OEM kill risk elevated',
+        );
       }
     } catch (_) {}
   }
