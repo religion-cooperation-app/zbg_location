@@ -13,6 +13,46 @@ class GeoDiagnosticsWriter {
   static const _dbName = 'sparrc_offline.db';
   static const _kvTable = 'kv_store';
   static const _lastStateKey = 'geo_diag_last_state';
+  static const _identityKey = 'geo_diag_identity';
+
+  static Future<void> storeIdentity({
+    required String uid,
+    required String regionId,
+  }) async {
+    if (kIsWeb) return;
+    if (uid.isEmpty || regionId.isEmpty) return;
+
+    try {
+      await _writeString(
+        _identityKey,
+        jsonEncode({
+          'uid': uid,
+          'region_id': regionId,
+          'client_updated_at_iso': DateTime.now().toUtc().toIso8601String(),
+        }),
+      );
+    } catch (e, st) {
+      await _recordNonFatal(e, st, 'zbg_geo_diag_store_identity_failed');
+    }
+  }
+
+  static Future<GeoDiagnosticsIdentity?> readIdentity() async {
+    if (kIsWeb) return null;
+
+    try {
+      final raw = await _readString(_identityKey);
+      if (raw == null || raw.isEmpty) return null;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      final uid = decoded['uid'] as String?;
+      final regionId = decoded['region_id'] as String?;
+      if (uid == null || uid.isEmpty) return null;
+      return GeoDiagnosticsIdentity(uid: uid, regionId: regionId);
+    } catch (e, st) {
+      await _recordNonFatal(e, st, 'zbg_geo_diag_read_identity_failed');
+      return null;
+    }
+  }
 
   static Future<void> recordProviderChange(
     fbg.ProviderChangeEvent event, {
@@ -278,4 +318,14 @@ class GeoDiagnosticsWriter {
       // Diagnostics must not affect location tracking.
     }
   }
+}
+
+class GeoDiagnosticsIdentity {
+  const GeoDiagnosticsIdentity({
+    required this.uid,
+    required this.regionId,
+  });
+
+  final String uid;
+  final String? regionId;
 }

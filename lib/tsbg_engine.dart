@@ -68,6 +68,10 @@ class TsbgEngine {
   void setIdentity({required String uid, required String regionId}) {
     _uid = uid;
     _regionId = regionId;
+    unawaited(GeoDiagnosticsWriter.storeIdentity(
+      uid: uid,
+      regionId: regionId,
+    ));
   }
 
   /// --------------------------------------------
