@@ -1,7 +1,6 @@
 /// lib/writers.dart
 /// Purpose:
 /// - Build validated Firestore document maps for breadcrumbs & geofence events
-/// - Keep the package pure Dart (no cloud_firestore dependency)
 /// - Defer the actual write to an injected function so apps decide how to write
 ///
 /// How to use from an app:
@@ -58,7 +57,7 @@ class FirestoreWriter {
   /// Create a breadcrumb document (validating fields to match your Security Rules).
   Future<String> writeBreadcrumb({
     required String regionId,
-    required String tsIso,         // ISO-8601 UTC string recommended
+    required String tsIso, // ISO-8601 UTC string recommended
     required double lat,
     required double lng,
     required double accuracyM,
@@ -67,8 +66,8 @@ class FirestoreWriter {
     String? zoneId,
     bool? insideZone,
     String source = 'app',
-    Map<String, dynamic>? extra,   // room for future fields
-    String? fixedId,               // set to produce a fixed doc id (useful in tests)
+    Map<String, dynamic>? extra, // room for future fields
+    String? fixedId, // set to produce a fixed doc id (useful in tests)
   }) async {
     final doc = _buildBreadcrumb(
       regionId: regionId,
@@ -90,10 +89,10 @@ class FirestoreWriter {
   /// Create a geofence event (ENTER/DWELL/EXIT). Separate collection by default.
   Future<String> writeGeofenceEvent({
     required String regionId,
-    required String event,   // 'ENTER' | 'DWELL' | 'EXIT'
+    required String event, // 'ENTER' | 'DWELL' | 'EXIT'
     required String tsIso,
     String? zoneId,
-    int? dwellSeconds,       // seconds dwelled; set on DWELL and EXIT events
+    int? dwellSeconds, // seconds dwelled; set on DWELL and EXIT events
     Map<String, dynamic>? extra,
     String? fixedId,
   }) async {
@@ -172,9 +171,11 @@ class FirestoreWriter {
     _assertNumber(d['accuracy_m'], 'accuracy_m');
     _assertString(d['geohash_p7'], 'geohash_p7');
 
-    if (d.containsKey('geohash_p8')) _assertString(d['geohash_p8'], 'geohash_p8');
+    if (d.containsKey('geohash_p8'))
+      _assertString(d['geohash_p8'], 'geohash_p8');
     if (d.containsKey('zoneId')) _assertString(d['zoneId'], 'zoneId');
-    if (d.containsKey('inside_zone')) _assertBool(d['inside_zone'], 'inside_zone');
+    if (d.containsKey('inside_zone'))
+      _assertBool(d['inside_zone'], 'inside_zone');
     if (d.containsKey('source')) _assertString(d['source'], 'source');
   }
 
@@ -196,5 +197,5 @@ class FirestoreWriter {
 
   void _assertBool(Object? v, String name) {
     if (v is! bool) throw ArgumentError('Field "$name" must be a bool.');
-    }
+  }
 }

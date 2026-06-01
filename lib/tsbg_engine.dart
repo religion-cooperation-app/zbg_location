@@ -13,6 +13,7 @@ import 'package:flutter_background_geolocation/flutter_background_geolocation.da
 import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 
 import 'api.dart'; // RuntimeConfig, SamplingMode, GeofenceDef, GeofenceEvent, LocationSample
+import 'geo_diagnostics_writer.dart';
 import 'utils.dart'; // haversineMeters
 
 // Native HTTP upload config for background ingestion.
@@ -100,121 +101,124 @@ class TsbgEngine {
     }
 
     try {
-    await fbg.BackgroundGeolocation.ready(
-      fbg.Config(
-        // reset and foregroundService remain on Config (not deprecated in v5)
-        reset: !_ready,
-        foregroundService: true,
+      await fbg.BackgroundGeolocation.ready(
+        fbg.Config(
+          // reset and foregroundService remain on Config (not deprecated in v5)
+          reset: !_ready,
+          foregroundService: true,
 
-        geolocation: fbg.GeoConfig(
-          desiredAccuracy: fbg.DesiredAccuracy.high,
-          // Allow FBG to scale distanceFilter with speed (elasticity).
-          // At rest/walking: baseline distanceFilter applies. At speed: FBG
-          // multiplies it proportionally, reducing GPS polling when moving fast.
-          // distanceFilter per mode is the minimum floor — never scaled below it.
-          disableElasticity: false,
-          // Configurable from Firestore — how long before FBG stops GPS after no motion.
-          stopTimeout: cfg.stopTimeoutMinutes,
-          // iOS: prevent CoreLocation from pausing updates on stationary devices.
-          pausesLocationUpdatesAutomatically: false,
-          // iOS: declare walking/non-automotive movement so CoreLocation applies
-          // less aggressive power management in background. FBG silently ignores
-          // this on Android — no platform guard needed.
-          activityType: fbg.ActivityType.otherNavigation,
-          // Minimum distance device must move from stationary position before
-          // FBG transitions to moving state. 25 is FBG's enforced minimum.
-          // iOS applies its own ~200m floor in terminated state regardless.
-          stationaryRadius: 25,
-          // Fire ENTER immediately if device is already inside a fence when
-          // geofences are registered. Complements synthesizeEnterIfInside()
-          // with a native-layer check that requires no GPS fetch.
-          geofenceInitialTriggerEntry: true,
-          // Android-only per FBG docs — enables active GPS for geofence EXIT
-          // detection. Has no effect on iOS (CLRegionMonitoring handles that).
-          geofenceModeHighAccuracy: Platform.isAndroid,
-          // iOS: request Always authorisation explicitly and provide all required
-          // dialog keys so FBG can render the upgrade prompt on iOS 13+.
-          // Without the full key set, FBG cannot show the Settings shortcut for
-          // users who previously denied or downgraded permission.
-          locationAuthorizationRequest: 'Always',
-          locationAuthorizationAlert: {
-            'titleWhenNotEnabled': 'Location services disabled',
-            'titleWhenInUse': 'Background location required',
-            'instructions': 'SPARRC uses location to detect entry and exit from study locations. Please enable Always Allow.',
-            'cancelButton': 'Cancel',
-            'settingsButton': 'Settings',
-          },
-        ),
-
-        app: fbg.AppConfig(
-          startOnBoot: cfg.startOnBoot,
-          stopOnTerminate: cfg.stopOnTerminate,
-          // Android: required to invoke geoFbgHeadlessTask in terminated state.
-          // Always pair with stopOnTerminate: false per FBG docs.
-          enableHeadless: true,
-          // iOS: periodically invalidate/recreate CLLocationManager via the
-          // background task API to prevent iOS from suspending the process
-          // between GPS wakeups. Closes most remaining background data gaps.
-          preventSuspend: true,
-          // Suppress heads-up banner and status bar icon on Android.
-          // The notification still appears in the shade (OS requirement for
-          // foreground services) but is otherwise invisible during normal use.
-          notification: fbg.Notification(
-            title: 'Location Detection',
-            text: 'SPARRC is tracking device location changes',
-            priority: fbg.NotificationPriority.min,
-            sticky: false,
+          geolocation: fbg.GeoConfig(
+            desiredAccuracy: fbg.DesiredAccuracy.high,
+            // Allow FBG to scale distanceFilter with speed (elasticity).
+            // At rest/walking: baseline distanceFilter applies. At speed: FBG
+            // multiplies it proportionally, reducing GPS polling when moving fast.
+            // distanceFilter per mode is the minimum floor — never scaled below it.
+            disableElasticity: false,
+            // Configurable from Firestore — how long before FBG stops GPS after no motion.
+            stopTimeout: cfg.stopTimeoutMinutes,
+            // iOS: prevent CoreLocation from pausing updates on stationary devices.
+            pausesLocationUpdatesAutomatically: false,
+            // iOS: declare walking/non-automotive movement so CoreLocation applies
+            // less aggressive power management in background. FBG silently ignores
+            // this on Android — no platform guard needed.
+            activityType: fbg.ActivityType.otherNavigation,
+            // Minimum distance device must move from stationary position before
+            // FBG transitions to moving state. 25 is FBG's enforced minimum.
+            // iOS applies its own ~200m floor in terminated state regardless.
+            stationaryRadius: 25,
+            // Fire ENTER immediately if device is already inside a fence when
+            // geofences are registered. Complements synthesizeEnterIfInside()
+            // with a native-layer check that requires no GPS fetch.
+            geofenceInitialTriggerEntry: true,
+            // Android-only per FBG docs — enables active GPS for geofence EXIT
+            // detection. Has no effect on iOS (CLRegionMonitoring handles that).
+            geofenceModeHighAccuracy: Platform.isAndroid,
+            // iOS: request Always authorisation explicitly and provide all required
+            // dialog keys so FBG can render the upgrade prompt on iOS 13+.
+            // Without the full key set, FBG cannot show the Settings shortcut for
+            // users who previously denied or downgraded permission.
+            locationAuthorizationRequest: 'Always',
+            locationAuthorizationAlert: {
+              'titleWhenNotEnabled': 'Location services disabled',
+              'titleWhenInUse': 'Background location required',
+              'instructions':
+                  'SPARRC uses location to detect entry and exit from study locations. Please enable Always Allow.',
+              'cancelButton': 'Cancel',
+              'settingsButton': 'Settings',
+            },
           ),
-          // Android: rationale shown when upgrading to Always Allow permission.
-          backgroundPermissionRationale: fbg.PermissionRationale(
-            message: 'SPARRC uses location to log entry and exit from study locations and to log participation events.',
+
+          app: fbg.AppConfig(
+            startOnBoot: cfg.startOnBoot,
+            stopOnTerminate: cfg.stopOnTerminate,
+            // Android: required to invoke geoFbgHeadlessTask in terminated state.
+            // Always pair with stopOnTerminate: false per FBG docs.
+            enableHeadless: true,
+            // iOS: periodically invalidate/recreate CLLocationManager via the
+            // background task API to prevent iOS from suspending the process
+            // between GPS wakeups. Closes most remaining background data gaps.
+            preventSuspend: true,
+            // Suppress heads-up banner and status bar icon on Android.
+            // The notification still appears in the shade (OS requirement for
+            // foreground services) but is otherwise invisible during normal use.
+            notification: fbg.Notification(
+              title: 'Location Detection',
+              text: 'SPARRC is tracking device location changes',
+              priority: fbg.NotificationPriority.min,
+              sticky: false,
+            ),
+            // Android: rationale shown when upgrading to Always Allow permission.
+            backgroundPermissionRationale: fbg.PermissionRationale(
+              message:
+                  'SPARRC uses location to log entry and exit from study locations and to log participation events.',
+            ),
+          ),
+
+          http: fbg.HttpConfig(
+            // Native HTTP → Cloud Function (background-safe).
+            url: _zbgIngestUrl,
+            headers: {
+              'X-Api-Key': cfg.ingestApiKey ??
+                  (throw StateError(
+                      'ingestApiKey is null — add ingest_api_key to appConfig/runtime')),
+            },
+            // Sent with every request (query/body-level params)
+            params: httpParams,
+            autoSync: true,
+            batchSync: cfg.batchSync,
+            maxBatchSize: cfg.maxBatchSize,
+            autoSyncThreshold: cfg.autoSyncThreshold,
+            // NOTE: no rootProperty here; defaults to 'location'
+            // 25s timeout fits within iOS SLC / background-fetch wakeup windows
+            // (~30s), giving FBG the best chance of completing a POST before iOS
+            // reclaims the process. Default of 60s exceeds the wakeup window.
+            timeout: 25000,
+          ),
+
+          persistence: fbg.PersistenceConfig(
+            // Sent with each recorded location/geofence as .extras
+            extras: httpParams,
+            // Keep unsynced SQLite records for 30 days so locations accumulated
+            // during extended offline periods are still recoverable on next open.
+            maxDaysToPersist: 30,
+          ),
+
+          activity: fbg.ActivityConfig(
+            // Allow FBG to enter low-power stationary mode when the device stops
+            // moving. The heartbeat handles breadcrumb emission while stationary;
+            // the accelerometer wakes FBG when motion resumes. Keeping this true
+            // burns maximum battery and causes iOS to throttle/kill the process.
+            disableStopDetection: false,
+          ),
+
+          logger: fbg.LoggerConfig(
+            debug: false,
           ),
         ),
-
-        http: fbg.HttpConfig(
-          // Native HTTP → Cloud Function (background-safe).
-          url: _zbgIngestUrl,
-          headers: {
-            'X-Api-Key': cfg.ingestApiKey ??
-                (throw StateError(
-                    'ingestApiKey is null — add ingest_api_key to appConfig/runtime')),
-          },
-          // Sent with every request (query/body-level params)
-          params: httpParams,
-          autoSync: true,
-          batchSync: cfg.batchSync,
-          maxBatchSize: cfg.maxBatchSize,
-          autoSyncThreshold: cfg.autoSyncThreshold,
-          // NOTE: no rootProperty here; defaults to 'location'
-          // 25s timeout fits within iOS SLC / background-fetch wakeup windows
-          // (~30s), giving FBG the best chance of completing a POST before iOS
-          // reclaims the process. Default of 60s exceeds the wakeup window.
-          timeout: 25000,
-        ),
-
-        persistence: fbg.PersistenceConfig(
-          // Sent with each recorded location/geofence as .extras
-          extras: httpParams,
-          // Keep unsynced SQLite records for 30 days so locations accumulated
-          // during extended offline periods are still recoverable on next open.
-          maxDaysToPersist: 30,
-        ),
-
-        activity: fbg.ActivityConfig(
-          // Allow FBG to enter low-power stationary mode when the device stops
-          // moving. The heartbeat handles breadcrumb emission while stationary;
-          // the accelerometer wakes FBG when motion resumes. Keeping this true
-          // burns maximum battery and causes iOS to throttle/kill the process.
-          disableStopDetection: false,
-        ),
-
-        logger: fbg.LoggerConfig(
-          debug: false,
-        ),
-      ),
-    );
+      );
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'fbg_ready_failed');
+      FirebaseCrashlytics.instance
+          .recordError(e, st, fatal: false, reason: 'fbg_ready_failed');
       rethrow;
     }
 
@@ -222,10 +226,14 @@ class TsbgEngine {
     // so the next start attempt retries with reset: true.
     _ready = true;
 
-    FirebaseCrashlytics.instance.setCustomKey('geofence_only_mode', cfg.geofenceOnlyMode.toString());
-    FirebaseCrashlytics.instance.setCustomKey('auto_sync_threshold', cfg.autoSyncThreshold);
-    FirebaseCrashlytics.instance.setCustomKey('batch_sync', cfg.batchSync.toString());
-    FirebaseCrashlytics.instance.setCustomKey('prevent_suspend_inside', cfg.preventSuspendInsideZone.toString());
+    FirebaseCrashlytics.instance
+        .setCustomKey('geofence_only_mode', cfg.geofenceOnlyMode.toString());
+    FirebaseCrashlytics.instance
+        .setCustomKey('auto_sync_threshold', cfg.autoSyncThreshold);
+    FirebaseCrashlytics.instance
+        .setCustomKey('batch_sync', cfg.batchSync.toString());
+    FirebaseCrashlytics.instance.setCustomKey(
+        'prevent_suspend_inside', cfg.preventSuspendInsideZone.toString());
 
     // Fix 1: Explicitly clear any stale persistence.extras from a previous session.
     // ready() with reset:false silently ignores extras changes; direct setConfig() always applies.
@@ -237,7 +245,8 @@ class TsbgEngine {
         persistence: fbg.PersistenceConfig(extras: httpParams),
       ));
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'fbg_setconfig_failed');
+      FirebaseCrashlytics.instance
+          .recordError(e, st, fatal: false, reason: 'fbg_setconfig_failed');
     }
 
     // Apply the current mode’s config (outside by default).
@@ -246,70 +255,71 @@ class TsbgEngine {
 
   Future<void> addGeofences(List<GeofenceDef> defs) async {
     try {
-    // Diff incoming defs against current _defs so we only add/remove what
-    // actually changed. Calling removeGeofences() on every update tears down
-    // CLRegionMonitoring entirely on iOS, creating a blind window where
-    // crossings are missed until re-registration completes.
-    final incoming = <String, GeofenceDef>{
-      for (final d in defs)
-        if (d.type == 'circle' &&
-            d.lat != null &&
-            d.lng != null &&
-            d.radiusM != null)
-          d.ident: d,
-    };
-    final current = <String, GeofenceDef>{for (final d in _defs) d.ident: d};
+      // Diff incoming defs against current _defs so we only add/remove what
+      // actually changed. Calling removeGeofences() on every update tears down
+      // CLRegionMonitoring entirely on iOS, creating a blind window where
+      // crossings are missed until re-registration completes.
+      final incoming = <String, GeofenceDef>{
+        for (final d in defs)
+          if (d.type == 'circle' &&
+              d.lat != null &&
+              d.lng != null &&
+              d.radiusM != null)
+            d.ident: d,
+      };
+      final current = <String, GeofenceDef>{for (final d in _defs) d.ident: d};
 
-    // Remove fences that are no longer in the incoming list (inner + outer near-zone)
-    for (final ident in current.keys) {
-      if (!incoming.containsKey(ident)) {
-        await fbg.BackgroundGeolocation.removeGeofence(ident);
-        await fbg.BackgroundGeolocation.removeGeofence('${ident}_near');
+      // Remove fences that are no longer in the incoming list (inner + outer near-zone)
+      for (final ident in current.keys) {
+        if (!incoming.containsKey(ident)) {
+          await fbg.BackgroundGeolocation.removeGeofence(ident);
+          await fbg.BackgroundGeolocation.removeGeofence('${ident}_near');
+        }
       }
-    }
 
-    // Add fences that are new or whose geometry has changed
-    for (final d in incoming.values) {
-      final existing = current[d.ident];
-      final changed = existing == null ||
-          existing.lat != d.lat ||
-          existing.lng != d.lng ||
-          existing.radiusM != d.radiusM;
-      if (changed) {
-        await fbg.BackgroundGeolocation.addGeofence(
-          fbg.Geofence(
-            identifier: d.ident,
-            latitude: d.lat!,
-            longitude: d.lng!,
-            radius: d.radiusM!,
-            notifyOnEntry: true,
-            notifyOnExit: true,
-            notifyOnDwell: true,
-            loiteringDelay: (_cfg?.dwellRequiredS ?? 60) * 1000,
-          ),
-        );
-        final nearRadiusM = (_cfg?.nearZoneRadiusM ?? 100).toDouble();
-        await fbg.BackgroundGeolocation.addGeofence(
-          fbg.Geofence(
-            identifier: '${d.ident}_near',
-            latitude: d.lat!,
-            longitude: d.lng!,
-            radius: d.radiusM! + nearRadiusM,
-            notifyOnEntry: true,
-            notifyOnExit: true,
-            notifyOnDwell: false,
-            loiteringDelay: 0,
-          ),
-        );
+      // Add fences that are new or whose geometry has changed
+      for (final d in incoming.values) {
+        final existing = current[d.ident];
+        final changed = existing == null ||
+            existing.lat != d.lat ||
+            existing.lng != d.lng ||
+            existing.radiusM != d.radiusM;
+        if (changed) {
+          await fbg.BackgroundGeolocation.addGeofence(
+            fbg.Geofence(
+              identifier: d.ident,
+              latitude: d.lat!,
+              longitude: d.lng!,
+              radius: d.radiusM!,
+              notifyOnEntry: true,
+              notifyOnExit: true,
+              notifyOnDwell: true,
+              loiteringDelay: (_cfg?.dwellRequiredS ?? 60) * 1000,
+            ),
+          );
+          final nearRadiusM = (_cfg?.nearZoneRadiusM ?? 100).toDouble();
+          await fbg.BackgroundGeolocation.addGeofence(
+            fbg.Geofence(
+              identifier: '${d.ident}_near',
+              latitude: d.lat!,
+              longitude: d.lng!,
+              radius: d.radiusM! + nearRadiusM,
+              notifyOnEntry: true,
+              notifyOnExit: true,
+              notifyOnDwell: false,
+              loiteringDelay: 0,
+            ),
+          );
+        }
       }
-    }
 
-    _defs
-      ..clear()
-      ..addAll(defs);
-    FirebaseCrashlytics.instance.setCustomKey('fence_count', _defs.length);
+      _defs
+        ..clear()
+        ..addAll(defs);
+      FirebaseCrashlytics.instance.setCustomKey('fence_count', _defs.length);
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'geofence_registration_failed');
+      FirebaseCrashlytics.instance.recordError(e, st,
+          fatal: false, reason: 'geofence_registration_failed');
       rethrow;
     }
   }
@@ -330,7 +340,8 @@ class TsbgEngine {
         await fbg.BackgroundGeolocation.start();
       }
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'fbg_start_failed');
+      FirebaseCrashlytics.instance
+          .recordError(e, st, fatal: false, reason: 'fbg_start_failed');
       rethrow;
     }
     _started = true;
@@ -355,7 +366,8 @@ class TsbgEngine {
     try {
       await fbg.BackgroundGeolocation.stop();
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'fbg_stop_failed');
+      FirebaseCrashlytics.instance
+          .recordError(e, st, fatal: false, reason: 'fbg_stop_failed');
       rethrow;
     } finally {
       // Always clear all state — even if the native stop() threw — so a
@@ -399,7 +411,9 @@ class TsbgEngine {
         if (def.type != 'circle' ||
             def.lat == null ||
             def.lng == null ||
-            def.radiusM == null) continue;
+            def.radiusM == null) {
+          continue;
+        }
         final dist = haversineMeters(lat, lng, def.lat!, def.lng!);
         if (dist <= def.radiusM!) {
           final ts = DateTime.now().toUtc();
@@ -417,7 +431,8 @@ class TsbgEngine {
         }
       }
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'synthesize_enter_gps_unavailable');
+      FirebaseCrashlytics.instance.recordError(e, st,
+          fatal: false, reason: 'synthesize_enter_gps_unavailable');
     }
   }
 
@@ -453,7 +468,10 @@ class TsbgEngine {
     final nearRadiusM = (_cfg?.nearZoneRadiusM ?? 100).toDouble();
     await fbg.BackgroundGeolocation.removeGeofences();
     for (final d in _defs) {
-      if (d.type == 'circle' && d.lat != null && d.lng != null && d.radiusM != null) {
+      if (d.type == 'circle' &&
+          d.lat != null &&
+          d.lng != null &&
+          d.radiusM != null) {
         await fbg.BackgroundGeolocation.addGeofence(
           fbg.Geofence(
             identifier: d.ident,
@@ -517,7 +535,8 @@ class TsbgEngine {
 
     // HEARTBEAT — ensures timed emission even when stationary
     fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent e) async {
-      FirebaseCrashlytics.instance.log('hb mode=${_mode.name} ts=${DateTime.now().toUtc().toIso8601String()}');
+      FirebaseCrashlytics.instance.log(
+          'hb mode=${_mode.name} ts=${DateTime.now().toUtc().toIso8601String()}');
       // Prefer last known location from SDK; fall back to a lightweight fetch.
       fbg.Location? loc = e.location;
       if (loc == null) {
@@ -527,7 +546,8 @@ class TsbgEngine {
             persist: true,
           );
         } catch (e, st) {
-          FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'heartbeat_gps_unavailable');
+          FirebaseCrashlytics.instance.recordError(e, st,
+              fatal: false, reason: 'heartbeat_gps_unavailable');
           return;
         }
       }
@@ -537,18 +557,28 @@ class TsbgEngine {
     // OEM / OS interference monitoring
     fbg.BackgroundGeolocation.onPowerSaveChange((bool isPowerSave) {
       FirebaseCrashlytics.instance.log('power_save: $isPowerSave');
+      unawaited(GeoDiagnosticsWriter.recordPowerSaveChange(
+        isPowerSave,
+        uid: _uid,
+      ));
       if (isPowerSave) {
         FirebaseCrashlytics.instance.recordError(
           StateError('oem_power_save_enabled'),
           StackTrace.current,
           fatal: false,
-          reason: 'Device entered power-save mode — OEM may kill background service',
+          reason:
+              'Device entered power-save mode — OEM may kill background service',
         );
       }
     });
 
     fbg.BackgroundGeolocation.onProviderChange((fbg.ProviderChangeEvent e) {
-      FirebaseCrashlytics.instance.log('provider: gps=${e.gps} network=${e.network} enabled=${e.enabled}');
+      FirebaseCrashlytics.instance.log(
+          'provider: gps=${e.gps} network=${e.network} enabled=${e.enabled} status=${e.status} accuracy=${e.accuracyAuthorization}');
+      unawaited(GeoDiagnosticsWriter.recordProviderChange(
+        e,
+        uid: _uid,
+      ));
       if (!e.enabled) {
         FirebaseCrashlytics.instance.recordError(
           StateError('location_provider_disabled'),
@@ -561,12 +591,17 @@ class TsbgEngine {
 
     fbg.BackgroundGeolocation.onEnabledChange((bool enabled) {
       FirebaseCrashlytics.instance.log('fbg_enabled: $enabled');
+      unawaited(GeoDiagnosticsWriter.recordFbgEnabledChange(
+        enabled,
+        uid: _uid,
+      ));
       if (!enabled && _started) {
         FirebaseCrashlytics.instance.recordError(
           StateError('fbg_disabled_while_running'),
           StackTrace.current,
           fatal: false,
-          reason: 'FBG was disabled while engine believed it was running — possible OEM kill',
+          reason:
+              'FBG was disabled while engine believed it was running — possible OEM kill',
         );
       }
     });
@@ -603,8 +638,8 @@ class TsbgEngine {
       }
 
       // Use SDK timestamp for event time
-      final ts =
-          DateTime.tryParse(e.location.timestamp)?.toUtc() ?? DateTime.now().toUtc();
+      final ts = DateTime.tryParse(e.location.timestamp)?.toUtc() ??
+          DateTime.now().toUtc();
 
       // Dwell tracking state machine
       int? dwellSeconds;
@@ -638,7 +673,8 @@ class TsbgEngine {
 
       // Emit to app FIRST — before calling setConfig back into FBG native,
       // so geo_bootstrap can update zone context while FBG callback is still clean.
-      _fenceCtl.add(GeofenceEvent(e.identifier, t, ts, dwellSeconds: dwellSeconds));
+      _fenceCtl
+          .add(GeofenceEvent(e.identifier, t, ts, dwellSeconds: dwellSeconds));
 
       // Switch mode AFTER emitting, so _applyMode's setConfig() call does not
       // re-enter FBG native while the geofence callback is still mid-execution.
@@ -716,12 +752,14 @@ class TsbgEngine {
           locationUpdateInterval: locationUpdateMs,
         ),
         app: fbg.AppConfig(
-          heartbeatInterval: heartbeatS.toDouble(), // seconds, per AppConfig v5 API (Android min: 60s)
+          heartbeatInterval: heartbeatS
+              .toDouble(), // seconds, per AppConfig v5 API (Android min: 60s)
           // iOS only — engage preventSuspend while inside a zone so heartbeat
           // breadcrumbs fire reliably while stationary. Off outside/near so iOS
           // manages the process normally and CLRegionMonitoring handles wakeups.
           // cfg.preventSuspendInsideZone is a Firestore kill switch (default true).
-          preventSuspend: (mode == SamplingMode.inside) && cfg.preventSuspendInsideZone,
+          preventSuspend:
+              (mode == SamplingMode.inside) && cfg.preventSuspendInsideZone,
         ),
       ),
     );
@@ -737,7 +775,8 @@ class TsbgEngine {
   }
 
   /// Central gate for "whatever's first" (distance OR time) emission.
-  Future<void> _maybeEmitFromFBGLocation(fbg.Location l, {required String reason}) async {
+  Future<void> _maybeEmitFromFBGLocation(fbg.Location l,
+      {required String reason}) async {
     final cfg = _cfg;
     if (cfg == null || !cfg.enabled) return;
 
@@ -747,7 +786,7 @@ class TsbgEngine {
 
     final double lat = c.latitude;
     final double lng = c.longitude;
-    final double acc = (c.accuracy ?? 9999.0);
+    final double acc = c.accuracy;
 
     // Accuracy gate
     if (acc > cfg.accuracyDropM) return;
@@ -779,9 +818,8 @@ class TsbgEngine {
     final lastLng = _lastEmitLng;
     final lastTs = _lastEmitUtc;
 
-    final bool timeDue = (lastTs == null)
-        ? true
-        : nowUtc.difference(lastTs).inSeconds >= rateS;
+    final bool timeDue =
+        (lastTs == null) ? true : nowUtc.difference(lastTs).inSeconds >= rateS;
 
     final double movedM = (lastLat == null || lastLng == null)
         ? double.infinity
@@ -818,13 +856,24 @@ class TsbgEngine {
     // Fix 3a: Near mode reconciliation — if GPS shows us inside the near radius but
     // the outer geofence ENTER was missed (e.g. device was already nearby when fences
     // were registered), switch to near mode now.
-    if (_enteredFenceId == null && _activeNearFences.isEmpty && _mode == SamplingMode.outside) {
+    if (_enteredFenceId == null &&
+        _activeNearFences.isEmpty &&
+        _mode == SamplingMode.outside) {
       final nearRadiusM = (_cfg?.nearZoneRadiusM ?? 100).toDouble();
       for (final d in _defs) {
-        if (d.type != 'circle' || d.lat == null || d.lng == null || d.radiusM == null) continue;
-        if (haversineMeters(lat, lng, d.lat!, d.lng!) <= d.radiusM! + nearRadiusM) {
+        if (d.type != 'circle' ||
+            d.lat == null ||
+            d.lng == null ||
+            d.radiusM == null) {
+          continue;
+        }
+        if (haversineMeters(lat, lng, d.lat!, d.lng!) <=
+            d.radiusM! + nearRadiusM) {
           await _applyMode(SamplingMode.near);
-          if (kDebugMode) debugPrint('[TsbgEngine] near-mode reconciliation: within near zone of ${d.ident}');
+          if (kDebugMode) {
+            debugPrint(
+                '[TsbgEngine] near-mode reconciliation: within near zone of ${d.ident}');
+          }
           break;
         }
       }
@@ -836,7 +885,12 @@ class TsbgEngine {
     if (_enteredFenceId == null) {
       String? containingFence;
       for (final d in _defs) {
-        if (d.type != 'circle' || d.lat == null || d.lng == null || d.radiusM == null) continue;
+        if (d.type != 'circle' ||
+            d.lat == null ||
+            d.lng == null ||
+            d.radiusM == null) {
+          continue;
+        }
         if (haversineMeters(lat, lng, d.lat!, d.lng!) <= d.radiusM!) {
           containingFence = d.ident;
           break;
@@ -850,9 +904,13 @@ class TsbgEngine {
           _enteredAt = nowUtc;
           _enteredFenceId = containingFence;
           _firedMilestones.clear();
-          _fenceCtl.add(GeofenceEvent(containingFence, GeofenceEventType.enter, nowUtc));
+          _fenceCtl.add(
+              GeofenceEvent(containingFence, GeofenceEventType.enter, nowUtc));
           await _applyMode(SamplingMode.inside);
-          if (kDebugMode) debugPrint('[TsbgEngine] synthetic ENTER (reconciliation): $containingFence');
+          if (kDebugMode) {
+            debugPrint(
+                '[TsbgEngine] synthetic ENTER (reconciliation): $containingFence');
+          }
         }
       } else {
         _insideFixFenceId = containingFence;
@@ -865,19 +923,25 @@ class TsbgEngine {
     final dwellCfg = _cfg;
     final enteredAt = _enteredAt;
     final enteredFenceId = _enteredFenceId;
-    if (dwellCfg != null && dwellCfg.dwellEveryS > 0 && enteredAt != null && enteredFenceId != null) {
+    if (dwellCfg != null &&
+        dwellCfg.dwellEveryS > 0 &&
+        enteredAt != null &&
+        enteredFenceId != null) {
       final elapsedS = nowUtc.difference(enteredAt).inSeconds;
-      final milestone = (elapsedS ~/ dwellCfg.dwellEveryS) * dwellCfg.dwellEveryS;
+      final milestone =
+          (elapsedS ~/ dwellCfg.dwellEveryS) * dwellCfg.dwellEveryS;
       if (milestone > 0 && !_firedMilestones.contains(milestone)) {
         _firedMilestones.add(milestone); // boundary used as dedup key
         _fenceCtl.add(GeofenceEvent(
           enteredFenceId,
           GeofenceEventType.dwell,
           nowUtc,
-          dwellSeconds: elapsedS, // actual elapsed time, not the rounded boundary
+          dwellSeconds:
+              elapsedS, // actual elapsed time, not the rounded boundary
         ));
         if (kDebugMode) {
-          debugPrint('[TsbgEngine] dwell milestone fired: ${milestone}s for fence $enteredFenceId');
+          debugPrint(
+              '[TsbgEngine] dwell milestone fired: ${milestone}s for fence $enteredFenceId');
         }
       }
     }
@@ -901,7 +965,10 @@ class TsbgEngine {
           break;
         }
       }
-      if (def != null && def.lat != null && def.lng != null && def.radiusM != null) {
+      if (def != null &&
+          def.lat != null &&
+          def.lng != null &&
+          def.radiusM != null) {
         final distToCenter = haversineMeters(lat, lng, def.lat!, def.lng!);
         if (distToCenter > def.radiusM! + 30.0) {
           final softExitEnteredAt = _enteredAt;
@@ -927,5 +994,4 @@ class TsbgEngine {
       }
     }
   }
-
 }
