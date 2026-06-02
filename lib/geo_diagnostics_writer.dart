@@ -58,6 +58,13 @@ class GeoDiagnosticsWriter {
     fbg.ProviderChangeEvent event, {
     String? uid,
   }) async {
+    await recordProviderChangeResult(event, uid: uid);
+  }
+
+  static Future<GeoDiagnosticsWriteResult> recordProviderChangeResult(
+    fbg.ProviderChangeEvent event, {
+    String? uid,
+  }) async {
     final locationPermission = _locationPermissionName(event.status);
     final locationPrecise = event.accuracyAuthorization ==
         fbg.ProviderChangeEvent.ACCURACY_AUTHORIZATION_FULL;
@@ -71,7 +78,7 @@ class GeoDiagnosticsWriter {
       'location_accuracy_authorization_code': event.accuracyAuthorization,
     };
 
-    await _writeEventIfChanged(
+    return _writeEventIfChanged(
       uid: uid,
       type: 'provider_change',
       source: 'fbg_onProviderChange',
@@ -86,9 +93,16 @@ class GeoDiagnosticsWriter {
     bool isPowerSave, {
     String? uid,
   }) async {
+    await recordPowerSaveChangeResult(isPowerSave, uid: uid);
+  }
+
+  static Future<GeoDiagnosticsWriteResult> recordPowerSaveChangeResult(
+    bool isPowerSave, {
+    String? uid,
+  }) async {
     const key = 'power_save_mode';
     final state = <String, dynamic>{key: isPowerSave};
-    await _writeEventIfChanged(
+    return _writeEventIfChanged(
       uid: uid,
       type: 'power_save_change',
       source: 'fbg_onPowerSaveChange',
@@ -103,9 +117,16 @@ class GeoDiagnosticsWriter {
     bool enabled, {
     String? uid,
   }) async {
+    await recordFbgEnabledChangeResult(enabled, uid: uid);
+  }
+
+  static Future<GeoDiagnosticsWriteResult> recordFbgEnabledChangeResult(
+    bool enabled, {
+    String? uid,
+  }) async {
     const key = 'fbg_enabled';
     final state = <String, dynamic>{key: enabled};
-    await _writeEventIfChanged(
+    return _writeEventIfChanged(
       uid: uid,
       type: 'fbg_enabled_change',
       source: 'fbg_onEnabledChange',
@@ -116,7 +137,7 @@ class GeoDiagnosticsWriter {
     );
   }
 
-  static Future<void> _writeEventIfChanged({
+  static Future<GeoDiagnosticsWriteResult> _writeEventIfChanged({
     required String? uid,
     required String type,
     required String source,
@@ -125,19 +146,39 @@ class GeoDiagnosticsWriter {
     required Map<String, dynamic> currentSnapshotFields,
     required List<String> compareKeys,
   }) async {
-    if (kIsWeb) return;
+    if (kIsWeb) {
+      return GeoDiagnosticsWriteResult.skipped(
+        status: GeoDiagnosticsWriteStatus.webSkipped,
+        type: type,
+        source: source,
+      );
+    }
     final resolvedUid = _resolveUid(uid);
-    if (resolvedUid == null || resolvedUid.isEmpty) return;
+    if (resolvedUid == null || resolvedUid.isEmpty) {
+      return GeoDiagnosticsWriteResult.skipped(
+        status: GeoDiagnosticsWriteStatus.missingUid,
+        type: type,
+        source: source,
+      );
+    }
 
     try {
+      await _log('geo_diag_write_start type=$type source=$source');
       final cleanState = _scalarMap(currentState);
+      await _log('geo_diag_read_last_state_start type=$type');
       final previous = await _readLastState();
+      await _log('geo_diag_read_last_state_done type=$type');
       if (!_hasChanged(
         previous: previous,
         current: cleanState,
         compareKeys: compareKeys,
       )) {
-        return;
+        await _log('geo_diag_deduped_no_change type=$type');
+        return GeoDiagnosticsWriteResult.skipped(
+          status: GeoDiagnosticsWriteStatus.dedupedNoChange,
+          type: type,
+          source: source,
+        );
       }
 
       final nowIso = DateTime.now().toUtc().toIso8601String();
@@ -166,10 +207,23 @@ class GeoDiagnosticsWriter {
         SetOptions(merge: true),
       );
 
+      await _log('geo_diag_firestore_commit_start type=$type');
       await batch.commit();
+      await _log('geo_diag_firestore_commit_done type=$type');
+      await _log('geo_diag_write_last_state_start type=$type');
       await _writeLastState({...previous, ...cleanState});
+      await _log('geo_diag_write_last_state_done type=$type');
+      return GeoDiagnosticsWriteResult.written(
+        type: type,
+        source: source,
+      );
     } catch (e, st) {
       await _recordNonFatal(e, st, 'zbg_geo_diag_write_failed');
+      return GeoDiagnosticsWriteResult.failed(
+        type: type,
+        source: source,
+        error: e,
+      );
     }
   }
 
@@ -317,6 +371,89 @@ class GeoDiagnosticsWriter {
     } catch (_) {
       // Diagnostics must not affect location tracking.
     }
+  }
+
+  static Future<void> _log(String message) async {
+    try {
+      FirebaseCrashlytics.instance.log(message);
+    } catch (_) {
+      // Diagnostics must not affect location tracking.
+    }
+  }
+}
+
+enum GeoDiagnosticsWriteStatus {
+  written,
+  dedupedNoChange,
+  missingUid,
+  webSkipped,
+  failed,
+}
+
+class GeoDiagnosticsWriteResult {
+  const GeoDiagnosticsWriteResult._({
+    required this.status,
+    required this.type,
+    required this.source,
+    this.errorType,
+    this.errorMessage,
+  });
+
+  factory GeoDiagnosticsWriteResult.written({
+    required String type,
+    required String source,
+  }) {
+    return GeoDiagnosticsWriteResult._(
+      status: GeoDiagnosticsWriteStatus.written,
+      type: type,
+      source: source,
+    );
+  }
+
+  factory GeoDiagnosticsWriteResult.skipped({
+    required GeoDiagnosticsWriteStatus status,
+    required String type,
+    required String source,
+  }) {
+    return GeoDiagnosticsWriteResult._(
+      status: status,
+      type: type,
+      source: source,
+    );
+  }
+
+  factory GeoDiagnosticsWriteResult.failed({
+    required String type,
+    required String source,
+    required Object error,
+  }) {
+    return GeoDiagnosticsWriteResult._(
+      status: GeoDiagnosticsWriteStatus.failed,
+      type: type,
+      source: source,
+      errorType: error.runtimeType.toString(),
+      errorMessage: error.toString(),
+    );
+  }
+
+  final GeoDiagnosticsWriteStatus status;
+  final String type;
+  final String source;
+  final String? errorType;
+  final String? errorMessage;
+
+  String get statusName => status.name;
+
+  bool get wrote => status == GeoDiagnosticsWriteStatus.written;
+
+  Map<String, dynamic> toDebugMap() {
+    return {
+      'writer_status': statusName,
+      'writer_type': type,
+      'writer_source': source,
+      if (errorType != null) 'writer_error_type': errorType,
+      if (errorMessage != null) 'writer_error_message': errorMessage,
+    };
   }
 }
 
