@@ -12,7 +12,7 @@ import 'package:sqflite/sqflite.dart';
 class GeoDiagnosticsWriter {
   static const _dbName = 'sparrc_offline.db';
   static const _kvTable = 'kv_store';
-  static const _lastStateKey = 'geo_diag_last_state';
+  static const _lastStateKey = 'geo_diag_fbg_event_last_state';
   static const _identityKey = 'geo_diag_identity';
 
   static Future<void> storeIdentity({
