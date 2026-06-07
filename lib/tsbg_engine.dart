@@ -168,6 +168,7 @@ class TsbgEngine {
             notification: fbg.Notification(
               title: 'Location Detection',
               text: 'SPARRC is tracking device location changes',
+              smallIcon: 'drawable/ic_stat_ic_launcher_foreground',
               priority: fbg.NotificationPriority.min,
               sticky: false,
             ),
