@@ -58,9 +58,13 @@ class TsbgEngine {
   DateTime? _lastEmitUtc;
   double? _lastEmitLat;
   double? _lastEmitLng;
-  DateTime? _lastForceMovingPaceUtc;
+  DateTime? _lastHeartbeatWatchdogUtc;
   bool? _lastConnectivityConnected;
-  static const Duration _forceMovingPaceCooldown = Duration(minutes: 15);
+
+  static const Duration _heartbeatWatchdogInterval = Duration(minutes: 2);
+  static const Duration _heartbeatWatchdogStaleAfter = Duration(minutes: 2);
+  static const int _heartbeatWatchdogTimeoutS = 30;
+  static const double _heartbeatWatchdogMovedM = 60;
 
   // Identity for native HTTP uploads → Cloud Function.
   String? _uid;
@@ -173,7 +177,7 @@ class TsbgEngine {
               text: 'SPARRC is tracking device location changes',
               smallIcon: 'drawable/ic_stat_ic_launcher_foreground',
               priority: fbg.NotificationPriority.low,
-              sticky: true,
+              sticky: false,
             ),
             // Android: rationale shown when upgrading to Always Allow permission.
             backgroundPermissionRationale: fbg.PermissionRationale(
@@ -470,14 +474,29 @@ class TsbgEngine {
   /// already been configured and started. FBG stop detection / stopTimeout can
   /// later return the service to stationary mode.
   Future<String> forceMovingPace({String source = 'foreground'}) async {
-    if (!_ready) return 'skipped:fbg_not_ready';
+    await fbg.Logger.notice('SPARRC force_pace attempt source=$source');
 
     try {
       final state = await fbg.BackgroundGeolocation.state;
-      if (state.enabled != true) return 'skipped:fbg_not_enabled';
+      await fbg.Logger.notice(
+        'SPARRC force_pace state source=$source enabled=${state.enabled} '
+        'isMoving=${state.isMoving}',
+      );
+    } catch (e, st) {
+      await fbg.Logger.notice(
+        'SPARRC force_pace state_unreadable source=$source',
+      );
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'force_moving_pace_state_unreadable',
+      );
+    }
 
+    try {
       await fbg.BackgroundGeolocation.changePace(true);
-      _lastForceMovingPaceUtc = DateTime.now().toUtc();
+      await fbg.Logger.notice('SPARRC force_pace call_returned source=$source');
       FirebaseCrashlytics.instance.log('force_moving_pace: $source');
       FirebaseCrashlytics.instance.setCustomKey(
         'last_force_moving_pace_source',
@@ -489,6 +508,9 @@ class TsbgEngine {
       );
       return 'success';
     } catch (e, st) {
+      await fbg.Logger.notice(
+        'SPARRC force_pace error source=$source error=${e.runtimeType}',
+      );
       FirebaseCrashlytics.instance.recordError(
         e,
         st,
@@ -501,63 +523,100 @@ class TsbgEngine {
 
   Future<String> _maybeForceMovingPace({
     required String source,
-    Duration cooldown = _forceMovingPaceCooldown,
-    bool requireKnownUsableProvider = true,
   }) async {
-    final cfg = _cfg;
-    if (cfg == null || !cfg.enabled) return 'skipped:config_disabled';
-    if (!_ready) return 'skipped:fbg_not_ready';
-    if (!_started) return 'skipped:fbg_not_started';
-    if (_uid == null || _regionId == null) return 'skipped:missing_identity';
-
-    final now = DateTime.now().toUtc();
-    final last = _lastForceMovingPaceUtc;
-    if (last != null && now.difference(last) < cooldown) {
-      return 'skipped:cooldown';
-    }
-
-    try {
-      final provider = await fbg.BackgroundGeolocation.providerState;
-      if (_isProviderExplicitlyUnusable(provider)) {
-        return 'skipped:provider_unusable';
-      }
-      if (requireKnownUsableProvider && !_isProviderUsable(provider)) {
-        return 'skipped:provider_unknown';
-      }
-    } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(
-        e,
-        st,
-        fatal: false,
-        reason: 'force_moving_pace_provider_check_failed',
-      );
-      if (requireKnownUsableProvider) return 'skipped:provider_check_failed';
-    }
-
     return forceMovingPace(source: source);
   }
 
-  void _scheduleForceMovingPace(
-    String source, {
-    Duration cooldown = _forceMovingPaceCooldown,
-    bool requireKnownUsableProvider = true,
-  }) {
+  void _scheduleForceMovingPace(String source) {
     unawaited(Future<void>(() async {
-      final result = await _maybeForceMovingPace(
-        source: source,
-        cooldown: cooldown,
-        requireKnownUsableProvider: requireKnownUsableProvider,
-      );
+      final result = await _maybeForceMovingPace(source: source);
       FirebaseCrashlytics.instance
           .log('force_moving_pace_guard: $source $result');
     }));
   }
 
-  bool _isProviderExplicitlyUnusable(fbg.ProviderChangeEvent e) {
-    final denied =
-        e.status == fbg.ProviderChangeEvent.AUTHORIZATION_STATUS_DENIED ||
-            e.status == fbg.ProviderChangeEvent.AUTHORIZATION_STATUS_RESTRICTED;
-    return !e.enabled || denied;
+  Future<void> _runHeartbeatWatchdog(fbg.HeartbeatEvent event) async {
+    final now = DateTime.now().toUtc();
+    await fbg.Logger.notice('SPARRC watchdog heartbeat_check');
+
+    final lastCheck = _lastHeartbeatWatchdogUtc;
+    if (lastCheck != null &&
+        now.difference(lastCheck) < _heartbeatWatchdogInterval) {
+      await fbg.Logger.notice('SPARRC watchdog skipped reason=rate_limited');
+      return;
+    }
+    _lastHeartbeatWatchdogUtc = now;
+
+    final lastTs = _lastEmitUtc;
+    final lastLat = _lastEmitLat;
+    final lastLng = _lastEmitLng;
+    if (lastTs == null || lastLat == null || lastLng == null) {
+      await fbg.Logger.notice(
+        'SPARRC watchdog skipped reason=no_last_breadcrumb',
+      );
+      return;
+    }
+
+    final staleS = now.difference(lastTs).inSeconds;
+    if (staleS < _heartbeatWatchdogStaleAfter.inSeconds) {
+      await fbg.Logger.notice(
+        'SPARRC watchdog skipped reason=breadcrumb_not_stale stale_s=$staleS',
+      );
+      return;
+    }
+
+    fbg.Location? loc;
+    var source = 'fresh_current_position';
+    await fbg.Logger.notice('SPARRC watchdog get_current_position_start');
+    try {
+      loc = await fbg.BackgroundGeolocation.getCurrentPosition(
+        samples: 1,
+        persist: true,
+        timeout: _heartbeatWatchdogTimeoutS,
+      );
+      await fbg.Logger.notice('SPARRC watchdog get_current_position_success');
+    } catch (e, st) {
+      source = 'heartbeat_fallback';
+      await fbg.Logger.notice(
+        'SPARRC watchdog get_current_position_error error=${e.runtimeType}',
+      );
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'heartbeat_watchdog_current_position_failed',
+      );
+      loc = event.location;
+    }
+
+    if (loc == null) {
+      await fbg.Logger.notice(
+        'SPARRC watchdog skipped reason=no_location_available',
+      );
+      return;
+    }
+
+    final lat = loc.coords.latitude;
+    final lng = loc.coords.longitude;
+    final movedM = haversineMeters(lastLat, lastLng, lat, lng);
+    await fbg.Logger.notice(
+      'SPARRC watchdog using_location source=$source '
+      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
+    );
+
+    if (movedM < _heartbeatWatchdogMovedM) {
+      await fbg.Logger.notice(
+        'SPARRC watchdog skipped reason=moved_too_little '
+        'distance_m=${movedM.toStringAsFixed(1)} threshold_m=$_heartbeatWatchdogMovedM',
+      );
+      return;
+    }
+
+    await fbg.Logger.notice(
+      'SPARRC watchdog force_pace source=heartbeat_watchdog '
+      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
+    );
+    await forceMovingPace(source: 'heartbeat_watchdog');
   }
 
   bool _isProviderUsable(fbg.ProviderChangeEvent e) {
@@ -670,6 +729,8 @@ class TsbgEngine {
     fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent e) async {
       FirebaseCrashlytics.instance.log(
           'hb mode=${_mode.name} ts=${DateTime.now().toUtc().toIso8601String()}');
+      await _runHeartbeatWatchdog(e);
+
       // Prefer last known location from SDK; fall back to a lightweight fetch.
       fbg.Location? loc = e.location;
       if (loc == null) {
@@ -677,6 +738,7 @@ class TsbgEngine {
           loc = await fbg.BackgroundGeolocation.getCurrentPosition(
             samples: 1,
             persist: true,
+            timeout: _heartbeatWatchdogTimeoutS,
           );
         } catch (e, st) {
           FirebaseCrashlytics.instance.recordError(e, st,
@@ -732,7 +794,6 @@ class TsbgEngine {
       if (!e.connected && wasConnected != false) {
         _scheduleForceMovingPace(
           'connectivity_disconnected',
-          cooldown: Duration.zero,
         );
       } else if (e.connected) {
         unawaited(flushBuffer());
@@ -764,16 +825,12 @@ class TsbgEngine {
           _activeNearFences.add(e.identifier);
           _scheduleForceMovingPace(
             'geofence_near_enter',
-            cooldown: Duration.zero,
-            requireKnownUsableProvider: false,
           );
           if (_enteredFenceId == null) await _applyMode(SamplingMode.near);
         } else if (e.action == 'EXIT') {
           _activeNearFences.remove(e.identifier);
           _scheduleForceMovingPace(
             'geofence_near_exit',
-            cooldown: Duration.zero,
-            requireKnownUsableProvider: false,
           );
           if (_enteredFenceId == null && _activeNearFences.isEmpty) {
             await _applyMode(SamplingMode.outside);
@@ -837,8 +894,6 @@ class TsbgEngine {
           .add(GeofenceEvent(e.identifier, t, ts, dwellSeconds: dwellSeconds));
       _scheduleForceMovingPace(
         'geofence_${t.name}',
-        cooldown: Duration.zero,
-        requireKnownUsableProvider: false,
       );
 
       // Switch mode AFTER emitting, so _applyMode's setConfig() call does not
