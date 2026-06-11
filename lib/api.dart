@@ -3,11 +3,9 @@
 // Only RuntimeConfig and related sections were modified/expanded.
 // Other parts preserved unless required for compatibility.
 
-import 'dart:async';
-
-/// ------------------------------------------------------------
-/// TYPES & ENUMS
-/// ------------------------------------------------------------
+// ------------------------------------------------------------
+// TYPES & ENUMS
+// ------------------------------------------------------------
 
 /// Zone state used by the engine
 enum SamplingMode {
@@ -111,6 +109,14 @@ class RuntimeConfig {
   /// After this, heartbeat (persist:true) keeps breadcrumbs flowing.
   final int stopTimeoutMinutes;
 
+  /// When true, prevents FBG from stopping location-services when stationary.
+  /// This is a reliability test flag and may increase battery usage.
+  final bool disableStopDetection;
+
+  /// Android activity-recognition confidence threshold used by FBG.
+  /// Lower values can wake moving mode on less confident motion signals.
+  final int minimumActivityRecognitionConfidence;
+
   /// Native HTTP batch upload settings (transistorsoft batchSync).
   /// When true, fixes are buffered in SQLite and sent in a single HTTP POST
   /// when [maxBatchSize] fixes accumulate. Reduces HTTP request volume at scale.
@@ -155,6 +161,8 @@ class RuntimeConfig {
     required this.distanceFilterOutsideM,
     required this.significantChangeOutsideThresholdS,
     required this.stopTimeoutMinutes,
+    this.disableStopDetection = false,
+    this.minimumActivityRecognitionConfidence = 75,
     this.startOnBoot = true,
     this.stopOnTerminate = false,
     this.useSignificantChangeWhenOutside = true,
@@ -190,6 +198,11 @@ class RuntimeConfig {
 
       // Stop timeout — how long before FBG stops GPS after no motion
       stopTimeoutMinutes: m['stop_timeout_minutes'] ?? 60,
+      disableStopDetection: m['platform']?['disable_stop_detection'] ?? false,
+      minimumActivityRecognitionConfidence:
+          (m['platform']?['minimum_activity_recognition_confidence'] as num?)
+                  ?.toInt() ??
+              75,
 
       // Existing flags
       startOnBoot: m['start_on_boot'] ?? true,
@@ -204,18 +217,19 @@ class RuntimeConfig {
       // Geofence-only mode — default false so old builds are unaffected
       geofenceOnlyMode: m['platform']?['geofence_only_mode'] ?? false,
       // preventSuspend kill switch — default true so existing behavior is preserved
-      preventSuspendInsideZone: m['platform']?['prevent_suspend_inside_zone'] ?? true,
+      preventSuspendInsideZone:
+          m['platform']?['prevent_suspend_inside_zone'] ?? true,
 
       // API key sourced from Firestore — null if field absent
       ingestApiKey: m['ingest_api_key'] as String?,
 
       // Near-zone radius sourced from geofenceDetect sub-map
-      nearZoneRadiusM: (m['geofenceDetect']?['near_zone_radius_m'] as num?)?.toInt() ?? 100,
+      nearZoneRadiusM:
+          (m['geofenceDetect']?['near_zone_radius_m'] as num?)?.toInt() ?? 100,
 
       // Accumulate this many records before syncing; 0 = sync immediately
-      autoSyncThreshold: (m['platform']?['auto_sync_threshold'] as num?)?.toInt() ?? 0,
+      autoSyncThreshold:
+          (m['platform']?['auto_sync_threshold'] as num?)?.toInt() ?? 0,
     );
   }
 }
-
-

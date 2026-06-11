@@ -58,6 +58,9 @@ class TsbgEngine {
   DateTime? _lastEmitUtc;
   double? _lastEmitLat;
   double? _lastEmitLng;
+  DateTime? _lastForceMovingPaceUtc;
+  bool? _lastConnectivityConnected;
+  static const Duration _forceMovingPaceCooldown = Duration(minutes: 15);
 
   // Identity for native HTTP uploads → Cloud Function.
   String? _uid;
@@ -169,8 +172,8 @@ class TsbgEngine {
               title: 'Location Detection',
               text: 'SPARRC is tracking device location changes',
               smallIcon: 'drawable/ic_stat_ic_launcher_foreground',
-              priority: fbg.NotificationPriority.min,
-              sticky: false,
+              priority: fbg.NotificationPriority.low,
+              sticky: true,
             ),
             // Android: rationale shown when upgrading to Always Allow permission.
             backgroundPermissionRationale: fbg.PermissionRationale(
@@ -213,7 +216,9 @@ class TsbgEngine {
             // moving. The heartbeat handles breadcrumb emission while stationary;
             // the accelerometer wakes FBG when motion resumes. Keeping this true
             // burns maximum battery and causes iOS to throttle/kill the process.
-            disableStopDetection: false,
+            disableStopDetection: cfg.disableStopDetection,
+            minimumActivityRecognitionConfidence:
+                cfg.minimumActivityRecognitionConfidence,
           ),
 
           logger: fbg.LoggerConfig(
@@ -239,6 +244,11 @@ class TsbgEngine {
         .setCustomKey('batch_sync', cfg.batchSync.toString());
     FirebaseCrashlytics.instance.setCustomKey(
         'prevent_suspend_inside', cfg.preventSuspendInsideZone.toString());
+    FirebaseCrashlytics.instance.setCustomKey(
+        'disable_stop_detection', cfg.disableStopDetection.toString());
+    FirebaseCrashlytics.instance.setCustomKey(
+        'minimum_activity_recognition_confidence',
+        cfg.minimumActivityRecognitionConfidence);
 
     // Fix 1: Explicitly clear any stale persistence.extras from a previous session.
     // ready() with reset:false silently ignores extras changes; direct setConfig() always applies.
@@ -247,6 +257,11 @@ class TsbgEngine {
     try {
       await fbg.BackgroundGeolocation.setConfig(fbg.Config(
         autoSyncThreshold: cfg.autoSyncThreshold,
+        activity: fbg.ActivityConfig(
+          disableStopDetection: cfg.disableStopDetection,
+          minimumActivityRecognitionConfidence:
+              cfg.minimumActivityRecognitionConfidence,
+        ),
         persistence: fbg.PersistenceConfig(extras: httpParams),
       ));
     } catch (e, st) {
@@ -449,6 +464,109 @@ class TsbgEngine {
     await fbg.BackgroundGeolocation.sync();
   }
 
+  /// Force FBG into moving pace without re-running ready/start/geofence setup.
+  ///
+  /// Use this as a foreground/resume reliability nudge after the engine has
+  /// already been configured and started. FBG stop detection / stopTimeout can
+  /// later return the service to stationary mode.
+  Future<String> forceMovingPace({String source = 'foreground'}) async {
+    if (!_ready) return 'skipped:fbg_not_ready';
+
+    try {
+      final state = await fbg.BackgroundGeolocation.state;
+      if (state.enabled != true) return 'skipped:fbg_not_enabled';
+
+      await fbg.BackgroundGeolocation.changePace(true);
+      _lastForceMovingPaceUtc = DateTime.now().toUtc();
+      FirebaseCrashlytics.instance.log('force_moving_pace: $source');
+      FirebaseCrashlytics.instance.setCustomKey(
+        'last_force_moving_pace_source',
+        source,
+      );
+      FirebaseCrashlytics.instance.setCustomKey(
+        'last_force_moving_pace_at',
+        DateTime.now().toUtc().toIso8601String(),
+      );
+      return 'success';
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'force_moving_pace_failed',
+      );
+      return 'error:${e.runtimeType}';
+    }
+  }
+
+  Future<String> _maybeForceMovingPace({
+    required String source,
+    Duration cooldown = _forceMovingPaceCooldown,
+    bool requireKnownUsableProvider = true,
+  }) async {
+    final cfg = _cfg;
+    if (cfg == null || !cfg.enabled) return 'skipped:config_disabled';
+    if (!_ready) return 'skipped:fbg_not_ready';
+    if (!_started) return 'skipped:fbg_not_started';
+    if (_uid == null || _regionId == null) return 'skipped:missing_identity';
+
+    final now = DateTime.now().toUtc();
+    final last = _lastForceMovingPaceUtc;
+    if (last != null && now.difference(last) < cooldown) {
+      return 'skipped:cooldown';
+    }
+
+    try {
+      final provider = await fbg.BackgroundGeolocation.providerState;
+      if (_isProviderExplicitlyUnusable(provider)) {
+        return 'skipped:provider_unusable';
+      }
+      if (requireKnownUsableProvider && !_isProviderUsable(provider)) {
+        return 'skipped:provider_unknown';
+      }
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'force_moving_pace_provider_check_failed',
+      );
+      if (requireKnownUsableProvider) return 'skipped:provider_check_failed';
+    }
+
+    return forceMovingPace(source: source);
+  }
+
+  void _scheduleForceMovingPace(
+    String source, {
+    Duration cooldown = _forceMovingPaceCooldown,
+    bool requireKnownUsableProvider = true,
+  }) {
+    unawaited(Future<void>(() async {
+      final result = await _maybeForceMovingPace(
+        source: source,
+        cooldown: cooldown,
+        requireKnownUsableProvider: requireKnownUsableProvider,
+      );
+      FirebaseCrashlytics.instance
+          .log('force_moving_pace_guard: $source $result');
+    }));
+  }
+
+  bool _isProviderExplicitlyUnusable(fbg.ProviderChangeEvent e) {
+    final denied =
+        e.status == fbg.ProviderChangeEvent.AUTHORIZATION_STATUS_DENIED ||
+            e.status == fbg.ProviderChangeEvent.AUTHORIZATION_STATUS_RESTRICTED;
+    return !e.enabled || denied;
+  }
+
+  bool _isProviderUsable(fbg.ProviderChangeEvent e) {
+    final authorized = e.status ==
+            fbg.ProviderChangeEvent.AUTHORIZATION_STATUS_ALWAYS ||
+        e.status == fbg.ProviderChangeEvent.AUTHORIZATION_STATUS_WHEN_IN_USE;
+    return e.enabled && authorized && (e.gps || e.network);
+  }
+
   /// Expose streams
   Stream<LocationSample> onLocation() => _locCtl.stream;
   Stream<GeofenceEvent> onGeofence() => _fenceCtl.stream;
@@ -538,6 +656,16 @@ class TsbgEngine {
       await _maybeEmitFromFBGLocation(l, reason: 'location');
     });
 
+    // MOTION — if FBG reports moving, make sure active GPS pace is engaged.
+    fbg.BackgroundGeolocation.onMotionChange((fbg.Location l) async {
+      FirebaseCrashlytics.instance.log(
+          'motion_change: moving=${l.isMoving} ts=${DateTime.now().toUtc().toIso8601String()}');
+      await _maybeEmitFromFBGLocation(l, reason: 'motion_change');
+      if (l.isMoving) {
+        _scheduleForceMovingPace('motion_change_moving');
+      }
+    });
+
     // HEARTBEAT — ensures timed emission even when stationary
     fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent e) async {
       FirebaseCrashlytics.instance.log(
@@ -591,6 +719,23 @@ class TsbgEngine {
           fatal: false,
           reason: 'Location provider disabled (airplane mode or user toggle)',
         );
+      } else if (_isProviderUsable(e)) {
+        _scheduleForceMovingPace('provider_change_usable');
+      }
+    });
+
+    fbg.BackgroundGeolocation.onConnectivityChange(
+        (fbg.ConnectivityChangeEvent e) {
+      FirebaseCrashlytics.instance.log('connectivity: ${e.connected}');
+      final wasConnected = _lastConnectivityConnected;
+      _lastConnectivityConnected = e.connected;
+      if (!e.connected && wasConnected != false) {
+        _scheduleForceMovingPace(
+          'connectivity_disconnected',
+          cooldown: Duration.zero,
+        );
+      } else if (e.connected) {
+        unawaited(flushBuffer());
       }
     });
 
@@ -617,9 +762,19 @@ class TsbgEngine {
       if (e.identifier.endsWith('_near')) {
         if (e.action == 'ENTER') {
           _activeNearFences.add(e.identifier);
+          _scheduleForceMovingPace(
+            'geofence_near_enter',
+            cooldown: Duration.zero,
+            requireKnownUsableProvider: false,
+          );
           if (_enteredFenceId == null) await _applyMode(SamplingMode.near);
         } else if (e.action == 'EXIT') {
           _activeNearFences.remove(e.identifier);
+          _scheduleForceMovingPace(
+            'geofence_near_exit',
+            cooldown: Duration.zero,
+            requireKnownUsableProvider: false,
+          );
           if (_enteredFenceId == null && _activeNearFences.isEmpty) {
             await _applyMode(SamplingMode.outside);
           }
@@ -680,6 +835,11 @@ class TsbgEngine {
       // so geo_bootstrap can update zone context while FBG callback is still clean.
       _fenceCtl
           .add(GeofenceEvent(e.identifier, t, ts, dwellSeconds: dwellSeconds));
+      _scheduleForceMovingPace(
+        'geofence_${t.name}',
+        cooldown: Duration.zero,
+        requireKnownUsableProvider: false,
+      );
 
       // Switch mode AFTER emitting, so _applyMode's setConfig() call does not
       // re-enter FBG native while the geofence callback is still mid-execution.
