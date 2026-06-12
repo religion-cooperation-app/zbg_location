@@ -7,6 +7,7 @@
 import 'dart:async';
 import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
     as fbg;
 
@@ -482,6 +483,23 @@ class TsbgEngine {
         'SPARRC force_pace state source=$source enabled=${state.enabled} '
         'isMoving=${state.isMoving}',
       );
+      if (state.enabled == true && state.isMoving == true) {
+        await fbg.Logger.notice(
+          'SPARRC force_pace skipped reason=already_moving source=$source',
+        );
+        FirebaseCrashlytics.instance.log(
+          'force_moving_pace_skipped: already_moving $source',
+        );
+        FirebaseCrashlytics.instance.setCustomKey(
+          'last_force_moving_pace_skip_reason',
+          'already_moving',
+        );
+        FirebaseCrashlytics.instance.setCustomKey(
+          'last_force_moving_pace_skip_source',
+          source,
+        );
+        return 'skipped:already_moving';
+      }
     } catch (e, st) {
       await fbg.Logger.notice(
         'SPARRC force_pace state_unreadable source=$source',
@@ -508,9 +526,29 @@ class TsbgEngine {
       );
       return 'success';
     } catch (e, st) {
+      final errorDescription = _describeForcePaceError(e);
       await fbg.Logger.notice(
-        'SPARRC force_pace error source=$source error=${e.runtimeType}',
+        'SPARRC force_pace error source=$source $errorDescription',
       );
+      if (e is PlatformException) {
+        FirebaseCrashlytics.instance.setCustomKey(
+          'last_force_moving_pace_error_code',
+          e.code,
+        );
+        FirebaseCrashlytics.instance.setCustomKey(
+          'last_force_moving_pace_error_message',
+          e.message ?? '',
+        );
+        FirebaseCrashlytics.instance.setCustomKey(
+          'last_force_moving_pace_error_details',
+          '${e.details}',
+        );
+      } else {
+        FirebaseCrashlytics.instance.setCustomKey(
+          'last_force_moving_pace_error_type',
+          e.runtimeType.toString(),
+        );
+      }
       FirebaseCrashlytics.instance.recordError(
         e,
         st,
@@ -519,6 +557,14 @@ class TsbgEngine {
       );
       return 'error:${e.runtimeType}';
     }
+  }
+
+  String _describeForcePaceError(Object error) {
+    if (error is PlatformException) {
+      return 'error=PlatformException code=${error.code} '
+          'message=${error.message} details=${error.details}';
+    }
+    return 'error=${error.runtimeType} value=$error';
   }
 
   Future<String> _maybeForceMovingPace({
@@ -547,9 +593,14 @@ class TsbgEngine {
     }
     _lastHeartbeatWatchdogUtc = now;
 
-    final lastTs = _lastEmitUtc;
-    final lastLat = _lastEmitLat;
-    final lastLng = _lastEmitLng;
+    final persistedRef =
+        await GeoDiagnosticsWriter.readLastBreadcrumbCandidate(uid: _uid);
+    final lastTs = persistedRef?.timestamp ?? _lastEmitUtc;
+    final lastLat = persistedRef?.lat ?? _lastEmitLat;
+    final lastLng = persistedRef?.lng ?? _lastEmitLng;
+    final referenceSource = persistedRef == null
+        ? 'memory_last_emit'
+        : 'local_persisted_candidate:${persistedRef.source ?? 'unknown'}';
     if (lastTs == null || lastLat == null || lastLng == null) {
       await fbg.Logger.notice(
         'SPARRC watchdog skipped reason=no_last_breadcrumb',
@@ -558,6 +609,9 @@ class TsbgEngine {
     }
 
     final staleS = now.difference(lastTs).inSeconds;
+    await fbg.Logger.notice(
+      'SPARRC watchdog reference source=$referenceSource stale_s=$staleS',
+    );
     if (staleS < _heartbeatWatchdogStaleAfter.inSeconds) {
       await fbg.Logger.notice(
         'SPARRC watchdog skipped reason=breadcrumb_not_stale stale_s=$staleS',
@@ -571,7 +625,7 @@ class TsbgEngine {
     try {
       loc = await fbg.BackgroundGeolocation.getCurrentPosition(
         samples: 1,
-        persist: true,
+        persist: false,
         timeout: _heartbeatWatchdogTimeoutS,
       );
       await fbg.Logger.notice('SPARRC watchdog get_current_position_success');
@@ -715,13 +769,15 @@ class TsbgEngine {
       await _maybeEmitFromFBGLocation(l, reason: 'location');
     });
 
-    // MOTION — if FBG reports moving, make sure active GPS pace is engaged.
+    // MOTION — native FBG already owns pace changes for this event.
     fbg.BackgroundGeolocation.onMotionChange((fbg.Location l) async {
       FirebaseCrashlytics.instance.log(
           'motion_change: moving=${l.isMoving} ts=${DateTime.now().toUtc().toIso8601String()}');
       await _maybeEmitFromFBGLocation(l, reason: 'motion_change');
       if (l.isMoving) {
-        _scheduleForceMovingPace('motion_change_moving');
+        await fbg.Logger.notice(
+          'SPARRC motionchange moving observed no_force_pace',
+        );
       }
     });
 
@@ -1061,6 +1117,15 @@ class TsbgEngine {
       _lastEmitUtc = nowUtc;
       _lastEmitLat = lat;
       _lastEmitLng = lng;
+      await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
+        lat: lat,
+        lng: lng,
+        accuracyM: acc,
+        timestamp: nowUtc,
+        source: reason,
+        uid: _uid,
+        regionId: _regionId,
+      );
 
       if (kDebugMode) {
         debugPrint(
