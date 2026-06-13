@@ -14,6 +14,10 @@ class GeoDiagnosticsWriter {
   static const _kvTable = 'kv_store';
   static const _lastStateKey = 'geo_diag_fbg_event_last_state';
   static const _identityKey = 'geo_diag_identity';
+  static const _lastBreadcrumbCandidateKey =
+      'geo_diag_last_breadcrumb_candidate';
+  static const _heartbeatWatchdogRunKeyPrefix =
+      'geo_diag_heartbeat_watchdog_last_run';
 
   static Future<void> storeIdentity({
     required String uid,
@@ -52,6 +56,132 @@ class GeoDiagnosticsWriter {
       await _recordNonFatal(e, st, 'zbg_geo_diag_read_identity_failed');
       return null;
     }
+  }
+
+  static Future<void> storeLastBreadcrumbCandidate({
+    required double lat,
+    required double lng,
+    required double accuracyM,
+    required DateTime timestamp,
+    required String source,
+    String? uid,
+    String? regionId,
+  }) async {
+    if (kIsWeb) return;
+
+    try {
+      await _writeString(
+        _lastBreadcrumbCandidateKey,
+        jsonEncode({
+          'lat': lat,
+          'lng': lng,
+          'accuracy_m': accuracyM,
+          'timestamp_iso': timestamp.toUtc().toIso8601String(),
+          'source': source,
+          if (uid != null && uid.isNotEmpty) 'uid': uid,
+          if (regionId != null && regionId.isNotEmpty) 'region_id': regionId,
+          'client_updated_at_iso': DateTime.now().toUtc().toIso8601String(),
+        }),
+      );
+    } catch (e, st) {
+      await _recordNonFatal(
+        e,
+        st,
+        'zbg_geo_diag_store_last_breadcrumb_candidate_failed',
+      );
+    }
+  }
+
+  static Future<GeoLastBreadcrumbCandidate?> readLastBreadcrumbCandidate({
+    String? uid,
+  }) async {
+    if (kIsWeb) return null;
+
+    try {
+      final raw = await _readString(_lastBreadcrumbCandidateKey);
+      if (raw == null || raw.isEmpty) return null;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      final map = Map<String, dynamic>.from(decoded);
+      final candidateUid = map['uid'] as String?;
+      if (uid != null &&
+          uid.isNotEmpty &&
+          candidateUid != null &&
+          candidateUid.isNotEmpty &&
+          candidateUid != uid) {
+        return null;
+      }
+
+      final lat = (map['lat'] as num?)?.toDouble();
+      final lng = (map['lng'] as num?)?.toDouble();
+      final accuracyM = (map['accuracy_m'] as num?)?.toDouble();
+      final timestampIso = map['timestamp_iso'] as String?;
+      final timestamp = timestampIso == null
+          ? null
+          : DateTime.tryParse(timestampIso)?.toUtc();
+      if (lat == null || lng == null || timestamp == null) return null;
+
+      return GeoLastBreadcrumbCandidate(
+        lat: lat,
+        lng: lng,
+        accuracyM: accuracyM,
+        timestamp: timestamp,
+        source: map['source'] as String?,
+        uid: candidateUid,
+        regionId: map['region_id'] as String?,
+      );
+    } catch (e, st) {
+      await _recordNonFatal(
+        e,
+        st,
+        'zbg_geo_diag_read_last_breadcrumb_candidate_failed',
+      );
+      return null;
+    }
+  }
+
+  static Future<DateTime?> readHeartbeatWatchdogRun({
+    required String source,
+  }) async {
+    if (kIsWeb) return null;
+    try {
+      final raw = await _readString(_heartbeatWatchdogRunKey(source));
+      if (raw == null || raw.isEmpty) return null;
+      return DateTime.tryParse(raw)?.toUtc();
+    } catch (e, st) {
+      await _recordNonFatal(
+        e,
+        st,
+        'zbg_geo_diag_read_heartbeat_watchdog_run_failed',
+      );
+      return null;
+    }
+  }
+
+  static Future<void> storeHeartbeatWatchdogRun({
+    required String source,
+    required DateTime timestamp,
+  }) async {
+    if (kIsWeb) return;
+    try {
+      await _writeString(
+        _heartbeatWatchdogRunKey(source),
+        timestamp.toUtc().toIso8601String(),
+      );
+    } catch (e, st) {
+      await _recordNonFatal(
+        e,
+        st,
+        'zbg_geo_diag_store_heartbeat_watchdog_run_failed',
+      );
+    }
+  }
+
+  static String _heartbeatWatchdogRunKey(String source) {
+    final safeSource = source
+        .replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_')
+        .replaceAll(RegExp(r'_+'), '_');
+    return '${_heartbeatWatchdogRunKeyPrefix}_$safeSource';
   }
 
   static Future<void> recordProviderChange(
@@ -197,15 +327,14 @@ class GeoDiagnosticsWriter {
 
       final currentRef = userRef.collection('geo_diagnostics').doc('current');
       batch.set(
-        currentRef,
-        {
-          'updated_at': FieldValue.serverTimestamp(),
-          'client_updated_at_iso': nowIso,
-          'last_event_type': type,
-          ..._scalarMap(currentSnapshotFields),
-        },
-        SetOptions(merge: true),
-      );
+          currentRef,
+          {
+            'updated_at': FieldValue.serverTimestamp(),
+            'client_updated_at_iso': nowIso,
+            'last_event_type': type,
+            ..._scalarMap(currentSnapshotFields),
+          },
+          SetOptions(merge: true));
 
       await _log('geo_diag_firestore_commit_start type=$type');
       await batch.commit();
@@ -213,10 +342,7 @@ class GeoDiagnosticsWriter {
       await _log('geo_diag_write_last_state_start type=$type');
       await _writeLastState({...previous, ...cleanState});
       await _log('geo_diag_write_last_state_done type=$type');
-      return GeoDiagnosticsWriteResult.written(
-        type: type,
-        source: source,
-      );
+      return GeoDiagnosticsWriteResult.written(type: type, source: source);
     } catch (e, st) {
       await _recordNonFatal(e, st, 'zbg_geo_diag_write_failed');
       return GeoDiagnosticsWriteResult.failed(
@@ -307,10 +433,12 @@ class GeoDiagnosticsWriter {
     final db = await _openDb();
     try {
       await db.insert(
-        _kvTable,
-        {'key': key, 'value': value},
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
+          _kvTable,
+          {
+            'key': key,
+            'value': value,
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace);
     } finally {
       await db.close();
     }
@@ -458,11 +586,28 @@ class GeoDiagnosticsWriteResult {
 }
 
 class GeoDiagnosticsIdentity {
-  const GeoDiagnosticsIdentity({
-    required this.uid,
-    required this.regionId,
-  });
+  const GeoDiagnosticsIdentity({required this.uid, required this.regionId});
 
   final String uid;
+  final String? regionId;
+}
+
+class GeoLastBreadcrumbCandidate {
+  const GeoLastBreadcrumbCandidate({
+    required this.lat,
+    required this.lng,
+    required this.timestamp,
+    this.accuracyM,
+    this.source,
+    this.uid,
+    this.regionId,
+  });
+
+  final double lat;
+  final double lng;
+  final double? accuracyM;
+  final DateTime timestamp;
+  final String? source;
+  final String? uid;
   final String? regionId;
 }

@@ -7,6 +7,7 @@
 import 'dart:async';
 import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
     as fbg;
 
@@ -58,6 +59,12 @@ class TsbgEngine {
   DateTime? _lastEmitUtc;
   double? _lastEmitLat;
   double? _lastEmitLng;
+  DateTime? _lastHeartbeatWatchdogUtc;
+
+  static const Duration _heartbeatWatchdogInterval = Duration(minutes: 2);
+  static const Duration _heartbeatWatchdogStaleAfter = Duration(minutes: 2);
+  static const int _heartbeatWatchdogTimeoutS = 30;
+  static const double _heartbeatWatchdogMovedM = 60;
 
   // Identity for native HTTP uploads → Cloud Function.
   String? _uid;
@@ -68,10 +75,7 @@ class TsbgEngine {
   void setIdentity({required String uid, required String regionId}) {
     _uid = uid;
     _regionId = regionId;
-    unawaited(GeoDiagnosticsWriter.storeIdentity(
-      uid: uid,
-      regionId: regionId,
-    ));
+    unawaited(GeoDiagnosticsWriter.storeIdentity(uid: uid, regionId: regionId));
   }
 
   /// --------------------------------------------
@@ -92,7 +96,8 @@ class TsbgEngine {
 
     if (kDebugMode) {
       debugPrint(
-          '[TsbgEngine] HTTP params at setConfig: uid=$uid regionId=$regionId httpParams=$httpParams');
+        '[TsbgEngine] HTTP params at setConfig: uid=$uid regionId=$regionId httpParams=$httpParams',
+      );
     }
 
     // One-time BG Geolocation init
@@ -185,7 +190,8 @@ class TsbgEngine {
             headers: {
               'X-Api-Key': cfg.ingestApiKey ??
                   (throw StateError(
-                      'ingestApiKey is null — add ingest_api_key to appConfig/runtime')),
+                    'ingestApiKey is null — add ingest_api_key to appConfig/runtime',
+                  )),
             },
             // Sent with every request (query/body-level params)
             params: httpParams,
@@ -216,14 +222,16 @@ class TsbgEngine {
             disableStopDetection: false,
           ),
 
-          logger: fbg.LoggerConfig(
-            debug: false,
-          ),
+          logger: fbg.LoggerConfig(debug: false),
         ),
       );
     } catch (e, st) {
-      FirebaseCrashlytics.instance
-          .recordError(e, st, fatal: false, reason: 'fbg_ready_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'fbg_ready_failed',
+      );
       rethrow;
     }
 
@@ -231,27 +239,41 @@ class TsbgEngine {
     // so the next start attempt retries with reset: true.
     _ready = true;
 
-    FirebaseCrashlytics.instance
-        .setCustomKey('geofence_only_mode', cfg.geofenceOnlyMode.toString());
-    FirebaseCrashlytics.instance
-        .setCustomKey('auto_sync_threshold', cfg.autoSyncThreshold);
-    FirebaseCrashlytics.instance
-        .setCustomKey('batch_sync', cfg.batchSync.toString());
     FirebaseCrashlytics.instance.setCustomKey(
-        'prevent_suspend_inside', cfg.preventSuspendInsideZone.toString());
+      'geofence_only_mode',
+      cfg.geofenceOnlyMode.toString(),
+    );
+    FirebaseCrashlytics.instance.setCustomKey(
+      'auto_sync_threshold',
+      cfg.autoSyncThreshold,
+    );
+    FirebaseCrashlytics.instance.setCustomKey(
+      'batch_sync',
+      cfg.batchSync.toString(),
+    );
+    FirebaseCrashlytics.instance.setCustomKey(
+      'prevent_suspend_inside',
+      cfg.preventSuspendInsideZone.toString(),
+    );
 
     // Fix 1: Explicitly clear any stale persistence.extras from a previous session.
     // ready() with reset:false silently ignores extras changes; direct setConfig() always applies.
     // autoSyncThreshold is also applied here so live Firestore config changes propagate
     // to the running engine (ready() with reset:false does not re-apply these).
     try {
-      await fbg.BackgroundGeolocation.setConfig(fbg.Config(
-        autoSyncThreshold: cfg.autoSyncThreshold,
-        persistence: fbg.PersistenceConfig(extras: httpParams),
-      ));
+      await fbg.BackgroundGeolocation.setConfig(
+        fbg.Config(
+          autoSyncThreshold: cfg.autoSyncThreshold,
+          persistence: fbg.PersistenceConfig(extras: httpParams),
+        ),
+      );
     } catch (e, st) {
-      FirebaseCrashlytics.instance
-          .recordError(e, st, fatal: false, reason: 'fbg_setconfig_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'fbg_setconfig_failed',
+      );
     }
 
     // Apply the current mode’s config (outside by default).
@@ -323,8 +345,12 @@ class TsbgEngine {
         ..addAll(defs);
       FirebaseCrashlytics.instance.setCustomKey('fence_count', _defs.length);
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st,
-          fatal: false, reason: 'geofence_registration_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'geofence_registration_failed',
+      );
       rethrow;
     }
   }
@@ -345,8 +371,12 @@ class TsbgEngine {
         await fbg.BackgroundGeolocation.start();
       }
     } catch (e, st) {
-      FirebaseCrashlytics.instance
-          .recordError(e, st, fatal: false, reason: 'fbg_start_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'fbg_start_failed',
+      );
       rethrow;
     }
     _started = true;
@@ -371,8 +401,12 @@ class TsbgEngine {
     try {
       await fbg.BackgroundGeolocation.stop();
     } catch (e, st) {
-      FirebaseCrashlytics.instance
-          .recordError(e, st, fatal: false, reason: 'fbg_stop_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'fbg_stop_failed',
+      );
       rethrow;
     } finally {
       // Always clear all state — even if the native stop() threw — so a
@@ -429,15 +463,20 @@ class TsbgEngine {
           await _applyMode(SamplingMode.inside);
           if (kDebugMode) {
             debugPrint(
-                '[TsbgEngine] synthesizeEnterIfInside: inside ${def.ident} '
-                '(${dist.toStringAsFixed(1)}m <= ${def.radiusM}m)');
+              '[TsbgEngine] synthesizeEnterIfInside: inside ${def.ident} '
+              '(${dist.toStringAsFixed(1)}m <= ${def.radiusM}m)',
+            );
           }
           break; // only one zone active at a time
         }
       }
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st,
-          fatal: false, reason: 'synthesize_enter_gps_unavailable');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'synthesize_enter_gps_unavailable',
+      );
     }
   }
 
@@ -447,6 +486,198 @@ class TsbgEngine {
   Future<void> flushBuffer() async {
     if (!_ready) return;
     await fbg.BackgroundGeolocation.sync();
+  }
+
+  /// Force FBG into moving pace without re-running ready/start/geofence setup.
+  ///
+  /// Used by the foreground heartbeat watchdog when it has evidence that the
+  /// device moved while FBG still appears passive/stationary.
+  Future<String> forceMovingPace({String source = 'foreground'}) async {
+    await fbg.Logger.notice('SPARRC force_pace attempt source=$source');
+
+    try {
+      final state = await fbg.BackgroundGeolocation.state;
+      await fbg.Logger.notice(
+        'SPARRC force_pace state source=$source enabled=${state.enabled} '
+        'isMoving=${state.isMoving}',
+      );
+      if (state.enabled == true && state.isMoving == true) {
+        await fbg.Logger.notice(
+          'SPARRC force_pace skipped reason=already_moving source=$source',
+        );
+        FirebaseCrashlytics.instance.log(
+          'force_moving_pace_skipped: already_moving $source',
+        );
+        FirebaseCrashlytics.instance.setCustomKey(
+          'last_force_moving_pace_skip_reason',
+          'already_moving',
+        );
+        FirebaseCrashlytics.instance.setCustomKey(
+          'last_force_moving_pace_source',
+          source,
+        );
+        return 'already_moving';
+      }
+    } catch (e, st) {
+      await fbg.Logger.notice(
+        'SPARRC force_pace state_unreadable source=$source '
+        '${_describeForcePaceError(e)}',
+      );
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'force_moving_pace_state_unreadable',
+      );
+    }
+
+    try {
+      await fbg.BackgroundGeolocation.changePace(true);
+      await fbg.Logger.notice('SPARRC force_pace call_returned source=$source');
+      FirebaseCrashlytics.instance.log('force_moving_pace_success: $source');
+      FirebaseCrashlytics.instance.setCustomKey(
+        'last_force_moving_pace_source',
+        source,
+      );
+      FirebaseCrashlytics.instance.setCustomKey(
+        'last_force_moving_pace_at',
+        DateTime.now().toUtc().toIso8601String(),
+      );
+      return 'success';
+    } catch (e, st) {
+      final errorDescription = _describeForcePaceError(e);
+      await fbg.Logger.notice(
+        'SPARRC force_pace error source=$source $errorDescription',
+      );
+      if (e is PlatformException) {
+        FirebaseCrashlytics.instance.setCustomKey(
+          'last_force_moving_pace_error_code',
+          e.code,
+        );
+        FirebaseCrashlytics.instance.setCustomKey(
+          'last_force_moving_pace_error_message',
+          e.message ?? '',
+        );
+        FirebaseCrashlytics.instance.setCustomKey(
+          'last_force_moving_pace_error_details',
+          '${e.details}',
+        );
+      } else {
+        FirebaseCrashlytics.instance.setCustomKey(
+          'last_force_moving_pace_error_type',
+          e.runtimeType.toString(),
+        );
+      }
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'force_moving_pace_failed',
+      );
+      return 'error:${e.runtimeType}';
+    }
+  }
+
+  String _describeForcePaceError(Object error) {
+    if (error is PlatformException) {
+      return 'error=PlatformException code=${error.code} '
+          'message=${error.message} details=${error.details}';
+    }
+    return 'error=${error.runtimeType} value=$error';
+  }
+
+  Future<void> _runHeartbeatWatchdog(fbg.HeartbeatEvent event) async {
+    final now = DateTime.now().toUtc();
+    await fbg.Logger.notice('SPARRC watchdog heartbeat_check');
+
+    final lastCheck = _lastHeartbeatWatchdogUtc;
+    if (lastCheck != null &&
+        now.difference(lastCheck) < _heartbeatWatchdogInterval) {
+      await fbg.Logger.notice('SPARRC watchdog skipped reason=rate_limited');
+      return;
+    }
+    _lastHeartbeatWatchdogUtc = now;
+
+    final persistedRef = await GeoDiagnosticsWriter.readLastBreadcrumbCandidate(
+      uid: _uid,
+    );
+    final lastTs = persistedRef?.timestamp ?? _lastEmitUtc;
+    final lastLat = persistedRef?.lat ?? _lastEmitLat;
+    final lastLng = persistedRef?.lng ?? _lastEmitLng;
+    final referenceSource = persistedRef == null
+        ? 'memory_last_emit'
+        : 'local_persisted_candidate:${persistedRef.source ?? 'unknown'}';
+
+    if (lastTs == null || lastLat == null || lastLng == null) {
+      await fbg.Logger.notice(
+        'SPARRC watchdog skipped reason=no_last_breadcrumb',
+      );
+      return;
+    }
+
+    final staleS = now.difference(lastTs).inSeconds;
+    await fbg.Logger.notice(
+      'SPARRC watchdog reference source=$referenceSource stale_s=$staleS',
+    );
+    if (staleS < _heartbeatWatchdogStaleAfter.inSeconds) {
+      await fbg.Logger.notice(
+        'SPARRC watchdog skipped reason=breadcrumb_not_stale stale_s=$staleS',
+      );
+      return;
+    }
+
+    fbg.Location? loc;
+    var source = 'fresh_current_position';
+    await fbg.Logger.notice('SPARRC watchdog get_current_position_start');
+    try {
+      loc = await fbg.BackgroundGeolocation.getCurrentPosition(
+        samples: 1,
+        persist: false,
+        timeout: _heartbeatWatchdogTimeoutS,
+      );
+      await fbg.Logger.notice('SPARRC watchdog get_current_position_success');
+    } catch (e, st) {
+      source = 'heartbeat_fallback';
+      await fbg.Logger.notice(
+        'SPARRC watchdog get_current_position_error error=${e.runtimeType}',
+      );
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'heartbeat_watchdog_current_position_failed',
+      );
+      loc = event.location;
+    }
+
+    if (loc == null) {
+      await fbg.Logger.notice(
+        'SPARRC watchdog skipped reason=no_location_available',
+      );
+      return;
+    }
+
+    final lat = loc.coords.latitude;
+    final lng = loc.coords.longitude;
+    final movedM = haversineMeters(lastLat, lastLng, lat, lng);
+    await fbg.Logger.notice(
+      'SPARRC watchdog using_location source=$source '
+      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
+    );
+
+    if (movedM < _heartbeatWatchdogMovedM) {
+      await fbg.Logger.notice(
+        'SPARRC watchdog skipped reason=moved_too_little '
+        'distance_m=${movedM.toStringAsFixed(1)} threshold_m=$_heartbeatWatchdogMovedM',
+      );
+      return;
+    }
+
+    await fbg.Logger.notice(
+      'SPARRC watchdog force_pace source=heartbeat_watchdog '
+      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
+    );
+    await forceMovingPace(source: 'heartbeat_watchdog');
   }
 
   /// Expose streams
@@ -522,9 +753,7 @@ class TsbgEngine {
       'mode': geoSystemMode,
     };
     await fbg.BackgroundGeolocation.setConfig(
-      fbg.Config(
-        persistence: fbg.PersistenceConfig(extras: updatedExtras),
-      ),
+      fbg.Config(persistence: fbg.PersistenceConfig(extras: updatedExtras)),
     );
   }
 
@@ -538,10 +767,23 @@ class TsbgEngine {
       await _maybeEmitFromFBGLocation(l, reason: 'location');
     });
 
+    fbg.BackgroundGeolocation.onMotionChange((fbg.Location l) async {
+      FirebaseCrashlytics.instance.log(
+        'motion_change: moving=${l.isMoving} ts=${DateTime.now().toUtc().toIso8601String()}',
+      );
+      await fbg.Logger.notice(
+        'SPARRC motionchange observed moving=${l.isMoving}',
+      );
+      await _maybeEmitFromFBGLocation(l, reason: 'motion_change');
+    });
+
     // HEARTBEAT — ensures timed emission even when stationary
     fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent e) async {
       FirebaseCrashlytics.instance.log(
-          'hb mode=${_mode.name} ts=${DateTime.now().toUtc().toIso8601String()}');
+        'hb mode=${_mode.name} ts=${DateTime.now().toUtc().toIso8601String()}',
+      );
+      await _runHeartbeatWatchdog(e);
+
       // Prefer last known location from SDK; fall back to a lightweight fetch.
       fbg.Location? loc = e.location;
       if (loc == null) {
@@ -549,10 +791,15 @@ class TsbgEngine {
           loc = await fbg.BackgroundGeolocation.getCurrentPosition(
             samples: 1,
             persist: true,
+            timeout: _heartbeatWatchdogTimeoutS,
           );
         } catch (e, st) {
-          FirebaseCrashlytics.instance.recordError(e, st,
-              fatal: false, reason: 'heartbeat_gps_unavailable');
+          FirebaseCrashlytics.instance.recordError(
+            e,
+            st,
+            fatal: false,
+            reason: 'heartbeat_gps_unavailable',
+          );
           return;
         }
       }
@@ -562,10 +809,9 @@ class TsbgEngine {
     // OEM / OS interference monitoring
     fbg.BackgroundGeolocation.onPowerSaveChange((bool isPowerSave) {
       FirebaseCrashlytics.instance.log('power_save: $isPowerSave');
-      unawaited(GeoDiagnosticsWriter.recordPowerSaveChange(
-        isPowerSave,
-        uid: _uid,
-      ));
+      unawaited(
+        GeoDiagnosticsWriter.recordPowerSaveChange(isPowerSave, uid: _uid),
+      );
       if (isPowerSave) {
         FirebaseCrashlytics.instance.recordError(
           StateError('oem_power_save_enabled'),
@@ -579,11 +825,9 @@ class TsbgEngine {
 
     fbg.BackgroundGeolocation.onProviderChange((fbg.ProviderChangeEvent e) {
       FirebaseCrashlytics.instance.log(
-          'provider: gps=${e.gps} network=${e.network} enabled=${e.enabled} status=${e.status} accuracy=${e.accuracyAuthorization}');
-      unawaited(GeoDiagnosticsWriter.recordProviderChange(
-        e,
-        uid: _uid,
-      ));
+        'provider: gps=${e.gps} network=${e.network} enabled=${e.enabled} status=${e.status} accuracy=${e.accuracyAuthorization}',
+      );
+      unawaited(GeoDiagnosticsWriter.recordProviderChange(e, uid: _uid));
       if (!e.enabled) {
         FirebaseCrashlytics.instance.recordError(
           StateError('location_provider_disabled'),
@@ -596,10 +840,9 @@ class TsbgEngine {
 
     fbg.BackgroundGeolocation.onEnabledChange((bool enabled) {
       FirebaseCrashlytics.instance.log('fbg_enabled: $enabled');
-      unawaited(GeoDiagnosticsWriter.recordFbgEnabledChange(
-        enabled,
-        uid: _uid,
-      ));
+      unawaited(
+        GeoDiagnosticsWriter.recordFbgEnabledChange(enabled, uid: _uid),
+      );
       if (!enabled && _started) {
         FirebaseCrashlytics.instance.recordError(
           StateError('fbg_disabled_while_running'),
@@ -678,8 +921,9 @@ class TsbgEngine {
 
       // Emit to app FIRST — before calling setConfig back into FBG native,
       // so geo_bootstrap can update zone context while FBG callback is still clean.
-      _fenceCtl
-          .add(GeofenceEvent(e.identifier, t, ts, dwellSeconds: dwellSeconds));
+      _fenceCtl.add(
+        GeofenceEvent(e.identifier, t, ts, dwellSeconds: dwellSeconds),
+      );
 
       // Switch mode AFTER emitting, so _applyMode's setConfig() call does not
       // re-enter FBG native while the geofence callback is still mid-execution.
@@ -771,7 +1015,8 @@ class TsbgEngine {
 
     if (kDebugMode) {
       debugPrint(
-          '[TsbgEngine] applyMode=$mode sc=$useSigChange hb=${heartbeatS}s df=${distanceM}m locUpdateMs=$locationUpdateMs');
+        '[TsbgEngine] applyMode=$mode sc=$useSigChange hb=${heartbeatS}s df=${distanceM}m locUpdateMs=$locationUpdateMs',
+      );
     }
 
     _mode = mode;
@@ -780,8 +1025,10 @@ class TsbgEngine {
   }
 
   /// Central gate for "whatever's first" (distance OR time) emission.
-  Future<void> _maybeEmitFromFBGLocation(fbg.Location l,
-      {required String reason}) async {
+  Future<void> _maybeEmitFromFBGLocation(
+    fbg.Location l, {
+    required String reason,
+  }) async {
     final cfg = _cfg;
     if (cfg == null || !cfg.enabled) return;
 
@@ -835,26 +1082,32 @@ class TsbgEngine {
 
     if (timeDue || distDue) {
       // Emit a sample to app layer (positional ctor: lat, lng, acc, ts)
-      _locCtl.add(LocationSample(
-        lat,
-        lng,
-        acc,
-        nowUtc,
-      ));
+      _locCtl.add(LocationSample(lat, lng, acc, nowUtc));
 
       // Reset the emission reference
       _lastEmitUtc = nowUtc;
       _lastEmitLat = lat;
       _lastEmitLng = lng;
+      await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
+        lat: lat,
+        lng: lng,
+        accuracyM: acc,
+        timestamp: nowUtc,
+        source: reason,
+        uid: _uid,
+        regionId: _regionId,
+      );
 
       if (kDebugMode) {
         debugPrint(
-            '[TsbgEngine] emit reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue moved=${movedM.toStringAsFixed(1)}m rate=${rateS}s dist=${distM}m acc=${acc}m');
+          '[TsbgEngine] emit reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue moved=${movedM.toStringAsFixed(1)}m rate=${rateS}s dist=${distM}m acc=${acc}m',
+        );
       }
     } else {
       if (kDebugMode) {
         debugPrint(
-            '[TsbgEngine] skip reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue');
+          '[TsbgEngine] skip reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue',
+        );
       }
     }
 
@@ -877,7 +1130,8 @@ class TsbgEngine {
           await _applyMode(SamplingMode.near);
           if (kDebugMode) {
             debugPrint(
-                '[TsbgEngine] near-mode reconciliation: within near zone of ${d.ident}');
+              '[TsbgEngine] near-mode reconciliation: within near zone of ${d.ident}',
+            );
           }
           break;
         }
@@ -910,11 +1164,13 @@ class TsbgEngine {
           _enteredFenceId = containingFence;
           _firedMilestones.clear();
           _fenceCtl.add(
-              GeofenceEvent(containingFence, GeofenceEventType.enter, nowUtc));
+            GeofenceEvent(containingFence, GeofenceEventType.enter, nowUtc),
+          );
           await _applyMode(SamplingMode.inside);
           if (kDebugMode) {
             debugPrint(
-                '[TsbgEngine] synthetic ENTER (reconciliation): $containingFence');
+              '[TsbgEngine] synthetic ENTER (reconciliation): $containingFence',
+            );
           }
         }
       } else {
@@ -937,16 +1193,19 @@ class TsbgEngine {
           (elapsedS ~/ dwellCfg.dwellEveryS) * dwellCfg.dwellEveryS;
       if (milestone > 0 && !_firedMilestones.contains(milestone)) {
         _firedMilestones.add(milestone); // boundary used as dedup key
-        _fenceCtl.add(GeofenceEvent(
-          enteredFenceId,
-          GeofenceEventType.dwell,
-          nowUtc,
-          dwellSeconds:
-              elapsedS, // actual elapsed time, not the rounded boundary
-        ));
+        _fenceCtl.add(
+          GeofenceEvent(
+            enteredFenceId,
+            GeofenceEventType.dwell,
+            nowUtc,
+            dwellSeconds:
+                elapsedS, // actual elapsed time, not the rounded boundary
+          ),
+        );
         if (kDebugMode) {
           debugPrint(
-              '[TsbgEngine] dwell milestone fired: ${milestone}s for fence $enteredFenceId');
+            '[TsbgEngine] dwell milestone fired: ${milestone}s for fence $enteredFenceId',
+          );
         }
       }
     }
@@ -984,16 +1243,19 @@ class TsbgEngine {
           _enteredAt = null;
           _enteredFenceId = null;
           _firedMilestones.clear();
-          _fenceCtl.add(GeofenceEvent(
-            softExitFenceId,
-            GeofenceEventType.exit,
-            nowUtc,
-            dwellSeconds: dwellSecs,
-          ));
+          _fenceCtl.add(
+            GeofenceEvent(
+              softExitFenceId,
+              GeofenceEventType.exit,
+              nowUtc,
+              dwellSeconds: dwellSecs,
+            ),
+          );
           if (kDebugMode) {
             debugPrint(
-                '[TsbgEngine] software EXIT: ${distToCenter.toStringAsFixed(1)}m > '
-                '${def.radiusM! + 30.0}m threshold for fence $softExitFenceId');
+              '[TsbgEngine] software EXIT: ${distToCenter.toStringAsFixed(1)}m > '
+              '${def.radiusM! + 30.0}m threshold for fence $softExitFenceId',
+            );
           }
         }
       }
