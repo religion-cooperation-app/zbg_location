@@ -661,41 +661,13 @@ class TsbgEngine {
     }
     _lastHeartbeatWatchdogUtc = now;
 
-    final persistedRef = await GeoDiagnosticsWriter.readLastBreadcrumbCandidate(
-      uid: _uid,
-    );
-    final lastTs = persistedRef?.timestamp ?? _lastEmitUtc;
-    final lastLat = persistedRef?.lat ?? _lastEmitLat;
-    final lastLng = persistedRef?.lng ?? _lastEmitLng;
-    final referenceSource = persistedRef == null
-        ? 'memory_last_emit'
-        : 'local_persisted_candidate:${persistedRef.source ?? 'unknown'}';
-
-    if (lastTs == null || lastLat == null || lastLng == null) {
-      await fbg.Logger.notice(
-        'SPARRC watchdog skipped reason=no_last_breadcrumb',
-      );
-      return;
-    }
-
-    final staleS = now.difference(lastTs).inSeconds;
-    await fbg.Logger.notice(
-      'SPARRC watchdog reference source=$referenceSource stale_s=$staleS',
-    );
-    if (staleS < _heartbeatWatchdogStaleAfter.inSeconds) {
-      await fbg.Logger.notice(
-        'SPARRC watchdog skipped reason=breadcrumb_not_stale stale_s=$staleS',
-      );
-      return;
-    }
-
     fbg.Location? loc;
     var source = 'fresh_current_position';
     await fbg.Logger.notice('SPARRC watchdog get_current_position_start');
     try {
       loc = await fbg.BackgroundGeolocation.getCurrentPosition(
         samples: 1,
-        persist: false,
+        persist: true,
         timeout: _heartbeatWatchdogTimeoutS,
       );
       await fbg.Logger.notice('SPARRC watchdog get_current_position_success');
@@ -722,7 +694,34 @@ class TsbgEngine {
 
     final lat = loc.coords.latitude;
     final lng = loc.coords.longitude;
-    final movedM = haversineMeters(lastLat, lastLng, lat, lng);
+
+    final persistedRef = await GeoDiagnosticsWriter.readLastBreadcrumbCandidate(
+      uid: _uid,
+    );
+    if (persistedRef == null) {
+      await fbg.Logger.notice(
+        'SPARRC watchdog skipped '
+        'reason=no_last_breadcrumb_reference after_location_persisted=true',
+      );
+      return;
+    }
+
+    final staleS = now.difference(persistedRef.timestamp).inSeconds;
+    await fbg.Logger.notice(
+      'SPARRC watchdog reference '
+      'source=local_persisted_candidate:${persistedRef.source ?? 'unknown'} '
+      'stale_s=$staleS',
+    );
+    if (staleS < _heartbeatWatchdogStaleAfter.inSeconds) {
+      await fbg.Logger.notice(
+        'SPARRC watchdog skipped reason=breadcrumb_not_stale '
+        'stale_s=$staleS after_location_persisted=true',
+      );
+      return;
+    }
+
+    final movedM =
+        haversineMeters(persistedRef.lat, persistedRef.lng, lat, lng);
     await fbg.Logger.notice(
       'SPARRC watchdog using_location source=$source '
       'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
