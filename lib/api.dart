@@ -164,9 +164,9 @@ class RuntimeConfig {
       enabled: m['enabled'] ?? true,
       dwellRequiredS: m['dwell_required_s'] ?? 60,
       dwellEveryS: m['dwell_every_s'] ?? 0,
-      rateOutsideS: m['rate_outside_zone_s'] ?? 60,
-      rateNearS: m['rate_near_zone_s'] ?? 60,
-      rateInsideS: m['rate_inside_zone_s'] ?? 60,
+      rateOutsideS: m['rate_outside_zone_s'] ?? 120,
+      rateNearS: m['rate_near_zone_s'] ?? 45,
+      rateInsideS: m['rate_inside_zone_s'] ?? 45,
       accuracyDropM: (m['accuracy_drop_m'] ?? 50).toDouble(),
 
       // NEW distance filters with defaults for safe operation
