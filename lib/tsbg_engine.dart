@@ -65,6 +65,10 @@ class TsbgEngine {
   static const Duration _heartbeatWatchdogStaleAfter = Duration(minutes: 2);
   static const int _heartbeatWatchdogTimeoutS = 30;
   static const double _heartbeatWatchdogMovedM = 60;
+  static const Duration _nearEnterForceWakeCooldown = Duration(minutes: 10);
+  static const Duration _nearEnterForceWakeStaleAfter = Duration(minutes: 5);
+  static const int _nearEnterForceWakeTimeoutS = 20;
+  static const double _nearEnterForceWakeMovedM = 60;
 
   // Identity for native HTTP uploads → Cloud Function.
   String? _uid;
@@ -81,6 +85,49 @@ class TsbgEngine {
   /// --------------------------------------------
   /// Public API
   /// --------------------------------------------
+
+  static List<String> _nativeIdsForDefs(Iterable<GeofenceDef> defs) {
+    final ids = <String>[];
+    for (final d in defs) {
+      ids
+        ..add(d.ident)
+        ..add('${d.ident}_near');
+    }
+    ids.sort();
+    return ids;
+  }
+
+  static String _formatIds(Iterable<String> ids) => ids.join(',');
+
+  Future<List<String>> nativeGeofenceIds() async {
+    final geofences = await fbg.BackgroundGeolocation.geofences;
+    final ids = geofences.map((g) => g.identifier).whereType<String>().toList()
+      ..sort();
+    return ids;
+  }
+
+  Future<void> logNativeGeofenceInventory(String source) async {
+    try {
+      final ids = await nativeGeofenceIds();
+      await fbg.Logger.notice(
+        'SPARRC geofence_inventory source=$source native_count=${ids.length} '
+        'ids=${_formatIds(ids)}',
+      );
+    } catch (e, st) {
+      try {
+        await fbg.Logger.notice(
+          'SPARRC geofence_inventory_failed source=$source '
+          'error=${e.runtimeType}',
+        );
+      } catch (_) {}
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'geofence_inventory_failed',
+      );
+    }
+  }
 
   Future<void> setConfig(RuntimeConfig cfg) async {
     _cfg = cfg;
@@ -295,12 +342,22 @@ class TsbgEngine {
             d.ident: d,
       };
       final current = <String, GeofenceDef>{for (final d in _defs) d.ident: d};
+      final expectedNativeIds = _nativeIdsForDefs(incoming.values);
+      var removedNativeCount = 0;
+      var addedNativeCount = 0;
+
+      await fbg.Logger.notice(
+        'SPARRC geofence_engine add_geofences start defs=${defs.length} '
+        'valid_defs=${incoming.length} expected_native=${expectedNativeIds.length} '
+        'ids=${_formatIds(expectedNativeIds)}',
+      );
 
       // Remove fences that are no longer in the incoming list (inner + outer near-zone)
       for (final ident in current.keys) {
         if (!incoming.containsKey(ident)) {
           await fbg.BackgroundGeolocation.removeGeofence(ident);
           await fbg.BackgroundGeolocation.removeGeofence('${ident}_near');
+          removedNativeCount += 2;
         }
       }
 
@@ -337,6 +394,7 @@ class TsbgEngine {
               loiteringDelay: 0,
             ),
           );
+          addedNativeCount += 2;
         }
       }
 
@@ -344,6 +402,11 @@ class TsbgEngine {
         ..clear()
         ..addAll(defs);
       FirebaseCrashlytics.instance.setCustomKey('fence_count', _defs.length);
+      await fbg.Logger.notice(
+        'SPARRC geofence_engine add_geofences result removed_native=$removedNativeCount '
+        'added_native=$addedNativeCount cached_defs=${_defs.length}',
+      );
+      await logNativeGeofenceInventory('engine_after_add');
     } catch (e, st) {
       FirebaseCrashlytics.instance.recordError(
         e,
@@ -680,6 +743,145 @@ class TsbgEngine {
     await forceMovingPace(source: 'heartbeat_watchdog');
   }
 
+  Future<void> _maybeForceWakeFromNearEnter(fbg.GeofenceEvent event) async {
+    final now = DateTime.now().toUtc();
+    const sourceName = 'near_geofence_enter_forcewake';
+
+    await fbg.Logger.notice(
+      'SPARRC near_forcewake check fence=${event.identifier}',
+    );
+
+    try {
+      final state = await fbg.BackgroundGeolocation.state;
+      await fbg.Logger.notice(
+        'SPARRC near_forcewake state enabled=${state.enabled} '
+        'isMoving=${state.isMoving}',
+      );
+      if (state.enabled != true) {
+        await fbg.Logger.notice(
+          'SPARRC near_forcewake skipped reason=fbg_disabled',
+        );
+        return;
+      }
+      if (state.isMoving == true) {
+        await fbg.Logger.notice(
+          'SPARRC near_forcewake skipped reason=already_moving',
+        );
+        return;
+      }
+    } catch (e, st) {
+      await fbg.Logger.notice(
+        'SPARRC near_forcewake state_unreadable error=${e.runtimeType}',
+      );
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'near_forcewake_state_unreadable',
+      );
+      return;
+    }
+
+    final lastRun = await GeoDiagnosticsWriter.readHeartbeatWatchdogRun(
+      source: sourceName,
+    );
+    if (lastRun != null &&
+        now.difference(lastRun) < _nearEnterForceWakeCooldown) {
+      await fbg.Logger.notice(
+        'SPARRC near_forcewake skipped reason=rate_limited '
+        'last_run_s=${now.difference(lastRun).inSeconds}',
+      );
+      return;
+    }
+
+    final comparisonRef =
+        await GeoDiagnosticsWriter.readLastBreadcrumbCandidate(
+      uid: _uid,
+    );
+
+    await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
+      source: sourceName,
+      timestamp: now,
+    );
+
+    await fbg.Logger.notice(
+      'SPARRC near_forcewake get_current_position_start '
+      'comparison_ref=${comparisonRef == null ? 'missing' : 'found'}',
+    );
+    fbg.Location? loc;
+    try {
+      loc = await fbg.BackgroundGeolocation.getCurrentPosition(
+        samples: 1,
+        persist: true,
+        timeout: _nearEnterForceWakeTimeoutS,
+      );
+      await fbg.Logger.notice(
+        'SPARRC near_forcewake get_current_position_success',
+      );
+    } catch (e, st) {
+      await fbg.Logger.notice(
+        'SPARRC near_forcewake get_current_position_error '
+        'error=${e.runtimeType}',
+      );
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'near_forcewake_current_position_failed',
+      );
+    }
+
+    if (loc == null) {
+      await fbg.Logger.notice(
+        'SPARRC near_forcewake skipped reason=no_location_available',
+      );
+      return;
+    }
+
+    if (comparisonRef == null) {
+      await fbg.Logger.notice(
+        'SPARRC near_forcewake skipped '
+        'reason=no_last_breadcrumb_reference after_location_persisted=true',
+      );
+      return;
+    }
+
+    final staleS = now.difference(comparisonRef.timestamp).inSeconds;
+    if (staleS < _nearEnterForceWakeStaleAfter.inSeconds) {
+      await fbg.Logger.notice(
+        'SPARRC near_forcewake skipped reason=breadcrumb_not_stale '
+        'stale_s=$staleS after_location_persisted=true',
+      );
+      return;
+    }
+
+    final movedM = haversineMeters(
+      comparisonRef.lat,
+      comparisonRef.lng,
+      loc.coords.latitude,
+      loc.coords.longitude,
+    );
+    await fbg.Logger.notice(
+      'SPARRC near_forcewake using_location '
+      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
+    );
+
+    if (movedM < _nearEnterForceWakeMovedM) {
+      await fbg.Logger.notice(
+        'SPARRC near_forcewake skipped reason=moved_too_little '
+        'distance_m=${movedM.toStringAsFixed(1)} '
+        'threshold_m=$_nearEnterForceWakeMovedM',
+      );
+      return;
+    }
+
+    await fbg.Logger.notice(
+      'SPARRC near_forcewake force_pace '
+      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
+    );
+    await forceMovingPace(source: sourceName);
+  }
+
   /// Expose streams
   Stream<LocationSample> onLocation() => _locCtl.stream;
   Stream<GeofenceEvent> onGeofence() => _fenceCtl.stream;
@@ -702,7 +904,13 @@ class TsbgEngine {
   /// the DWELL → EXIT state transition.
   Future<void> refreshGeofences() async {
     final nearRadiusM = (_cfg?.nearZoneRadiusM ?? 100).toDouble();
+    final expectedNativeIds = _nativeIdsForDefs(_defs);
+    await fbg.Logger.notice(
+      'SPARRC geofence_engine refresh_geofences start defs=${_defs.length} '
+      'expected_native=${expectedNativeIds.length} ids=${_formatIds(expectedNativeIds)}',
+    );
     await fbg.BackgroundGeolocation.removeGeofences();
+    var addedNativeCount = 0;
     for (final d in _defs) {
       if (d.type == 'circle' &&
           d.lat != null &&
@@ -732,8 +940,13 @@ class TsbgEngine {
             loiteringDelay: 0,
           ),
         );
+        addedNativeCount += 2;
       }
     }
+    await fbg.Logger.notice(
+      'SPARRC geofence_engine refresh_geofences result added_native=$addedNativeCount',
+    );
+    await logNativeGeofenceInventory('engine_after_refresh');
   }
 
   /// Update native HTTP extras with current zone context so zbgIngest
@@ -861,6 +1074,7 @@ class TsbgEngine {
         if (e.action == 'ENTER') {
           _activeNearFences.add(e.identifier);
           if (_enteredFenceId == null) await _applyMode(SamplingMode.near);
+          await _maybeForceWakeFromNearEnter(e);
         } else if (e.action == 'EXIT') {
           _activeNearFences.remove(e.identifier);
           if (_enteredFenceId == null && _activeNearFences.isEmpty) {
