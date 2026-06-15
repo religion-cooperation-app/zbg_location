@@ -271,11 +271,7 @@ class TsbgEngine {
           ),
 
           activity: fbg.ActivityConfig(
-            // Allow FBG to enter low-power stationary mode when the device stops
-            // moving. The heartbeat handles breadcrumb emission while stationary;
-            // the accelerometer wakes FBG when motion resumes. Keeping this true
-            // burns maximum battery and causes iOS to throttle/kill the process.
-            disableStopDetection: false,
+            disableStopDetection: cfg.disableStopDetection,
           ),
 
           logger: fbg.LoggerConfig(debug: false),

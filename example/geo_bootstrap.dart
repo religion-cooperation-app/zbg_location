@@ -606,6 +606,10 @@ class GeoBootstrap with WidgetsBindingObserver {
 
       // Near-zone radius for outer geofences
       nearZoneRadiusM: (geoDetect['near_zone_radius_m'] ?? 100) as int,
+
+      // Disable stop detection — controlled globally via Firestore; default false
+      disableStopDetection:
+          (platform['disable_stop_detection'] ?? false) as bool,
     );
   }
 }

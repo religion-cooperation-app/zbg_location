@@ -131,6 +131,12 @@ class RuntimeConfig {
   /// wake-ups at the cost of a short upload delay.
   final int autoSyncThreshold;
 
+  /// When true, FBG never enters low-power stationary mode — GPS stays on
+  /// continuously. Sourced from appConfig/runtime platform.disable_stop_detection.
+  /// Default false. Set true only for specific tracking needs; burns battery
+  /// and causes iOS to throttle the process.
+  final bool disableStopDetection;
+
   /// Construct full runtime config
   const RuntimeConfig({
     required this.enabled,
@@ -155,6 +161,7 @@ class RuntimeConfig {
     this.ingestApiKey,
     this.nearZoneRadiusM = 100,
     this.autoSyncThreshold = 0,
+    this.disableStopDetection = false,
   });
 
   /// Factory loader from Firestore or JSON blob
@@ -207,6 +214,10 @@ class RuntimeConfig {
       // Accumulate this many records before syncing; 0 = sync immediately
       autoSyncThreshold:
           (m['platform']?['auto_sync_threshold'] as num?)?.toInt() ?? 0,
+
+      // Disable stop detection — default false so existing builds are unaffected
+      disableStopDetection:
+          m['platform']?['disable_stop_detection'] == true,
     );
   }
 }
