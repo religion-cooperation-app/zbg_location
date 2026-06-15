@@ -38,7 +38,16 @@ import '/custom_code/geo_diagnostics_http.dart';
 Future<void> geoFirebaseMessagingBackgroundHandler(
   RemoteMessage message,
 ) async {
-  if (message.data['type'] != 'geo_wakeup') return;
+  final msgType = message.data['type'];
+
+  // Option C: geofence refresh push — handle on both platforms.
+  // Sent by a Cloud Function triggered on regions/{regionId}/geofences writes.
+  if (msgType == 'refresh_geofences') {
+    await _headlessFcmRefreshGeofences();
+    return;
+  }
+
+  if (msgType != 'geo_wakeup') return;
   if (!Platform.isIOS) return; // Android FBG foreground service handles Android
 
   // 1. Flush SQLite — recover any locations FBG stored but could not POST
@@ -558,6 +567,221 @@ Future<void> _logHeadlessNativeGeofenceInventory(String source) async {
   }
 }
 
+// ── Shared headless geofence re-registration ──────────────────────────────────
+// Used by the EXIT re-arm, Option B heartbeat version check, and Option C FCM
+// silent push. Removes all FBG geofences then re-adds from Firestore snapshot.
+Future<void> _headlessReRegisterGeofences({
+  required FirebaseFirestore fs,
+  required String regionId,
+  required int loiteringDelayMs,
+  required double nearZoneRadiusM,
+}) async {
+  final snap = await fs.collection('regions/$regionId/geofences').get();
+  await fbg.Logger.notice(
+    'SPARRC headless_reregister docs=${snap.docs.length} regionId=$regionId',
+  );
+  await fbg.BackgroundGeolocation.removeGeofences();
+  for (final doc in snap.docs) {
+    final d = doc.data();
+    final type = (d['type'] ?? 'circle') as String;
+    if (type != 'circle') continue;
+    final center = (d['center'] as Map?) ?? {};
+    final lat = (center['lat'] as num?)?.toDouble();
+    final lng = (center['lng'] as num?)?.toDouble();
+    final radiusM = (d['radius_m'] as num?)?.toDouble();
+    if (lat == null || lng == null || radiusM == null) continue;
+    await fbg.BackgroundGeolocation.addGeofence(
+      fbg.Geofence(
+        identifier: doc.id,
+        latitude: lat,
+        longitude: lng,
+        radius: radiusM,
+        notifyOnEntry: true,
+        notifyOnExit: true,
+        notifyOnDwell: true,
+        loiteringDelay: loiteringDelayMs,
+      ),
+    );
+    await fbg.BackgroundGeolocation.addGeofence(
+      fbg.Geofence(
+        identifier: '${doc.id}_near',
+        latitude: lat,
+        longitude: lng,
+        radius: radiusM + nearZoneRadiusM,
+        notifyOnEntry: true,
+        notifyOnExit: true,
+        notifyOnDwell: false,
+        loiteringDelay: 0,
+      ),
+    );
+  }
+  await _logHeadlessNativeGeofenceInventory('headless_reregister');
+}
+
+// ── Option B: Heartbeat geofence version check ────────────────────────────────
+// Reads geofences_updated_at from appConfig/runtime (a Firestore Timestamp
+// updated whenever geofences change — set it manually or via Cloud Function
+// trigger on regions/{regionId}/geofences writes).
+// Compares to locally stored last-seen timestamp. Re-registers only on change.
+Future<void> _headlessCheckGeofenceVersion() async {
+  const source = 'geofence_version_sync';
+  await fbg.Logger.notice('SPARRC geo_version_check start');
+
+  final identity = await GeoDiagnosticsWriter.readIdentity();
+  final regionId = identity?.regionId;
+  if (identity == null || regionId == null || regionId.isEmpty) {
+    await fbg.Logger.notice(
+      'SPARRC geo_version_check skipped reason=no_identity',
+    );
+    return;
+  }
+
+  try {
+    await Firebase.initializeApp();
+    final fs = FirebaseFirestore.instance;
+    final snap = await fs.doc('appConfig/runtime').get();
+    if (!snap.exists) {
+      await fbg.Logger.notice(
+        'SPARRC geo_version_check skipped reason=no_runtime_config',
+      );
+      return;
+    }
+
+    final data = snap.data()!;
+    final rawTs = data['geofences_updated_at'];
+    if (rawTs == null) {
+      await fbg.Logger.notice(
+        'SPARRC geo_version_check skipped reason=no_version_field',
+      );
+      return;
+    }
+
+    final firestoreVersion = (rawTs as Timestamp).toDate().toUtc();
+    final lastSeen = await GeoDiagnosticsWriter.readHeartbeatWatchdogRun(
+      source: source,
+    );
+
+    if (lastSeen != null && !firestoreVersion.isAfter(lastSeen)) {
+      await fbg.Logger.notice(
+        'SPARRC geo_version_check skipped reason=version_current '
+        'version=${firestoreVersion.toIso8601String()}',
+      );
+      return;
+    }
+
+    await fbg.Logger.notice(
+      'SPARRC geo_version_check version_changed '
+      'new=${firestoreVersion.toIso8601String()} '
+      'last=${lastSeen?.toIso8601String() ?? 'never'}',
+    );
+
+    final geoDetect = (data['geofenceDetect'] as Map?) ?? {};
+    final loiteringDelayMs =
+        ((geoDetect['dwell_required_s'] as num?)?.toInt() ?? 60) * 1000;
+    final nearZoneRadiusM =
+        (geoDetect['near_zone_radius_m'] as num?)?.toDouble() ?? 100.0;
+
+    await _headlessReRegisterGeofences(
+      fs: fs,
+      regionId: regionId,
+      loiteringDelayMs: loiteringDelayMs,
+      nearZoneRadiusM: nearZoneRadiusM,
+    );
+
+    await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
+      source: source,
+      timestamp: firestoreVersion,
+    );
+    await fbg.Logger.notice('SPARRC geo_version_check done re_registered=true');
+  } catch (e) {
+    await fbg.Logger.notice(
+      'SPARRC geo_version_check error error=${e.runtimeType}',
+    );
+  }
+}
+
+// ── Option C: FCM silent-push geofence refresh ────────────────────────────────
+// Triggered by a data-only FCM message with type='refresh_geofences'.
+// Intended to be sent by a Cloud Function that triggers on
+// regions/{regionId}/geofences writes. Handles both iOS and Android — the
+// FBG foreground service does not help here because the Firestore listener
+// dies with the Flutter isolate.
+Future<void> _headlessFcmRefreshGeofences() async {
+  const source = 'fcm_geo_refresh';
+  const versionSource = 'geofence_version_sync';
+  await fbg.Logger.notice('SPARRC fcm_geo_refresh received');
+
+  final now = DateTime.now().toUtc();
+  final lastRun = await GeoDiagnosticsWriter.readHeartbeatWatchdogRun(
+    source: source,
+  );
+  if (lastRun != null && now.difference(lastRun) < const Duration(minutes: 2)) {
+    await fbg.Logger.notice(
+      'SPARRC fcm_geo_refresh skipped reason=rate_limited '
+      'last_run_s=${now.difference(lastRun).inSeconds}',
+    );
+    return;
+  }
+
+  final identity = await GeoDiagnosticsWriter.readIdentity();
+  final regionId = identity?.regionId;
+  if (identity == null || regionId == null || regionId.isEmpty) {
+    await fbg.Logger.notice(
+      'SPARRC fcm_geo_refresh skipped reason=no_identity',
+    );
+    return;
+  }
+
+  try {
+    await Firebase.initializeApp();
+    final fs = FirebaseFirestore.instance;
+
+    final configSnap = await fs.doc('appConfig/runtime').get();
+    int loiteringDelayMs = 60000;
+    double nearZoneRadiusM = 100.0;
+    DateTime? firestoreVersion;
+    if (configSnap.exists) {
+      final data = configSnap.data()!;
+      final geoDetect = (data['geofenceDetect'] as Map?) ?? {};
+      loiteringDelayMs =
+          ((geoDetect['dwell_required_s'] as num?)?.toInt() ?? 60) * 1000;
+      nearZoneRadiusM =
+          (geoDetect['near_zone_radius_m'] as num?)?.toDouble() ?? 100.0;
+      final rawTs = data['geofences_updated_at'];
+      if (rawTs != null) {
+        firestoreVersion = (rawTs as Timestamp).toDate().toUtc();
+      }
+    }
+
+    await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
+      source: source,
+      timestamp: now,
+    );
+
+    await _headlessReRegisterGeofences(
+      fs: fs,
+      regionId: regionId,
+      loiteringDelayMs: loiteringDelayMs,
+      nearZoneRadiusM: nearZoneRadiusM,
+    );
+
+    // Stamp the version so the next heartbeat version check does not
+    // redundantly re-register what we just fetched.
+    if (firestoreVersion != null) {
+      await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
+        source: versionSource,
+        timestamp: firestoreVersion,
+      );
+    }
+
+    await fbg.Logger.notice('SPARRC fcm_geo_refresh done');
+  } catch (e) {
+    await fbg.Logger.notice(
+      'SPARRC fcm_geo_refresh error error=${e.runtimeType}',
+    );
+  }
+}
+
 bool _shouldLogHeadlessGeofenceInventory(String eventName) {
   return eventName == fbg.Event.LOCATION ||
       eventName == fbg.Event.HEARTBEAT ||
@@ -643,6 +867,8 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
         'SPARRC headless_watchdog force_pace_not_requested',
       );
     }
+    // Option B: check whether Firestore geofences changed since last sync.
+    await _headlessCheckGeofenceVersion();
     return;
   }
 
@@ -740,6 +966,7 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
   int rateInsideS = 45, rateNearS = 45, rateOutsideS = 120;
   int distFilterInsideM = 10, distFilterNearM = 20, distFilterOutsideM = 100;
   double nearZoneRadiusM = 100.0;
+  DateTime? geofencesUpdatedAt; // captured for version-stamp after EXIT re-arm
   try {
     final configSnap = await fs.doc('appConfig/runtime').get();
     if (configSnap.exists) {
@@ -750,6 +977,10 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
           ((geoDetect['dwell_required_s'] as num?)?.toInt() ?? 60) * 1000;
       nearZoneRadiusM =
           (geoDetect['near_zone_radius_m'] as num?)?.toDouble() ?? 100.0;
+      final rawGeoTs = data['geofences_updated_at'];
+      if (rawGeoTs != null) {
+        geofencesUpdatedAt = (rawGeoTs as Timestamp).toDate().toUtc();
+      }
       rateInsideS = (breadcrumbs['rate_inside_zone_s'] as num?)?.toInt() ?? 45;
       rateNearS = (breadcrumbs['rate_near_zone_s'] as num?)?.toInt() ?? 45;
       rateOutsideS =
@@ -838,40 +1069,18 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
   // EXIT: re-arm Android's Geofencing API including outer near-zone fences.
   if (action == 'EXIT' && regionId != null) {
     try {
-      final snap = await fs.collection('regions/$regionId/geofences').get();
-      await fbg.BackgroundGeolocation.removeGeofences();
-      for (final doc in snap.docs) {
-        final d = doc.data();
-        final type = (d['type'] ?? 'circle') as String;
-        if (type != 'circle') continue;
-        final center = (d['center'] as Map?) ?? {};
-        final lat = (center['lat'] as num?)?.toDouble();
-        final lng = (center['lng'] as num?)?.toDouble();
-        final radiusM = (d['radius_m'] as num?)?.toDouble();
-        if (lat == null || lng == null || radiusM == null) continue;
-        await fbg.BackgroundGeolocation.addGeofence(
-          fbg.Geofence(
-            identifier: doc.id,
-            latitude: lat,
-            longitude: lng,
-            radius: radiusM,
-            notifyOnEntry: true,
-            notifyOnExit: true,
-            notifyOnDwell: true,
-            loiteringDelay: loiteringDelayMs,
-          ),
-        );
-        await fbg.BackgroundGeolocation.addGeofence(
-          fbg.Geofence(
-            identifier: '${doc.id}_near',
-            latitude: lat,
-            longitude: lng,
-            radius: radiusM + nearZoneRadiusM,
-            notifyOnEntry: true,
-            notifyOnExit: true,
-            notifyOnDwell: false,
-            loiteringDelay: 0,
-          ),
+      await _headlessReRegisterGeofences(
+        fs: fs,
+        regionId: regionId,
+        loiteringDelayMs: loiteringDelayMs,
+        nearZoneRadiusM: nearZoneRadiusM,
+      );
+      // Stamp the version so the next heartbeat doesn't re-register again
+      // for the same Firestore geofence state we just fetched.
+      if (geofencesUpdatedAt != null) {
+        await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
+          source: 'geofence_version_sync',
+          timestamp: geofencesUpdatedAt!,
         );
       }
     } catch (_) {

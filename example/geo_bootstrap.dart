@@ -17,8 +17,9 @@ import 'package:zbg_location/zbg_location.dart'; // barrel (api, engine, writers
 import 'package:zbg_proximity/zbg_proximity.dart'; // for ZoneState
 import '/custom_code/zbg_firestore_adapter.dart'; // your shared WriteFn adapter
 import '/custom_code/geo_fcm_handler.dart'; // FCM handler + background fetch headless task
+import 'package:flutter/widgets.dart';
 
-class GeoBootstrap {
+class GeoBootstrap with WidgetsBindingObserver {
   GeoBootstrap._();
   static final instance = GeoBootstrap._();
 
@@ -35,6 +36,8 @@ class GeoBootstrap {
   bool _inside = false;
   bool _starting =
       false; // concurrency guard — prevents overlapping startFromFirestore calls
+  String? _regionId;
+  bool _lifecycleObserverRegistered = false;
 
   static List<String> _expectedNativeGeofenceIds(List<GeofenceDef> defs) {
     final ids = <String>[];
@@ -388,6 +391,7 @@ class GeoBootstrap {
     // geo_mode records the active tracking mode so geoWakeupSweep can skip
     // users in geofence_only mode (they only emit breadcrumbs inside fences).
     _uid = uid;
+    _regionId = regionId;
     FirebaseCrashlytics.instance.setUserIdentifier(uid);
     try {
       await fs.doc('users/$uid').set({
@@ -408,9 +412,18 @@ class GeoBootstrap {
       );
       throw StateError('geo:user_doc_write_failed');
     }
+    if (!_lifecycleObserverRegistered) {
+      WidgetsBinding.instance.addObserver(this);
+      _lifecycleObserverRegistered = true;
+    }
   }
 
   Future<void> stop() async {
+    if (_lifecycleObserverRegistered) {
+      WidgetsBinding.instance.removeObserver(this);
+      _lifecycleObserverRegistered = false;
+    }
+    _regionId = null;
     await _locSub?.cancel();
     await _fenceSub?.cancel();
     _configSub?.cancel();
@@ -472,6 +485,53 @@ class GeoBootstrap {
 
   Future<String> forceMovingPace({String source = 'foreground'}) {
     return _engine.forceMovingPace(source: source);
+  }
+
+  /// Fires on every app foreground (AppLifecycleState.resumed).
+  /// Triggers a lightweight geofence sync so newly-added Firestore fences
+  /// are picked up even when the real-time listener died with the isolate.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) return;
+    final regionId = _regionId;
+    if (regionId == null || !isRunning) return;
+    refreshGeofencesFromFirestore(regionId);
+  }
+
+  /// One-shot Firestore fetch of the geofences collection, then diffs against
+  /// what FBG currently has registered. Does NOT restart listeners or re-init
+  /// any other engine state — safe to call from foreground, FCM handler, or
+  /// any path that needs to pick up newly-added Firestore fences.
+  Future<void> refreshGeofencesFromFirestore(String regionId) async {
+    if (!isRunning) {
+      await fbg.Logger.notice(
+        'SPARRC geo_refresh_geofences skipped reason=not_running',
+      );
+      return;
+    }
+    await fbg.Logger.notice(
+      'SPARRC geo_refresh_geofences start regionId=$regionId',
+    );
+    try {
+      final snap = await FirebaseFirestore.instance
+          .collection('regions/$regionId/geofences')
+          .get();
+      final defs = _parseGeofenceDocs(snap.docs);
+      await _engine.addGeofences(defs);
+      await fbg.Logger.notice(
+        'SPARRC geo_refresh_geofences done defs=${defs.length}',
+      );
+    } catch (e, st) {
+      await fbg.Logger.notice(
+        'SPARRC geo_refresh_geofences error error=${e.runtimeType}',
+      );
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'geo_refresh_geofences_failed',
+      );
+    }
   }
 
   /// Parses a geofences collection snapshot into GeofenceDef list.
