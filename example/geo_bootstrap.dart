@@ -36,6 +36,17 @@ class GeoBootstrap {
   bool _starting =
       false; // concurrency guard — prevents overlapping startFromFirestore calls
 
+  static List<String> _expectedNativeGeofenceIds(List<GeofenceDef> defs) {
+    final ids = <String>[];
+    for (final d in defs) {
+      ids
+        ..add(d.ident)
+        ..add('${d.ident}_near');
+    }
+    ids.sort();
+    return ids;
+  }
+
   // Broadcasts zone state changes to any subscriber (e.g. BtBootstrap).
   // Purely in-memory — no network involved.
   final _zoneCtl = StreamController<ZoneState>.broadcast();
@@ -53,6 +64,9 @@ class GeoBootstrap {
 
   Future<void> _startFromFirestoreInner(String regionId) async {
     final fs = FirebaseFirestore.instance;
+    await fbg.Logger.notice(
+      'SPARRC geofence_bootstrap start regionId=$regionId',
+    );
 
     // ----- 0) Get user + set identity FIRST -----
     // NOTE: _uid is intentionally NOT set here. It is set only at step 7 after
@@ -68,7 +82,8 @@ class GeoBootstrap {
     // data-only 'geo_wakeup' message arrives (backgrounded/OS-terminated, not
     // force-quit). Idempotent — safe to call on every startFromFirestore.
     FirebaseMessaging.onBackgroundMessage(
-        geoFirebaseMessagingBackgroundHandler);
+      geoFirebaseMessagingBackgroundHandler,
+    );
 
     // Background fetch (iOS only): OS-triggered periodic wakeup ~every 15–30 min.
     // Complements silent push with time-based wakeups that require no server
@@ -93,9 +108,15 @@ class GeoBootstrap {
           },
         );
         await BackgroundFetch.registerHeadlessTask(
-            geoBackgroundFetchHeadlessTask);
+          geoBackgroundFetchHeadlessTask,
+        );
       } catch (e, st) {
-        FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'background_fetch_configure_failed');
+        FirebaseCrashlytics.instance.recordError(
+          e,
+          st,
+          fatal: false,
+          reason: 'background_fetch_configure_failed',
+        );
         throw StateError('geo:background_fetch_failed');
       }
     }
@@ -106,10 +127,27 @@ class GeoBootstrap {
     // CLRegionMonitoring re-arms automatically and BackgroundFetch handles wakeups.
     if (Platform.isAndroid) {
       try {
+        await fbg.Logger.notice(
+          'SPARRC headless_task_register_start source=geo_bootstrap',
+        );
         await fbg.BackgroundGeolocation.registerHeadlessTask(
-            geoFbgHeadlessTask);
+          geoFbgHeadlessTask,
+        );
+        await fbg.Logger.notice(
+          'SPARRC headless_task_registered source=geo_bootstrap',
+        );
       } catch (e, st) {
-        FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'headless_task_registration_failed');
+        try {
+          await fbg.Logger.notice(
+            'SPARRC headless_task_registration_failed error=${e.runtimeType}',
+          );
+        } catch (_) {}
+        FirebaseCrashlytics.instance.recordError(
+          e,
+          st,
+          fatal: false,
+          reason: 'headless_task_registration_failed',
+        );
         throw StateError('geo:headless_task_failed');
       }
     }
@@ -128,28 +166,50 @@ class GeoBootstrap {
       (snap) {
         if (!snap.exists) {
           if (!configReady.isCompleted)
-            configReady.completeError(StateError('geo:missing_runtime_config'));
+            configReady.completeError(
+              StateError('geo:missing_runtime_config'),
+            );
           return;
         }
         RuntimeConfig cfg;
         try {
           cfg = _buildRuntimeConfig(snap.data()! as Map<String, dynamic>);
         } catch (e, st) {
-          FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'runtime_config_parse_failed');
+          FirebaseCrashlytics.instance.recordError(
+            e,
+            st,
+            fatal: false,
+            reason: 'runtime_config_parse_failed',
+          );
           if (!configReady.isCompleted)
-            configReady.completeError(StateError('geo:config_parse_failed'));
+            configReady.completeError(
+              StateError('geo:config_parse_failed'),
+            );
           return;
         }
         final fut = _engine.setConfig(cfg);
         if (!configReady.isCompleted) {
-          fut.then((_) => configReady.complete()).catchError((Object e, StackTrace st) {
-            FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'fbg_init_failed');
+          fut.then((_) => configReady.complete()).catchError((
+            Object e,
+            StackTrace st,
+          ) {
+            FirebaseCrashlytics.instance.recordError(
+              e,
+              st,
+              fatal: false,
+              reason: 'fbg_init_failed',
+            );
             if (!configReady.isCompleted)
               configReady.completeError(StateError('geo:fbg_init_failed'));
           });
         } else {
           fut.catchError((Object e, StackTrace st) {
-            FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'live_config_update_failed');
+            FirebaseCrashlytics.instance.recordError(
+              e,
+              st,
+              fatal: false,
+              reason: 'live_config_update_failed',
+            );
           });
         }
       },
@@ -173,8 +233,13 @@ class GeoBootstrap {
     // the broadcast stream with no subscriber.
     _fenceSub?.cancel();
     _fenceSub = _engine.onGeofence().listen((e) async {
-      FirebaseCrashlytics.instance.log('fence ${e.type.name} zone=${e.fenceId}${e.dwellSeconds != null ? ' dwell=${e.dwellSeconds}s' : ''}');
-      FirebaseCrashlytics.instance.setCustomKey('last_fence_event', e.type.name);
+      FirebaseCrashlytics.instance.log(
+        'fence ${e.type.name} zone=${e.fenceId}${e.dwellSeconds != null ? ' dwell=${e.dwellSeconds}s' : ''}',
+      );
+      FirebaseCrashlytics.instance.setCustomKey(
+        'last_fence_event',
+        e.type.name,
+      );
       FirebaseCrashlytics.instance.setCustomKey('last_fence_id', e.fenceId);
       final isEnterOrDwell = (e.type == GeofenceEventType.enter ||
           e.type == GeofenceEventType.dwell);
@@ -186,10 +251,7 @@ class GeoBootstrap {
       // Update native HTTP extras so zbgIngest breadcrumbs carry correct
       // zoneId and inside_zone from this point forward.
       // On EXIT: zoneId is null, so the 'zoneId' key is omitted from extras.
-      await _engine.setZoneContext(
-        zoneId: _currentZoneId,
-        insideZone: _inside,
-      );
+      await _engine.setZoneContext(zoneId: _currentZoneId, insideZone: _inside);
 
       // After EXIT, force-re-register all geofences so Android's Geofencing API
       // re-arms ENTER monitoring for the next visit. Android-only: on iOS,
@@ -229,12 +291,28 @@ class GeoBootstrap {
         fs.collection('regions/$regionId/geofences').snapshots().listen(
       (snap) async {
         final defs = _parseGeofenceDocs(snap.docs);
-        if (defs.isNotEmpty) await _engine.addGeofences(defs);
+        final expectedNativeIds = _expectedNativeGeofenceIds(defs);
+        await fbg.Logger.notice(
+          'SPARRC geofence_bootstrap firestore_snapshot '
+          'docs=${snap.docs.length} defs=${defs.length} '
+          'expected_native=${expectedNativeIds.length} '
+          'ids=${expectedNativeIds.join(',')}',
+        );
+        if (defs.isNotEmpty) {
+          await fbg.Logger.notice(
+            'SPARRC geofence_bootstrap add_geofences count=${defs.length} '
+            'expected_native=${expectedNativeIds.length}',
+          );
+          await _engine.addGeofences(defs);
+          await _engine.logNativeGeofenceInventory('bootstrap_after_add');
+        }
         if (!geofencesReady.isCompleted) geofencesReady.complete();
       },
       onError: (e) {
         if (!geofencesReady.isCompleted)
-          geofencesReady.completeError(StateError('geo:geofences_load_failed'));
+          geofencesReady.completeError(
+            StateError('geo:geofences_load_failed'),
+          );
       },
     );
     try {
@@ -270,8 +348,14 @@ class GeoBootstrap {
     // ----- 6) Start engine -----
     try {
       await _engine.start();
+      await _engine.logNativeGeofenceInventory('bootstrap_after_start');
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'engine_start_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'engine_start_failed',
+      );
       throw StateError('geo:engine_start_failed');
     }
 
@@ -283,8 +367,14 @@ class GeoBootstrap {
     // is listening, and emits a synthetic ENTER if inside any registered fence.
     try {
       await _engine.synthesizeEnterIfInside();
+      await _engine.logNativeGeofenceInventory('bootstrap_after_synthesize');
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'synthesize_enter_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'synthesize_enter_failed',
+      );
       throw StateError('geo:synthesize_failed');
     }
 
@@ -300,20 +390,22 @@ class GeoBootstrap {
     _uid = uid;
     FirebaseCrashlytics.instance.setUserIdentifier(uid);
     try {
-      await fs.doc('users/$uid').set(
-        {
-          'geo_running': true,
-          'geo_session_started': FieldValue.serverTimestamp(),
-          // tz_offset_minutes: device UTC offset in minutes (e.g. -300 for EST,
-          // 330 for IST). Written each session start so it stays current across
-          // DST changes. Used by geoWakeupSweep to evaluate local-time window.
-          'tz_offset_minutes': DateTime.now().timeZoneOffset.inMinutes,
-          'geo_mode': _engine.geoSystemMode,
-        },
-        SetOptions(merge: true),
-      );
+      await fs.doc('users/$uid').set({
+        'geo_running': true,
+        'geo_session_started': FieldValue.serverTimestamp(),
+        // tz_offset_minutes: device UTC offset in minutes (e.g. -300 for EST,
+        // 330 for IST). Written each session start so it stays current across
+        // DST changes. Used by geoWakeupSweep to evaluate local-time window.
+        'tz_offset_minutes': DateTime.now().timeZoneOffset.inMinutes,
+        'geo_mode': _engine.geoSystemMode,
+      }, SetOptions(merge: true));
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'user_doc_start_write_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'user_doc_start_write_failed',
+      );
       throw StateError('geo:user_doc_write_failed');
     }
   }
@@ -333,7 +425,12 @@ class GeoBootstrap {
     try {
       await _engine.stop();
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'engine_stop_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'engine_stop_failed',
+      );
       errorCode = 'geo:stop_engine_failed';
     }
 
@@ -344,15 +441,17 @@ class GeoBootstrap {
     // Mark geo as stopped so geoWakeupSweep no longer targets this user.
     if (_uid != null) {
       try {
-        await FirebaseFirestore.instance.doc('users/$_uid').set(
-          {
-            'geo_running': false,
-            'geo_session_stopped': FieldValue.serverTimestamp()
-          },
-          SetOptions(merge: true),
-        );
+        await FirebaseFirestore.instance.doc('users/$_uid').set({
+          'geo_running': false,
+          'geo_session_stopped': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
       } catch (e, st) {
-        FirebaseCrashlytics.instance.recordError(e, st, fatal: false, reason: 'user_doc_stop_write_failed');
+        FirebaseCrashlytics.instance.recordError(
+          e,
+          st,
+          fatal: false,
+          reason: 'user_doc_stop_write_failed',
+        );
         errorCode ??= 'geo:stop_doc_write_failed';
       }
       _uid = null;
@@ -371,10 +470,15 @@ class GeoBootstrap {
   /// recover terminated-state locations written during significant-change wakeups.
   Future<void> flushBuffer() async => _engine.flushBuffer();
 
+  Future<String> forceMovingPace({String source = 'foreground'}) {
+    return _engine.forceMovingPace(source: source);
+  }
+
   /// Parses a geofences collection snapshot into GeofenceDef list.
   /// Called on every emission of the geofence listener.
   List<GeofenceDef> _parseGeofenceDocs(
-      List<QueryDocumentSnapshot<Map<String, dynamic>>> docs) {
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
+  ) {
     final defs = <GeofenceDef>[];
     for (final d in docs) {
       final m = d.data();
@@ -385,13 +489,15 @@ class GeoBootstrap {
         final lng = (center['lng'] as num?)?.toDouble();
         final radiusM = (m['radius_m'] as num?)?.toDouble();
         if (lat != null && lng != null && radiusM != null) {
-          defs.add(GeofenceDef(
-            ident: d.id,
-            type: 'circle',
-            lat: lat,
-            lng: lng,
-            radiusM: radiusM,
-          ));
+          defs.add(
+            GeofenceDef(
+              ident: d.id,
+              type: 'circle',
+              lat: lat,
+              lng: lng,
+              radiusM: radiusM,
+            ),
+          );
         }
       }
       // polygons are optional later
@@ -410,9 +516,9 @@ class GeoBootstrap {
       enabled: (breadcrumbs['enabled'] == true),
       dwellRequiredS: (geoDetect['dwell_required_s'] ?? 60) as int,
       dwellEveryS: (geoDetect['dwell_every_s'] ?? 0) as int,
-      rateOutsideS: (breadcrumbs['rate_outside_zone_s'] ?? 300) as int,
-      rateNearS: (breadcrumbs['rate_near_zone_s'] ?? 60) as int,
-      rateInsideS: (breadcrumbs['rate_inside_zone_s'] ?? 30) as int,
+      rateOutsideS: (breadcrumbs['rate_outside_zone_s'] ?? 120) as int,
+      rateNearS: (breadcrumbs['rate_near_zone_s'] ?? 45) as int,
+      rateInsideS: (breadcrumbs['rate_inside_zone_s'] ?? 45) as int,
       accuracyDropM: (breadcrumbs['accuracy_drop_m'] ?? 50).toDouble(),
       distanceFilterInsideM:
           (breadcrumbs['distance_filter_inside_m'] ?? 10) as int,

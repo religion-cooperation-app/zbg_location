@@ -131,6 +131,10 @@ class TsbgEngine {
 
   Future<void> setConfig(RuntimeConfig cfg) async {
     _cfg = cfg;
+    await fbg.Logger.notice(
+      'SPARRC engine_set_config start ready=$_ready '
+      'listeners_attached=$_listenersAttached started=$_started',
+    );
 
     // Snapshot identity for HTTP params at config-time.
     final uid = _uid;
@@ -152,8 +156,13 @@ class TsbgEngine {
     // _listenersAttached ensures this only happens once — FBG listener registration
     // is additive and calling onGeofence/onLocation twice stacks duplicate handlers.
     if (!_listenersAttached) {
+      await fbg.Logger.notice('SPARRC engine_attach_listeners start');
       _attachListeners();
       _listenersAttached = true;
+      await fbg.Logger.notice(
+        'SPARRC engine_attach_listeners registered '
+        'onLocation/onMotionChange/onHeartbeat/onGeofence',
+      );
     }
 
     try {
@@ -285,6 +294,7 @@ class TsbgEngine {
     // Only mark ready after success — if ready() threw, _ready stays false
     // so the next start attempt retries with reset: true.
     _ready = true;
+    await fbg.Logger.notice('SPARRC engine_ready_success');
 
     FirebaseCrashlytics.instance.setCustomKey(
       'geofence_only_mode',
@@ -324,7 +334,13 @@ class TsbgEngine {
     }
 
     // Apply the current mode’s config (outside by default).
+    await fbg.Logger.notice(
+      'SPARRC engine_set_config applying_mode=${_mode.name}',
+    );
     await _applyMode(_mode);
+    await fbg.Logger.notice(
+      'SPARRC engine_set_config complete mode=${_mode.name}',
+    );
   }
 
   Future<void> addGeofences(List<GeofenceDef> defs) async {
@@ -991,10 +1007,32 @@ class TsbgEngine {
 
     // HEARTBEAT — ensures timed emission even when stationary
     fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent e) async {
+      await fbg.Logger.notice(
+        'SPARRC foreground_heartbeat received has_location=${e.location != null} '
+        'mode=${_mode.name} ready=$_ready started=$_started',
+      );
+      await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
+        source: 'foreground_heartbeat_received',
+        timestamp: DateTime.now().toUtc(),
+      );
+      try {
+        final state = await fbg.BackgroundGeolocation.state;
+        await fbg.Logger.notice(
+          'SPARRC heartbeat_state path=foreground enabled=${state.enabled} '
+          'isMoving=${state.isMoving}',
+        );
+      } catch (e) {
+        await fbg.Logger.notice(
+          'SPARRC heartbeat_state path=foreground state_unreadable '
+          'error=${e.runtimeType}',
+        );
+      }
       FirebaseCrashlytics.instance.log(
         'hb mode=${_mode.name} ts=${DateTime.now().toUtc().toIso8601String()}',
       );
+      await fbg.Logger.notice('SPARRC foreground_watchdog invoke');
       await _runHeartbeatWatchdog(e);
+      await fbg.Logger.notice('SPARRC foreground_watchdog returned');
 
       // Prefer last known location from SDK; fall back to a lightweight fetch.
       fbg.Location? loc = e.location;

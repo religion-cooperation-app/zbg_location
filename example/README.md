@@ -15,6 +15,11 @@ The bootstrap orchestrator. A singleton (`GeoBootstrap.instance`) that:
 
 Copy to: `lib/custom_code/geo_bootstrap.dart` in your FlutterFlow project.
 
+### `geo_fcm_handler.dart`
+FCM background message handler, iOS background-fetch headless task, and Android FBG headless task. It handles terminated-state FBG events, headless heartbeat watchdog diagnostics, near-zone forcewake, location candidate persistence, and Android geofence event writes.
+
+Copy to: `lib/custom_code/geo_fcm_handler.dart` in your FlutterFlow project.
+
 ### `geoStartFromConfig.dart`
 FlutterFlow custom action that calls `GeoBootstrap.instance.startFromFirestore(regionId)`. Returns `'success'` or an error string. Call on sign-in and conditionally on the homepage (gated by `isBreadcrumbStale`).
 
@@ -41,8 +46,8 @@ In production this function lives in `functions/index.js` alongside the rest of 
 
 The following files are also required in the FlutterFlow project but are more project-specific:
 
-- `geo_fcm_handler.dart` — FCM background message handler and Android FBG headless task
 - `zbg_firestore_adapter.dart` — `WriteFn` adapter that bridges `FirestoreWriter` to the Firebase SDK available in FlutterFlow
+- `geo_diagnostics_http.dart` — diagnostics helper used by the headless handler
 - `isBreadcrumbStale.dart` — custom action that reads `last_breadcrumb_ts` from the user document to gate homepage restarts
 - `geoFlushBuffer.dart` — custom action that calls `GeoBootstrap.instance.flushBuffer()` on homepage visits
 
