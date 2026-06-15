@@ -106,7 +106,7 @@ void geoBackgroundFetchHeadlessTask(HeadlessTask task) async {
 //
 // Registered via BackgroundGeolocation.registerHeadlessTask inside
 // GeoBootstrap.startFromFirestore() — Android-only.
-const Duration _headlessWatchdogInterval = Duration(minutes: 2);
+const Duration _headlessWatchdogInterval = Duration(minutes: 3);
 const Duration _headlessWatchdogStaleAfter = Duration(minutes: 2);
 const int _headlessWatchdogTimeoutS = 30;
 const double _headlessWatchdogMovedM = 60;
@@ -580,9 +580,10 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
         'source=headless_location',
       );
     }
-    try {
-      await fbg.BackgroundGeolocation.sync();
-    } catch (_) {}
+    await fbg.Logger.notice(
+      'SPARRC headless_location no_manual_sync '
+      'reason=defer_to_native_auto_sync',
+    );
     return;
   }
 

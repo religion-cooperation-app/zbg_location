@@ -61,7 +61,7 @@ class TsbgEngine {
   double? _lastEmitLng;
   DateTime? _lastHeartbeatWatchdogUtc;
 
-  static const Duration _heartbeatWatchdogInterval = Duration(minutes: 2);
+  static const Duration _heartbeatWatchdogInterval = Duration(minutes: 3);
   static const Duration _heartbeatWatchdogStaleAfter = Duration(minutes: 2);
   static const int _heartbeatWatchdogTimeoutS = 30;
   static const double _heartbeatWatchdogMovedM = 60;
@@ -307,6 +307,12 @@ class TsbgEngine {
     FirebaseCrashlytics.instance.setCustomKey(
       'batch_sync',
       cfg.batchSync.toString(),
+    );
+    await fbg.Logger.notice(
+      'SPARRC http_batch_config '
+      'batchSync=${cfg.batchSync} '
+      'autoSyncThreshold=${cfg.autoSyncThreshold} '
+      'maxBatchSize=${cfg.maxBatchSize}',
     );
     FirebaseCrashlytics.instance.setCustomKey(
       'prevent_suspend_inside',
