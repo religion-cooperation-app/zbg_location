@@ -903,6 +903,145 @@ class TsbgEngine {
     await forceMovingPace(source: sourceName);
   }
 
+  Future<void> _maybeForceWakeFromInnerEnter(fbg.GeofenceEvent event) async {
+    final now = DateTime.now().toUtc();
+    const sourceName = 'inner_geofence_enter_forcewake';
+
+    await fbg.Logger.notice(
+      'SPARRC inner_forcewake check fence=${event.identifier}',
+    );
+
+    try {
+      final state = await fbg.BackgroundGeolocation.state;
+      await fbg.Logger.notice(
+        'SPARRC inner_forcewake state enabled=${state.enabled} '
+        'isMoving=${state.isMoving}',
+      );
+      if (state.enabled != true) {
+        await fbg.Logger.notice(
+          'SPARRC inner_forcewake skipped reason=fbg_disabled',
+        );
+        return;
+      }
+      if (state.isMoving == true) {
+        await fbg.Logger.notice(
+          'SPARRC inner_forcewake skipped reason=already_moving',
+        );
+        return;
+      }
+    } catch (e, st) {
+      await fbg.Logger.notice(
+        'SPARRC inner_forcewake state_unreadable error=${e.runtimeType}',
+      );
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'inner_forcewake_state_unreadable',
+      );
+      return;
+    }
+
+    final lastRun = await GeoDiagnosticsWriter.readHeartbeatWatchdogRun(
+      source: sourceName,
+    );
+    if (lastRun != null &&
+        now.difference(lastRun) < _nearEnterForceWakeCooldown) {
+      await fbg.Logger.notice(
+        'SPARRC inner_forcewake skipped reason=rate_limited '
+        'last_run_s=${now.difference(lastRun).inSeconds}',
+      );
+      return;
+    }
+
+    final comparisonRef =
+        await GeoDiagnosticsWriter.readLastBreadcrumbCandidate(
+      uid: _uid,
+    );
+
+    await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
+      source: sourceName,
+      timestamp: now,
+    );
+
+    await fbg.Logger.notice(
+      'SPARRC inner_forcewake get_current_position_start '
+      'comparison_ref=${comparisonRef == null ? 'missing' : 'found'}',
+    );
+    fbg.Location? loc;
+    try {
+      loc = await fbg.BackgroundGeolocation.getCurrentPosition(
+        samples: 1,
+        persist: true,
+        timeout: _nearEnterForceWakeTimeoutS,
+      );
+      await fbg.Logger.notice(
+        'SPARRC inner_forcewake get_current_position_success',
+      );
+    } catch (e, st) {
+      await fbg.Logger.notice(
+        'SPARRC inner_forcewake get_current_position_error '
+        'error=${e.runtimeType}',
+      );
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'inner_forcewake_current_position_failed',
+      );
+    }
+
+    if (loc == null) {
+      await fbg.Logger.notice(
+        'SPARRC inner_forcewake skipped reason=no_location_available',
+      );
+      return;
+    }
+
+    if (comparisonRef == null) {
+      await fbg.Logger.notice(
+        'SPARRC inner_forcewake skipped '
+        'reason=no_last_breadcrumb_reference after_location_persisted=true',
+      );
+      return;
+    }
+
+    final staleS = now.difference(comparisonRef.timestamp).inSeconds;
+    if (staleS < _nearEnterForceWakeStaleAfter.inSeconds) {
+      await fbg.Logger.notice(
+        'SPARRC inner_forcewake skipped reason=breadcrumb_not_stale '
+        'stale_s=$staleS after_location_persisted=true',
+      );
+      return;
+    }
+
+    final movedM = haversineMeters(
+      comparisonRef.lat,
+      comparisonRef.lng,
+      loc.coords.latitude,
+      loc.coords.longitude,
+    );
+    await fbg.Logger.notice(
+      'SPARRC inner_forcewake using_location '
+      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
+    );
+
+    if (movedM < _nearEnterForceWakeMovedM) {
+      await fbg.Logger.notice(
+        'SPARRC inner_forcewake skipped reason=moved_too_little '
+        'distance_m=${movedM.toStringAsFixed(1)} '
+        'threshold_m=$_nearEnterForceWakeMovedM',
+      );
+      return;
+    }
+
+    await fbg.Logger.notice(
+      'SPARRC inner_forcewake force_pace '
+      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
+    );
+    await forceMovingPace(source: sourceName);
+  }
+
   /// Expose streams
   Stream<LocationSample> onLocation() => _locCtl.stream;
   Stream<GeofenceEvent> onGeofence() => _fenceCtl.stream;
@@ -1189,6 +1328,9 @@ class TsbgEngine {
         _exitHysteresisTimer?.cancel();
         _exitHysteresisTimer = null;
         await _applyMode(SamplingMode.inside);
+        if (t == GeofenceEventType.enter) {
+          await _maybeForceWakeFromInnerEnter(e);
+        }
       } else if (t == GeofenceEventType.exit) {
         // Delay the outside-mode switch by 2 minutes. GPS jitter can fire a
         // spurious EXIT while the device is physically still inside the fence;

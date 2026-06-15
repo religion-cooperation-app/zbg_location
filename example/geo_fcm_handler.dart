@@ -410,6 +410,135 @@ Future<void> _maybeForceWakeFromNearEnter({
   await _forceHeadlessMovingPace(source: sourceName);
 }
 
+Future<void> _maybeForceWakeFromInnerEnter({
+  required fbg.GeofenceEvent event,
+  required String uid,
+}) async {
+  final now = DateTime.now().toUtc();
+  const sourceName = 'inner_geofence_enter_forcewake';
+
+  await fbg.Logger.notice(
+    'SPARRC inner_forcewake check fence=${event.identifier}',
+  );
+
+  try {
+    final state = await fbg.BackgroundGeolocation.state;
+    await fbg.Logger.notice(
+      'SPARRC inner_forcewake state enabled=${state.enabled} '
+      'isMoving=${state.isMoving}',
+    );
+    if (state.enabled != true) {
+      await fbg.Logger.notice(
+        'SPARRC inner_forcewake skipped reason=fbg_disabled',
+      );
+      return;
+    }
+    if (state.isMoving == true) {
+      await fbg.Logger.notice(
+        'SPARRC inner_forcewake skipped reason=already_moving',
+      );
+      return;
+    }
+  } catch (e) {
+    await fbg.Logger.notice(
+      'SPARRC inner_forcewake state_unreadable error=${e.runtimeType}',
+    );
+    return;
+  }
+
+  final lastRun = await GeoDiagnosticsWriter.readHeartbeatWatchdogRun(
+    source: sourceName,
+  );
+  if (lastRun != null &&
+      now.difference(lastRun) < _nearEnterForceWakeCooldown) {
+    await fbg.Logger.notice(
+      'SPARRC inner_forcewake skipped reason=rate_limited '
+      'last_run_s=${now.difference(lastRun).inSeconds}',
+    );
+    return;
+  }
+
+  final comparisonRef = await GeoDiagnosticsWriter.readLastBreadcrumbCandidate(
+    uid: uid,
+  );
+
+  await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
+    source: sourceName,
+    timestamp: now,
+  );
+
+  await fbg.Logger.notice(
+    'SPARRC inner_forcewake get_current_position_start '
+    'comparison_ref=${comparisonRef == null ? 'missing' : 'found'}',
+  );
+  fbg.Location? loc;
+  try {
+    loc = await fbg.BackgroundGeolocation.getCurrentPosition(
+      samples: 1,
+      persist: true,
+      timeout: _nearEnterForceWakeTimeoutS,
+    );
+    await fbg.Logger.notice(
+      'SPARRC inner_forcewake get_current_position_success',
+    );
+  } catch (e) {
+    await fbg.Logger.notice(
+      'SPARRC inner_forcewake get_current_position_error '
+      'error=${e.runtimeType}',
+    );
+  }
+
+  if (loc == null) {
+    await fbg.Logger.notice(
+      'SPARRC inner_forcewake skipped reason=no_location_available',
+    );
+    return;
+  }
+
+  if (comparisonRef == null) {
+    await fbg.Logger.notice(
+      'SPARRC inner_forcewake skipped '
+      'reason=no_last_breadcrumb_reference after_location_persisted=true',
+    );
+    return;
+  }
+
+  final staleS = now.difference(comparisonRef.timestamp).inSeconds;
+  if (staleS < _nearEnterForceWakeStaleAfter.inSeconds) {
+    await fbg.Logger.notice(
+      'SPARRC inner_forcewake skipped reason=breadcrumb_not_stale '
+      'stale_s=$staleS after_location_persisted=true',
+    );
+    return;
+  }
+
+  final movedM = haversineMeters(
+    comparisonRef.lat,
+    comparisonRef.lng,
+    loc.coords.latitude,
+    loc.coords.longitude,
+  );
+  await fbg.Logger.notice(
+    'SPARRC inner_forcewake using_location '
+    'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
+  );
+
+  if (movedM < _nearEnterForceWakeMovedM) {
+    await fbg.Logger.notice(
+      'SPARRC inner_forcewake skipped reason=moved_too_little '
+      'distance_m=${movedM.toStringAsFixed(1)} '
+      'threshold_m=$_nearEnterForceWakeMovedM',
+    );
+    return;
+  }
+
+  await fbg.Logger.notice(
+    'SPARRC inner_forcewake force_pace '
+    'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
+  );
+  await _forceHeadlessMovingPace(source: sourceName);
+}
+
 Future<void> _logHeadlessNativeGeofenceInventory(String source) async {
   try {
     final geofences = await fbg.BackgroundGeolocation.geofences;
@@ -689,6 +818,7 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
         ),
       );
     } catch (_) {}
+    await _maybeForceWakeFromInnerEnter(event: event, uid: uid);
   } else if (action == 'EXIT') {
     // Apply near mode — user is likely still within the near zone.
     // The _near EXIT event will switch to outside mode when they fully leave.
