@@ -394,21 +394,27 @@ class GeoBootstrap with WidgetsBindingObserver {
     _regionId = regionId;
     FirebaseCrashlytics.instance.setUserIdentifier(uid);
     try {
-      await fs.doc('users/$uid').set({
-        'geo_running': true,
-        'geo_session_started': FieldValue.serverTimestamp(),
-        // tz_offset_minutes: device UTC offset in minutes (e.g. -300 for EST,
-        // 330 for IST). Written each session start so it stays current across
-        // DST changes. Used by geoWakeupSweep to evaluate local-time window.
-        'tz_offset_minutes': DateTime.now().timeZoneOffset.inMinutes,
-        'geo_mode': _engine.geoSystemMode,
-      }, SetOptions(merge: true));
+      await Future.wait([
+        fs.doc('geoSessions/$uid').set({
+          'geo_running': true,
+          'geo_session_started': FieldValue.serverTimestamp(),
+          // tz_offset_minutes: device UTC offset in minutes (e.g. -300 for EST,
+          // 330 for IST). Written each session start so it stays current across
+          // DST changes. Used by geoWakeupSweep to evaluate local-time window.
+          'tz_offset_minutes': DateTime.now().timeZoneOffset.inMinutes,
+          'geo_mode': _engine.geoSystemMode,
+          'uid': uid,
+        }, SetOptions(merge: true)),
+        fs.doc('users/$uid').set({
+          'geo_running': true,
+        }, SetOptions(merge: true)),
+      ]);
     } catch (e, st) {
       FirebaseCrashlytics.instance.recordError(
         e,
         st,
         fatal: false,
-        reason: 'user_doc_start_write_failed',
+        reason: 'session_doc_start_write_failed',
       );
       throw StateError('geo:user_doc_write_failed');
     }
@@ -454,16 +460,21 @@ class GeoBootstrap with WidgetsBindingObserver {
     // Mark geo as stopped so geoWakeupSweep no longer targets this user.
     if (_uid != null) {
       try {
-        await FirebaseFirestore.instance.doc('users/$_uid').set({
-          'geo_running': false,
-          'geo_session_stopped': FieldValue.serverTimestamp(),
-        }, SetOptions(merge: true));
+        await Future.wait([
+          FirebaseFirestore.instance.doc('geoSessions/$_uid').set({
+            'geo_running': false,
+            'geo_session_stopped': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true)),
+          FirebaseFirestore.instance.doc('users/$_uid').set({
+            'geo_running': false,
+          }, SetOptions(merge: true)),
+        ]);
       } catch (e, st) {
         FirebaseCrashlytics.instance.recordError(
           e,
           st,
           fatal: false,
-          reason: 'user_doc_stop_write_failed',
+          reason: 'session_doc_stop_write_failed',
         );
         errorCode ??= 'geo:stop_doc_write_failed';
       }
@@ -482,6 +493,68 @@ class GeoBootstrap with WidgetsBindingObserver {
   /// Call from the geoFlushBuffer custom action on every homepage visit to
   /// recover terminated-state locations written during significant-change wakeups.
   Future<void> flushBuffer() async => _engine.flushBuffer();
+
+  /// Applies a pre-fetched appConfig/runtime Firestore data map to the
+  /// running FBG engine. No-ops if geo is not running.
+  ///
+  /// Use this when the caller has already fetched the doc (e.g., the
+  /// applyAppConfigRuntime custom action) to avoid a second Firestore read.
+  Future<void> refreshConfigFromMap(Map<String, dynamic> data) async {
+    if (!isRunning) return;
+    await fbg.Logger.notice('SPARRC geo_refresh_config_from_map start');
+    try {
+      final cfg = _buildRuntimeConfig(data);
+      await _engine.setConfig(cfg);
+      await fbg.Logger.notice('SPARRC geo_refresh_config_from_map done');
+    } catch (e, st) {
+      await fbg.Logger.notice(
+        'SPARRC geo_refresh_config_from_map error error=${e.runtimeType}',
+      );
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'geo_refresh_config_failed',
+      );
+    }
+  }
+
+  /// One-shot Firestore fetch of appConfig/runtime → applies RuntimeConfig
+  /// to the running FBG engine. No-ops if geo is not running.
+  ///
+  /// Complements [_configSub] as a reliable forced-refresh path when the
+  /// listener dies in the background. Called by the applyAppConfigRuntime
+  /// custom action on every homepage open (with a 1h SQLite cooldown).
+  Future<void> refreshConfigFromFirestore() async {
+    if (!isRunning) {
+      await fbg.Logger.notice(
+        'SPARRC geo_refresh_config skipped reason=not_running',
+      );
+      return;
+    }
+    await fbg.Logger.notice('SPARRC geo_refresh_config start');
+    try {
+      final snap =
+          await FirebaseFirestore.instance.doc('appConfig/runtime').get();
+      if (!snap.exists) {
+        await fbg.Logger.notice(
+          'SPARRC geo_refresh_config skipped reason=doc_missing',
+        );
+        return;
+      }
+      await refreshConfigFromMap(snap.data()!);
+    } catch (e, st) {
+      await fbg.Logger.notice(
+        'SPARRC geo_refresh_config error error=${e.runtimeType}',
+      );
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'geo_refresh_config_failed',
+      );
+    }
+  }
 
   Future<String> forceMovingPace({String source = 'foreground'}) {
     return _engine.forceMovingPace(source: source);
