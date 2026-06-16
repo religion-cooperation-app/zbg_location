@@ -976,7 +976,7 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
 
   // Read config once — used for mode switching and fence registration.
   int loiteringDelayMs = 60000;
-  int rateInsideS = 45, rateNearS = 45, rateOutsideS = 120;
+  int rateInsideS = 60, rateNearS = 90, rateOutsideS = 120;
   int distFilterInsideM = 10, distFilterNearM = 20, distFilterOutsideM = 100;
   double nearZoneRadiusM = 100.0;
   DateTime? geofencesUpdatedAt; // captured for version-stamp after EXIT re-arm
@@ -994,8 +994,8 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
       if (rawGeoTs != null) {
         geofencesUpdatedAt = (rawGeoTs as Timestamp).toDate().toUtc();
       }
-      rateInsideS = (breadcrumbs['rate_inside_zone_s'] as num?)?.toInt() ?? 45;
-      rateNearS = (breadcrumbs['rate_near_zone_s'] as num?)?.toInt() ?? 45;
+      rateInsideS = (breadcrumbs['rate_inside_zone_s'] as num?)?.toInt() ?? 60;
+      rateNearS = (breadcrumbs['rate_near_zone_s'] as num?)?.toInt() ?? 90;
       rateOutsideS =
           (breadcrumbs['rate_outside_zone_s'] as num?)?.toInt() ?? 120;
       distFilterInsideM =

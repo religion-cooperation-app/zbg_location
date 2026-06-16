@@ -577,8 +577,8 @@ class GeoBootstrap with WidgetsBindingObserver {
       dwellRequiredS: (geoDetect['dwell_required_s'] ?? 60) as int,
       dwellEveryS: (geoDetect['dwell_every_s'] ?? 0) as int,
       rateOutsideS: (breadcrumbs['rate_outside_zone_s'] ?? 120) as int,
-      rateNearS: (breadcrumbs['rate_near_zone_s'] ?? 45) as int,
-      rateInsideS: (breadcrumbs['rate_inside_zone_s'] ?? 45) as int,
+      rateNearS: (breadcrumbs['rate_near_zone_s'] ?? 90) as int,
+      rateInsideS: (breadcrumbs['rate_inside_zone_s'] ?? 60) as int,
       accuracyDropM: (breadcrumbs['accuracy_drop_m'] ?? 50).toDouble(),
       distanceFilterInsideM:
           (breadcrumbs['distance_filter_inside_m'] ?? 10) as int,
