@@ -60,9 +60,11 @@ class TsbgEngine {
   double? _lastEmitLat;
   double? _lastEmitLng;
   DateTime? _lastHeartbeatWatchdogUtc;
+  DateTime? _lastHeartbeatPersistUtc;
 
   static const Duration _heartbeatWatchdogInterval = Duration(minutes: 3);
   static const Duration _heartbeatWatchdogStaleAfter = Duration(minutes: 2);
+  static const Duration _heartbeatPersistInterval = Duration(minutes: 9);
   static const int _heartbeatWatchdogTimeoutS = 30;
   static const double _heartbeatWatchdogMovedM = 60;
   static const Duration _nearEnterForceWakeCooldown = Duration(minutes: 10);
@@ -679,13 +681,20 @@ class TsbgEngine {
     }
     _lastHeartbeatWatchdogUtc = now;
 
+    final lastPersist = _lastHeartbeatPersistUtc;
+    final shouldPersist = lastPersist == null ||
+        now.difference(lastPersist) >= _heartbeatPersistInterval;
+    if (shouldPersist) _lastHeartbeatPersistUtc = now;
+
     fbg.Location? loc;
     var source = 'fresh_current_position';
-    await fbg.Logger.notice('SPARRC watchdog get_current_position_start');
+    await fbg.Logger.notice(
+      'SPARRC watchdog get_current_position_start persist=$shouldPersist',
+    );
     try {
       loc = await fbg.BackgroundGeolocation.getCurrentPosition(
         samples: 1,
-        persist: true,
+        persist: shouldPersist,
         timeout: _heartbeatWatchdogTimeoutS,
       );
       await fbg.Logger.notice('SPARRC watchdog get_current_position_success');
