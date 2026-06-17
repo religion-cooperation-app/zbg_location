@@ -343,7 +343,14 @@ class GeoBootstrap with WidgetsBindingObserver {
         zoneId: _currentZoneId,
         insideZone: _inside,
         source: 'bg',
-        extra: {'source_dart': 'bg', 'mode': _engine.geoSystemMode},
+        extra: {
+          'source_dart': 'bg',
+          'mode': _engine.geoSystemMode,
+          if (s.activityType != null) 'activity_type': s.activityType,
+          if (s.activityConfidence != null) 'activity_confidence': s.activityConfidence,
+          if (s.fbgIsMoving != null) 'fbg_is_moving': s.fbgIsMoving,
+          if (s.fbgEvent != null) 'fbg_event': s.fbgEvent,
+        },
         fixedId: '${uid}_$tsIso',
       );
     });
@@ -494,6 +501,31 @@ class GeoBootstrap with WidgetsBindingObserver {
   /// recover terminated-state locations written during significant-change wakeups.
   Future<void> flushBuffer() async => _engine.flushBuffer();
 
+  /// Applies a pre-fetched appConfig/runtime data map to the FBG engine even
+  /// when isRunning=false. When isRunning=true, delegates to refreshConfigFromMap.
+  /// When isRunning=false, checks state.enabled and calls _engine.setConfig
+  /// directly if FBG is running natively from a prior session.
+  Future<String> refreshConfigFromMapForced(Map<String, dynamic> data) async {
+    if (isRunning) {
+      await refreshConfigFromMap(data);
+      return 'ok';
+    }
+    try {
+      final state = await fbg.BackgroundGeolocation.state;
+      if (!state.enabled) return 'skipped:fbg_not_enabled';
+      await fbg.Logger.notice('SPARRC geo_refresh_config_forced start');
+      final cfg = _buildRuntimeConfig(data);
+      await _engine.setConfig(cfg);
+      await fbg.Logger.notice('SPARRC geo_refresh_config_forced done');
+      return 'ok_forced';
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(
+        e, st, fatal: false, reason: 'geo_refresh_config_forced_failed',
+      );
+      return 'error:${e.runtimeType}';
+    }
+  }
+
   /// Applies a pre-fetched appConfig/runtime Firestore data map to the
   /// running FBG engine. No-ops if geo is not running.
   ///
@@ -567,7 +599,7 @@ class GeoBootstrap with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) return;
     final regionId = _regionId;
-    if (regionId == null || !isRunning) return;
+    if (regionId == null) return;
     refreshGeofencesFromFirestore(regionId);
   }
 
@@ -577,9 +609,35 @@ class GeoBootstrap with WidgetsBindingObserver {
   /// any path that needs to pick up newly-added Firestore fences.
   Future<void> refreshGeofencesFromFirestore(String regionId) async {
     if (!isRunning) {
-      await fbg.Logger.notice(
-        'SPARRC geo_refresh_geofences skipped reason=not_running',
-      );
+      // Bootstrap failed but FBG may still be running natively from a prior
+      // session. Register geofences directly if state.enabled is true.
+      try {
+        final state = await fbg.BackgroundGeolocation.state;
+        if (!state.enabled) {
+          await fbg.Logger.notice(
+            'SPARRC geo_refresh_geofences skipped reason=not_running_fbg_disabled',
+          );
+          return;
+        }
+        await fbg.Logger.notice(
+          'SPARRC geo_refresh_geofences fallback_start regionId=$regionId',
+        );
+        final snap = await FirebaseFirestore.instance
+            .collection('regions/$regionId/geofences')
+            .get();
+        final defs = _parseGeofenceDocs(snap.docs);
+        await _engine.addGeofences(defs);
+        await fbg.Logger.notice(
+          'SPARRC geo_refresh_geofences fallback_done defs=${defs.length}',
+        );
+      } catch (e, st) {
+        await fbg.Logger.notice(
+          'SPARRC geo_refresh_geofences fallback_error error=${e.runtimeType}',
+        );
+        FirebaseCrashlytics.instance.recordError(
+          e, st, fatal: false, reason: 'geo_refresh_geofences_fallback_failed',
+        );
+      }
       return;
     }
     await fbg.Logger.notice(

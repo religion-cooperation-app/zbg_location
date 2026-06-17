@@ -1485,8 +1485,14 @@ class TsbgEngine {
         (lastLat == null || lastLng == null) ? true : movedM >= distM;
 
     if (timeDue || distDue) {
-      // Emit a sample to app layer (positional ctor: lat, lng, acc, ts)
-      _locCtl.add(LocationSample(lat, lng, acc, nowUtc));
+      // Emit a sample to app layer
+      _locCtl.add(LocationSample(
+        lat, lng, acc, nowUtc,
+        activityType: l.activity?.type,
+        activityConfidence: l.activity?.confidence,
+        fbgIsMoving: l.isMoving,
+        fbgEvent: reason,
+      ));
 
       // Reset the emission reference
       _lastEmitUtc = nowUtc;

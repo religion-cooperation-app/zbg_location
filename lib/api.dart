@@ -50,8 +50,17 @@ class LocationSample {
   final double lng;
   final double accuracyM;
   final DateTime ts;
+  final String? activityType;       // e.g. 'walking', 'in_vehicle', 'still'
+  final int? activityConfidence;    // 0–100
+  final bool? fbgIsMoving;
+  final String? fbgEvent;           // dart-side trigger: 'location', 'motion_change', 'heartbeat', 'activity_change'
 
-  LocationSample(this.lat, this.lng, this.accuracyM, this.ts);
+  LocationSample(this.lat, this.lng, this.accuracyM, this.ts, {
+    this.activityType,
+    this.activityConfidence,
+    this.fbgIsMoving,
+    this.fbgEvent,
+  });
 }
 
 /// ------------------------------------------------------------
