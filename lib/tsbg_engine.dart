@@ -8,6 +8,7 @@ import 'dart:async';
 import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
     as fbg;
 
@@ -713,27 +714,36 @@ class TsbgEngine {
     if (shouldPersist) _lastHeartbeatPersistUtc = now;
 
     fbg.Location? loc;
-    var source = 'fresh_current_position';
-    await fbg.Logger.notice(
-      'SPARRC watchdog get_current_position_start persist=$shouldPersist',
-    );
-    try {
-      loc = await fbg.BackgroundGeolocation.getCurrentPosition(
-        samples: 1,
-        persist: shouldPersist,
-        timeout: _heartbeatWatchdogTimeoutS,
-      );
-      await fbg.Logger.notice('SPARRC watchdog get_current_position_success');
-    } catch (e, st) {
-      source = 'heartbeat_fallback';
+    var source = 'heartbeat_fallback';
+    final isForegrounded =
+        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+    if (isForegrounded) {
       await fbg.Logger.notice(
-        'SPARRC watchdog get_current_position_error error=${e.runtimeType}',
+        'SPARRC watchdog get_current_position_start persist=$shouldPersist',
       );
-      FirebaseCrashlytics.instance.recordError(
-        e,
-        st,
-        fatal: false,
-        reason: 'heartbeat_watchdog_current_position_failed',
+      try {
+        loc = await fbg.BackgroundGeolocation.getCurrentPosition(
+          samples: 1,
+          persist: shouldPersist,
+          timeout: _heartbeatWatchdogTimeoutS,
+        );
+        source = 'fresh_current_position';
+        await fbg.Logger.notice('SPARRC watchdog get_current_position_success');
+      } catch (e, st) {
+        await fbg.Logger.notice(
+          'SPARRC watchdog get_current_position_error error=${e.runtimeType}',
+        );
+        FirebaseCrashlytics.instance.recordError(
+          e,
+          st,
+          fatal: false,
+          reason: 'heartbeat_watchdog_current_position_failed',
+        );
+        loc = event.location;
+      }
+    } else {
+      await fbg.Logger.notice(
+        'SPARRC watchdog skipped_fresh_position reason=backgrounded',
       );
       loc = event.location;
     }
@@ -1145,26 +1155,6 @@ class TsbgEngine {
       await _maybeEmitFromFBGLocation(l, reason: 'motion_change');
     });
 
-    // ACTIVITYCHANGE — emit a location sample tagged with activity context
-    fbg.BackgroundGeolocation.onActivityChange(
-        (fbg.ActivityChangeEvent e) async {
-      await fbg.Logger.notice(
-        'SPARRC activitychange activity=${e.activity} '
-        'confidence=${e.confidence}',
-      );
-      FirebaseCrashlytics.instance.log(
-        'activity_change: ${e.activity} conf=${e.confidence}',
-      );
-      try {
-        final loc = await fbg.BackgroundGeolocation.getCurrentPosition(
-          samples: 1,
-          persist: true,
-          timeout: 20,
-        );
-        await _maybeEmitFromFBGLocation(loc, reason: 'activity_change');
-      } catch (_) {}
-    });
-
     // HEARTBEAT — ensures timed emission even when stationary
     fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent e) async {
       await fbg.Logger.notice(
@@ -1194,9 +1184,12 @@ class TsbgEngine {
       await _runHeartbeatWatchdog(e);
       await fbg.Logger.notice('SPARRC foreground_watchdog returned');
 
-      // Prefer last known location from SDK; fall back to a lightweight fetch.
+      // Use location attached to heartbeat event; only fetch fresh when foregrounded.
       fbg.Location? loc = e.location;
       if (loc == null) {
+        final isForegrounded =
+            WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+        if (!isForegrounded) return;
         try {
           loc = await fbg.BackgroundGeolocation.getCurrentPosition(
             samples: 1,

@@ -117,8 +117,6 @@ void geoBackgroundFetchHeadlessTask(HeadlessTask task) async {
 // GeoBootstrap.startFromFirestore() — Android-only.
 const Duration _headlessWatchdogInterval = Duration(minutes: 3);
 const Duration _headlessWatchdogStaleAfter = Duration(minutes: 2);
-const Duration _headlessWatchdogPersistInterval = Duration(minutes: 9);
-const int _headlessWatchdogTimeoutS = 30;
 const double _headlessWatchdogMovedM = 60;
 const Duration _nearEnterForceWakeCooldown = Duration(minutes: 10);
 const Duration _nearEnterForceWakeStaleAfter = Duration(minutes: 5);
@@ -144,40 +142,9 @@ Future<bool> _runHeadlessHeartbeatWatchdog({fbg.HeartbeatEvent? event}) async {
     timestamp: now,
   );
 
-  final lastPersist = await GeoDiagnosticsWriter.readHeartbeatWatchdogRun(
-    source: 'heartbeat_persist',
-  );
-  final shouldPersist = lastPersist == null ||
-      now.difference(lastPersist) >= _headlessWatchdogPersistInterval;
-  if (shouldPersist) {
-    await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
-      source: 'heartbeat_persist',
-      timestamp: now,
-    );
-  }
-
-  fbg.Location? loc;
-  var locationSource = 'fresh_current_position';
-  await fbg.Logger.notice(
-    'SPARRC headless_watchdog get_current_position_start persist=$shouldPersist',
-  );
-  try {
-    loc = await fbg.BackgroundGeolocation.getCurrentPosition(
-      samples: 1,
-      persist: shouldPersist,
-      timeout: _headlessWatchdogTimeoutS,
-    );
-    await fbg.Logger.notice(
-      'SPARRC headless_watchdog get_current_position_success',
-    );
-  } catch (e) {
-    locationSource = 'heartbeat_fallback';
-    await fbg.Logger.notice(
-      'SPARRC headless_watchdog get_current_position_error '
-      'error=${e.runtimeType}',
-    );
-    loc = event?.location;
-  }
+  final loc = event?.location;
+  const locationSource = 'heartbeat_event_location';
+  await fbg.Logger.notice('SPARRC headless_watchdog using_event_location');
 
   if (loc == null) {
     await fbg.Logger.notice(
