@@ -959,20 +959,20 @@ class TsbgEngine {
       return;
     }
 
-    final comparisonRef =
-        await GeoDiagnosticsWriter.readLastBreadcrumbCandidate(
-      uid: _uid,
-    );
-
     await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
       source: sourceName,
       timestamp: now,
     );
 
+    // Change O: fire changePace before staleness check — inner geofence ENTER
+    // is strong movement evidence regardless of how fresh the last breadcrumb is.
     await fbg.Logger.notice(
-      'SPARRC inner_forcewake get_current_position_start '
-      'comparison_ref=${comparisonRef == null ? 'missing' : 'found'}',
+      'SPARRC inner_forcewake force_pace fence=${event.identifier}',
     );
+    await forceMovingPace(source: sourceName);
+
+    // Change L: capture a fresh fix and update the SQLite breadcrumb candidate
+    // so the heartbeat watchdog does not fire again immediately after this wake.
     fbg.Location? loc;
     try {
       loc = await fbg.BackgroundGeolocation.getCurrentPosition(
@@ -996,55 +996,19 @@ class TsbgEngine {
       );
     }
 
-    if (loc == null) {
-      await fbg.Logger.notice(
-        'SPARRC inner_forcewake skipped reason=no_location_available',
-      );
-      return;
-    }
+    if (loc == null) return;
 
-    if (comparisonRef == null) {
-      await fbg.Logger.notice(
-        'SPARRC inner_forcewake skipped '
-        'reason=no_last_breadcrumb_reference after_location_persisted=true',
-      );
-      return;
-    }
-
-    final staleS = now.difference(comparisonRef.timestamp).inSeconds;
-    if (staleS < _nearEnterForceWakeStaleAfter.inSeconds) {
-      await fbg.Logger.notice(
-        'SPARRC inner_forcewake skipped reason=breadcrumb_not_stale '
-        'stale_s=$staleS after_location_persisted=true',
-      );
-      return;
-    }
-
-    final movedM = haversineMeters(
-      comparisonRef.lat,
-      comparisonRef.lng,
-      loc.coords.latitude,
-      loc.coords.longitude,
+    await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
+      lat: loc.coords.latitude,
+      lng: loc.coords.longitude,
+      accuracyM: loc.coords.accuracy,
+      timestamp: now,
+      source: sourceName,
+      uid: _uid,
     );
     await fbg.Logger.notice(
-      'SPARRC inner_forcewake using_location '
-      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
+      'SPARRC inner_forcewake stored_breadcrumb_candidate',
     );
-
-    if (movedM < _nearEnterForceWakeMovedM) {
-      await fbg.Logger.notice(
-        'SPARRC inner_forcewake skipped reason=moved_too_little '
-        'distance_m=${movedM.toStringAsFixed(1)} '
-        'threshold_m=$_nearEnterForceWakeMovedM',
-      );
-      return;
-    }
-
-    await fbg.Logger.notice(
-      'SPARRC inner_forcewake force_pace '
-      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
-    );
-    await forceMovingPace(source: sourceName);
   }
 
   /// Expose streams
