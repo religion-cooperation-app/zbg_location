@@ -594,6 +594,23 @@ class GeoBootstrap with WidgetsBindingObserver {
     try {
       final state = await fbg.BackgroundGeolocation.state;
       if (!state.enabled) return 'skipped:fbg_not_enabled';
+
+      // Re-establish identity before calling setConfig. Without this, httpParams
+      // is built with only {mode:...} because _uid/_regionId are null after a
+      // force-kill + Dart restart. Calling setConfig without uid overwrites
+      // http.params and persistence.extras on the native plugin, causing all
+      // subsequent uploads to fail with "Missing uid".
+      final currentUid = FirebaseAuth.instance.currentUser?.uid;
+      final regionId = _regionId;
+      if (currentUid == null || regionId == null) {
+        await fbg.Logger.notice(
+          'SPARRC geo_refresh_config_forced skipped'
+          ' uid_null=${currentUid == null} region_null=${regionId == null}',
+        );
+        return 'skipped:no_identity';
+      }
+      _engine.setIdentity(uid: currentUid, regionId: regionId);
+
       await fbg.Logger.notice('SPARRC geo_refresh_config_forced start');
       final cfg = _buildRuntimeConfig(data);
       await _engine.setConfig(cfg);
