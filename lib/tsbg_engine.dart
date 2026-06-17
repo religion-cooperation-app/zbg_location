@@ -447,6 +447,20 @@ class TsbgEngine {
       if (state.enabled) return;
       _started = false;
     }
+    // Cross-process guard: adopt a running native session instead of calling
+    // start() on top of it (throws on Android when the FBG foreground service
+    // is still alive from the prior process — geo:engine_start_failed).
+    try {
+      final state = await fbg.BackgroundGeolocation.state;
+      if (state.enabled) {
+        await fbg.Logger.notice(
+          'SPARRC engine_start adopted_running_native_session',
+        );
+        _started = true;
+        return;
+      }
+    } catch (_) {}
+
     try {
       if (_cfg?.geofenceOnlyMode == true) {
         await fbg.BackgroundGeolocation.startGeofences();
@@ -460,6 +474,18 @@ class TsbgEngine {
         fatal: false,
         reason: 'fbg_start_failed',
       );
+      // Recovery: start() threw but FBG may already be running (Android
+      // cross-process race between the state check above and start() call).
+      try {
+        final state = await fbg.BackgroundGeolocation.state;
+        if (state.enabled) {
+          await fbg.Logger.notice(
+            'SPARRC engine_start threw_but_running — adopting',
+          );
+          _started = true;
+          return;
+        }
+      } catch (_) {}
       rethrow;
     }
     _started = true;
@@ -1117,6 +1143,26 @@ class TsbgEngine {
         'SPARRC motionchange observed moving=${l.isMoving}',
       );
       await _maybeEmitFromFBGLocation(l, reason: 'motion_change');
+    });
+
+    // ACTIVITYCHANGE — emit a location sample tagged with activity context
+    fbg.BackgroundGeolocation.onActivityChange(
+        (fbg.ActivityChangeEvent e) async {
+      await fbg.Logger.notice(
+        'SPARRC activitychange activity=${e.activity} '
+        'confidence=${e.confidence}',
+      );
+      FirebaseCrashlytics.instance.log(
+        'activity_change: ${e.activity} conf=${e.confidence}',
+      );
+      try {
+        final loc = await fbg.BackgroundGeolocation.getCurrentPosition(
+          samples: 1,
+          persist: true,
+          timeout: 20,
+        );
+        await _maybeEmitFromFBGLocation(loc, reason: 'activity_change');
+      } catch (_) {}
     });
 
     // HEARTBEAT — ensures timed emission even when stationary

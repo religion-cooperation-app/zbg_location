@@ -4,7 +4,10 @@
 // also streams for bluetooth system. updated 2/23/26. Most recent backup in firestore_export/_backup and in github backup
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io' show Platform;
+import 'package:path/path.dart' as path_helper;
+import 'package:sqflite/sqflite.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -60,6 +63,18 @@ class GeoBootstrap with WidgetsBindingObserver {
     _starting = true;
     try {
       await _startFromFirestoreInner(regionId);
+    } catch (e) {
+      // Change D: cancel any subscriptions opened during the failed bootstrap
+      // so they don't fire as orphaned listeners after the error.
+      _configSub?.cancel();
+      _configSub = null;
+      _fenceSub?.cancel();
+      _geofenceSub?.cancel();
+      _geofenceSub = null;
+      await _locSub?.cancel();
+      _uid = null;
+      _regionId = null;
+      rethrow;
     } finally {
       _starting = false;
     }
@@ -74,11 +89,32 @@ class GeoBootstrap with WidgetsBindingObserver {
     // ----- 0) Get user + set identity FIRST -----
     // NOTE: _uid is intentionally NOT set here. It is set only at step 7 after
     // full successful startup, so isRunning accurately reflects engine state.
+    // _regionId is set early so the lifecycle observer and forcewake methods
+    // have region context even when bootstrap fails before step 7.
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null) throw StateError('geo:no_user');
+    _regionId = regionId;
 
     // Tell the engine who we are + what region we're in
     _engine.setIdentity(uid: uid, regionId: regionId);
+
+    // Pre-flight: stop native FBG if it is already running from a prior Dart
+    // session (_uid == null means this session never completed a bootstrap).
+    // Gives start() in step 6 a clean slate. TsbgEngine.start() (Change A) is
+    // the safety net if this stop fails or races.
+    try {
+      final state = await fbg.BackgroundGeolocation.state;
+      if (state.enabled && _uid == null) {
+        await fbg.Logger.notice(
+          'SPARRC geo_preflight_stop native_running_no_dart_session',
+        );
+        await fbg.BackgroundGeolocation.stop();
+      }
+    } catch (e) {
+      await fbg.Logger.notice(
+        'SPARRC geo_preflight_stop_failed error=${e.runtimeType} — continuing',
+      );
+    }
 
     // ----- 0b) Register background wakeup handlers -----
     // FCM silent-push handler: invoked by firebase_messaging when a
@@ -190,9 +226,13 @@ class GeoBootstrap with WidgetsBindingObserver {
             );
           return;
         }
+        final rawData = snap.data()! as Map<String, dynamic>;
         final fut = _engine.setConfig(cfg);
         if (!configReady.isCompleted) {
-          fut.then((_) => configReady.complete()).catchError((
+          fut.then((_) {
+            configReady.complete();
+            _persistConfigCache(rawData);
+          }).catchError((
             Object e,
             StackTrace st,
           ) {
@@ -206,7 +246,9 @@ class GeoBootstrap with WidgetsBindingObserver {
               configReady.completeError(StateError('geo:fbg_init_failed'));
           });
         } else {
-          fut.catchError((Object e, StackTrace st) {
+          fut
+              .then((_) => _persistConfigCache(rawData))
+              .catchError((Object e, StackTrace st) {
             FirebaseCrashlytics.instance.recordError(
               e,
               st,
@@ -222,9 +264,18 @@ class GeoBootstrap with WidgetsBindingObserver {
       },
     );
     try {
-      await configReady.future.timeout(const Duration(seconds: 15));
+      await configReady.future.timeout(const Duration(seconds: 30));
     } on TimeoutException {
-      throw StateError('geo:config_timeout');
+      final cached = await _loadCachedRuntimeConfig();
+      if (cached != null) {
+        await fbg.Logger.notice(
+          'SPARRC geo_config_timeout_fallback using_sqlite_cache',
+        );
+        final cfg = _buildRuntimeConfig(cached);
+        await _engine.setConfig(cfg);
+      } else {
+        throw StateError('geo:config_timeout');
+      }
     }
 
     // ----- 2) Writer (shared) -----
@@ -319,9 +370,26 @@ class GeoBootstrap with WidgetsBindingObserver {
       },
     );
     try {
-      await geofencesReady.future.timeout(const Duration(seconds: 15));
+      await geofencesReady.future.timeout(const Duration(seconds: 45));
     } on TimeoutException {
-      throw StateError('geo:geofences_timeout');
+      // Before aborting, check if FBG already has geofences registered natively
+      // (e.g. restored by ready() from a prior session's persisted state).
+      // If so, proceed — _geofenceSub stays alive and will re-register with
+      // fresh Firestore defs when connectivity recovers.
+      try {
+        final existing = await fbg.BackgroundGeolocation.geofences;
+        if (existing.isNotEmpty) {
+          await fbg.Logger.notice(
+            'SPARRC geo_geofences_timeout_fallback '
+            'using_native_count=${existing.length}',
+          );
+        } else {
+          throw StateError('geo:geofences_timeout');
+        }
+      } catch (e) {
+        if (e is StateError) rethrow;
+        throw StateError('geo:geofences_timeout');
+      }
     }
 
     // ----- 5) Dart breadcrumb writes (foreground + background) -----
@@ -397,33 +465,46 @@ class GeoBootstrap with WidgetsBindingObserver {
     // (including homepage-triggered restarts — not just sign-in).
     // geo_mode records the active tracking mode so geoWakeupSweep can skip
     // users in geofence_only mode (they only emit breadcrumbs inside fences).
-    _uid = uid;
-    _regionId = regionId;
     FirebaseCrashlytics.instance.setUserIdentifier(uid);
-    try {
-      await Future.wait([
-        fs.doc('geoSessions/$uid').set({
-          'geo_running': true,
-          'geo_session_started': FieldValue.serverTimestamp(),
-          // tz_offset_minutes: device UTC offset in minutes (e.g. -300 for EST,
-          // 330 for IST). Written each session start so it stays current across
-          // DST changes. Used by geoWakeupSweep to evaluate local-time window.
-          'tz_offset_minutes': DateTime.now().timeZoneOffset.inMinutes,
-          'geo_mode': _engine.geoSystemMode,
-          'uid': uid,
-        }, SetOptions(merge: true)),
-        fs.doc('users/$uid').set({
-          'geo_running': true,
-        }, SetOptions(merge: true)),
-      ]);
-    } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(
-        e,
-        st,
-        fatal: false,
-        reason: 'session_doc_start_write_failed',
-      );
-      throw StateError('geo:user_doc_write_failed');
+    const kStep7MaxAttempts = 3;
+    for (var attempt = 1; attempt <= kStep7MaxAttempts; attempt++) {
+      try {
+        await Future.wait([
+          fs.doc('geoSessions/$uid').set({
+            'geo_running': true,
+            'geo_session_started': FieldValue.serverTimestamp(),
+            // tz_offset_minutes: device UTC offset in minutes (e.g. -300 for EST,
+            // 330 for IST). Written each session start so it stays current across
+            // DST changes. Used by geoWakeupSweep to evaluate local-time window.
+            'tz_offset_minutes': DateTime.now().timeZoneOffset.inMinutes,
+            'geo_mode': _engine.geoSystemMode,
+            'uid': uid,
+          }, SetOptions(merge: true)),
+          fs.doc('users/$uid').set({
+            'geo_running': true,
+          }, SetOptions(merge: true)),
+        ]);
+        _uid = uid;
+        await fbg.Logger.notice(
+          'SPARRC geo_bootstrap step7_ok attempt=$attempt',
+        );
+        break;
+      } catch (e, st) {
+        if (attempt == kStep7MaxAttempts) {
+          FirebaseCrashlytics.instance.recordError(
+            e,
+            st,
+            fatal: false,
+            reason: 'session_doc_start_write_failed_all_attempts',
+          );
+          throw StateError('geo:user_doc_write_failed');
+        }
+        await fbg.Logger.notice(
+          'SPARRC geo_bootstrap step7_retry attempt=$attempt '
+          'error=${e.runtimeType}',
+        );
+        await Future.delayed(const Duration(seconds: 2));
+      }
     }
     if (!_lifecycleObserverRegistered) {
       WidgetsBinding.instance.addObserver(this);
@@ -741,6 +822,57 @@ class GeoBootstrap with WidgetsBindingObserver {
       // Disable stop detection — controlled globally via Firestore; default false
       disableStopDetection:
           (platform['disable_stop_detection'] ?? false) as bool,
+    );
+  }
+
+  static const _configCacheKey = 'geo_runtime_config_cache_json';
+
+  Future<void> _persistConfigCache(Map<String, dynamic> data) async {
+    try {
+      final db = await _openKvDb();
+      await db.insert(
+        'kv_store',
+        {'key': _configCacheKey, 'value': jsonEncode(data)},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      await db.close();
+    } catch (_) {}
+  }
+
+  Future<Map<String, dynamic>?> _loadCachedRuntimeConfig() async {
+    try {
+      final db = await _openKvDb();
+      final rows = await db.query(
+        'kv_store',
+        columns: ['value'],
+        where: 'key = ?',
+        whereArgs: [_configCacheKey],
+        limit: 1,
+      );
+      await db.close();
+      if (rows.isEmpty) return null;
+      final raw = rows.first['value'] as String?;
+      if (raw == null || raw.isEmpty) return null;
+      final decoded = jsonDecode(raw);
+      return decoded is Map ? Map<String, dynamic>.from(decoded) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<Database> _openKvDb() async {
+    final dbPath = await getDatabasesPath();
+    return openDatabase(
+      path_helper.join(dbPath, 'sparrc_offline.db'),
+      version: 1,
+      onOpen: (db) async {
+        await db.execute('''
+          CREATE TABLE IF NOT EXISTS kv_store (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+          )
+        ''');
+      },
     );
   }
 }

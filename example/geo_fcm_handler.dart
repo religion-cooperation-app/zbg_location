@@ -880,13 +880,37 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
   if (headlessEvent.name == fbg.Event.MOTIONCHANGE) {
     final event = headlessEvent.event;
     var isMoving = 'unknown';
+    fbg.Location? motionLoc;
     if (event is fbg.Location) {
       isMoving = event.isMoving.toString();
+      motionLoc = event;
     }
     await fbg.Logger.notice(
-      'SPARRC headless_event motionchange isMoving=$isMoving '
-      'force_pace=false',
+      'SPARRC headless_event motionchange isMoving=$isMoving',
     );
+    if (motionLoc != null) {
+      final ts =
+          DateTime.tryParse(motionLoc.timestamp)?.toUtc() ??
+          DateTime.now().toUtc();
+      final extras =
+          (motionLoc.extras is Map ? motionLoc.extras : const {}) as Map;
+      await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
+        lat: motionLoc.coords.latitude,
+        lng: motionLoc.coords.longitude,
+        accuracyM: motionLoc.coords.accuracy,
+        timestamp: ts,
+        source: 'headless_motionchange',
+        uid: extras['uid'] as String?,
+        regionId: extras['regionId'] as String?,
+      );
+      try {
+        await fbg.BackgroundGeolocation.getCurrentPosition(
+          samples: 1,
+          persist: true,
+          timeout: 20,
+        );
+      } catch (_) {}
+    }
     return;
   }
 
@@ -897,8 +921,33 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
       details = 'activity=${event.activity} confidence=${event.confidence}';
     } catch (_) {}
     await fbg.Logger.notice(
-      'SPARRC headless_event activitychange $details force_pace=false',
+      'SPARRC headless_event activitychange $details',
     );
+    try {
+      final now = DateTime.now().toUtc();
+      final lastPersist = await GeoDiagnosticsWriter.readHeartbeatWatchdogRun(
+        source: 'activity_persist',
+      );
+      if (lastPersist == null ||
+          now.difference(lastPersist) > const Duration(minutes: 2)) {
+        await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
+          source: 'activity_persist',
+          timestamp: now,
+        );
+        final loc = await fbg.BackgroundGeolocation.getCurrentPosition(
+          samples: 1,
+          persist: true,
+          timeout: 20,
+        );
+        await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
+          lat: loc.coords.latitude,
+          lng: loc.coords.longitude,
+          accuracyM: loc.coords.accuracy,
+          timestamp: now,
+          source: 'headless_activitychange',
+        );
+      }
+    } catch (_) {}
     return;
   }
 
@@ -1000,6 +1049,16 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
           ),
         );
       } catch (_) {}
+      // N2: update breadcrumb candidate from event location on near-fence ENTER.
+      await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
+        lat: event.location.coords.latitude,
+        lng: event.location.coords.longitude,
+        accuracyM: event.location.coords.accuracy,
+        timestamp: ts,
+        source: 'headless_near_fence_enter',
+        uid: uid,
+        regionId: regionId,
+      );
       await _maybeForceWakeFromNearEnter(event: event, uid: uid);
     } else if (action == 'EXIT') {
       try {
@@ -1013,6 +1072,16 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
           ),
         );
       } catch (_) {}
+      // N2: update breadcrumb candidate from event location on near-fence EXIT.
+      await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
+        lat: event.location.coords.latitude,
+        lng: event.location.coords.longitude,
+        accuracyM: event.location.coords.accuracy,
+        timestamp: ts,
+        source: 'headless_near_fence_exit',
+        uid: uid,
+        regionId: regionId,
+      );
     }
     return;
   }
@@ -1027,6 +1096,18 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
     'source': 'bg_headless',
     if (mode != null) 'mode': mode,
   });
+
+  // N1: update SQLite breadcrumb candidate from event location so the
+  // heartbeat watchdog staleness check reflects this geofence event.
+  await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
+    lat: event.location.coords.latitude,
+    lng: event.location.coords.longitude,
+    accuracyM: event.location.coords.accuracy,
+    timestamp: ts,
+    source: 'headless_geofence_${action.toLowerCase()}',
+    uid: uid,
+    regionId: regionId,
+  );
 
   // Apply sampling mode config based on event type.
   if (action == 'ENTER') {
