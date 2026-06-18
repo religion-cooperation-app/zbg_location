@@ -8,7 +8,6 @@ import 'dart:async';
 import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter/widgets.dart';
 import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
     as fbg;
 
@@ -60,18 +59,7 @@ class TsbgEngine {
   DateTime? _lastEmitUtc;
   double? _lastEmitLat;
   double? _lastEmitLng;
-  DateTime? _lastHeartbeatWatchdogUtc;
-  DateTime? _lastHeartbeatPersistUtc;
-
-  static const Duration _heartbeatWatchdogInterval = Duration(minutes: 3);
-  static const Duration _heartbeatWatchdogStaleAfter = Duration(minutes: 2);
-  static const Duration _heartbeatPersistInterval = Duration(minutes: 9);
-  static const int _heartbeatWatchdogTimeoutS = 30;
-  static const double _heartbeatWatchdogMovedM = 60;
   static const Duration _nearEnterForceWakeCooldown = Duration(minutes: 10);
-  static const Duration _nearEnterForceWakeStaleAfter = Duration(minutes: 5);
-  static const int _nearEnterForceWakeTimeoutS = 20;
-  static const double _nearEnterForceWakeMovedM = 60;
 
   // Identity for native HTTP uploads → Cloud Function.
   String? _uid;
@@ -696,115 +684,6 @@ class TsbgEngine {
     return 'error=${error.runtimeType} value=$error';
   }
 
-  Future<void> _runHeartbeatWatchdog(fbg.HeartbeatEvent event) async {
-    final now = DateTime.now().toUtc();
-    await fbg.Logger.notice('SPARRC watchdog heartbeat_check');
-
-    final lastCheck = _lastHeartbeatWatchdogUtc;
-    if (lastCheck != null &&
-        now.difference(lastCheck) < _heartbeatWatchdogInterval) {
-      await fbg.Logger.notice('SPARRC watchdog skipped reason=rate_limited');
-      return;
-    }
-    _lastHeartbeatWatchdogUtc = now;
-
-    final lastPersist = _lastHeartbeatPersistUtc;
-    final shouldPersist = lastPersist == null ||
-        now.difference(lastPersist) >= _heartbeatPersistInterval;
-    if (shouldPersist) _lastHeartbeatPersistUtc = now;
-
-    fbg.Location? loc;
-    var source = 'heartbeat_fallback';
-    final isForegrounded =
-        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
-    if (isForegrounded) {
-      await fbg.Logger.notice(
-        'SPARRC watchdog get_current_position_start persist=$shouldPersist',
-      );
-      try {
-        loc = await fbg.BackgroundGeolocation.getCurrentPosition(
-          samples: 1,
-          persist: shouldPersist,
-          timeout: _heartbeatWatchdogTimeoutS,
-        );
-        source = 'fresh_current_position';
-        await fbg.Logger.notice('SPARRC watchdog get_current_position_success');
-      } catch (e, st) {
-        await fbg.Logger.notice(
-          'SPARRC watchdog get_current_position_error error=${e.runtimeType}',
-        );
-        FirebaseCrashlytics.instance.recordError(
-          e,
-          st,
-          fatal: false,
-          reason: 'heartbeat_watchdog_current_position_failed',
-        );
-        loc = event.location;
-      }
-    } else {
-      await fbg.Logger.notice(
-        'SPARRC watchdog skipped_fresh_position reason=backgrounded',
-      );
-      loc = event.location;
-    }
-
-    if (loc == null) {
-      await fbg.Logger.notice(
-        'SPARRC watchdog skipped reason=no_location_available',
-      );
-      return;
-    }
-
-    final lat = loc.coords.latitude;
-    final lng = loc.coords.longitude;
-
-    final persistedRef = await GeoDiagnosticsWriter.readLastBreadcrumbCandidate(
-      uid: _uid,
-    );
-    if (persistedRef == null) {
-      await fbg.Logger.notice(
-        'SPARRC watchdog skipped '
-        'reason=no_last_breadcrumb_reference after_location_persisted=true',
-      );
-      return;
-    }
-
-    final staleS = now.difference(persistedRef.timestamp).inSeconds;
-    await fbg.Logger.notice(
-      'SPARRC watchdog reference '
-      'source=local_persisted_candidate:${persistedRef.source ?? 'unknown'} '
-      'stale_s=$staleS',
-    );
-    if (staleS < _heartbeatWatchdogStaleAfter.inSeconds) {
-      await fbg.Logger.notice(
-        'SPARRC watchdog skipped reason=breadcrumb_not_stale '
-        'stale_s=$staleS after_location_persisted=true',
-      );
-      return;
-    }
-
-    final movedM =
-        haversineMeters(persistedRef.lat, persistedRef.lng, lat, lng);
-    await fbg.Logger.notice(
-      'SPARRC watchdog using_location source=$source '
-      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
-    );
-
-    if (movedM < _heartbeatWatchdogMovedM) {
-      await fbg.Logger.notice(
-        'SPARRC watchdog skipped reason=moved_too_little '
-        'distance_m=${movedM.toStringAsFixed(1)} threshold_m=$_heartbeatWatchdogMovedM',
-      );
-      return;
-    }
-
-    await fbg.Logger.notice(
-      'SPARRC watchdog force_pace source=heartbeat_watchdog '
-      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
-    );
-    await forceMovingPace(source: 'heartbeat_watchdog');
-  }
-
   Future<void> _maybeForceWakeFromNearEnter(fbg.GeofenceEvent event) async {
     final now = DateTime.now().toUtc();
     const sourceName = 'near_geofence_enter_forcewake';
@@ -856,90 +735,13 @@ class TsbgEngine {
       return;
     }
 
-    final comparisonRef =
-        await GeoDiagnosticsWriter.readLastBreadcrumbCandidate(
-      uid: _uid,
-    );
-
     await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
       source: sourceName,
       timestamp: now,
     );
 
     await fbg.Logger.notice(
-      'SPARRC near_forcewake get_current_position_start '
-      'comparison_ref=${comparisonRef == null ? 'missing' : 'found'}',
-    );
-    fbg.Location? loc;
-    try {
-      loc = await fbg.BackgroundGeolocation.getCurrentPosition(
-        samples: 1,
-        persist: true,
-        timeout: _nearEnterForceWakeTimeoutS,
-      );
-      await fbg.Logger.notice(
-        'SPARRC near_forcewake get_current_position_success',
-      );
-    } catch (e, st) {
-      await fbg.Logger.notice(
-        'SPARRC near_forcewake get_current_position_error '
-        'error=${e.runtimeType}',
-      );
-      FirebaseCrashlytics.instance.recordError(
-        e,
-        st,
-        fatal: false,
-        reason: 'near_forcewake_current_position_failed',
-      );
-    }
-
-    if (loc == null) {
-      await fbg.Logger.notice(
-        'SPARRC near_forcewake skipped reason=no_location_available',
-      );
-      return;
-    }
-
-    if (comparisonRef == null) {
-      await fbg.Logger.notice(
-        'SPARRC near_forcewake skipped '
-        'reason=no_last_breadcrumb_reference after_location_persisted=true',
-      );
-      return;
-    }
-
-    final staleS = now.difference(comparisonRef.timestamp).inSeconds;
-    if (staleS < _nearEnterForceWakeStaleAfter.inSeconds) {
-      await fbg.Logger.notice(
-        'SPARRC near_forcewake skipped reason=breadcrumb_not_stale '
-        'stale_s=$staleS after_location_persisted=true',
-      );
-      return;
-    }
-
-    final movedM = haversineMeters(
-      comparisonRef.lat,
-      comparisonRef.lng,
-      loc.coords.latitude,
-      loc.coords.longitude,
-    );
-    await fbg.Logger.notice(
-      'SPARRC near_forcewake using_location '
-      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
-    );
-
-    if (movedM < _nearEnterForceWakeMovedM) {
-      await fbg.Logger.notice(
-        'SPARRC near_forcewake skipped reason=moved_too_little '
-        'distance_m=${movedM.toStringAsFixed(1)} '
-        'threshold_m=$_nearEnterForceWakeMovedM',
-      );
-      return;
-    }
-
-    await fbg.Logger.notice(
-      'SPARRC near_forcewake force_pace '
-      'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
+      'SPARRC near_forcewake force_pace fence=${event.identifier}',
     );
     await forceMovingPace(source: sourceName);
   }
@@ -1000,51 +802,10 @@ class TsbgEngine {
       timestamp: now,
     );
 
-    // Change O: fire changePace before staleness check — inner geofence ENTER
-    // is strong movement evidence regardless of how fresh the last breadcrumb is.
     await fbg.Logger.notice(
       'SPARRC inner_forcewake force_pace fence=${event.identifier}',
     );
     await forceMovingPace(source: sourceName);
-
-    // Change L: capture a fresh fix and update the SQLite breadcrumb candidate
-    // so the heartbeat watchdog does not fire again immediately after this wake.
-    fbg.Location? loc;
-    try {
-      loc = await fbg.BackgroundGeolocation.getCurrentPosition(
-        samples: 1,
-        persist: true,
-        timeout: _nearEnterForceWakeTimeoutS,
-      );
-      await fbg.Logger.notice(
-        'SPARRC inner_forcewake get_current_position_success',
-      );
-    } catch (e, st) {
-      await fbg.Logger.notice(
-        'SPARRC inner_forcewake get_current_position_error '
-        'error=${e.runtimeType}',
-      );
-      FirebaseCrashlytics.instance.recordError(
-        e,
-        st,
-        fatal: false,
-        reason: 'inner_forcewake_current_position_failed',
-      );
-    }
-
-    if (loc == null) return;
-
-    await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
-      lat: loc.coords.latitude,
-      lng: loc.coords.longitude,
-      accuracyM: loc.coords.accuracy,
-      timestamp: now,
-      source: sourceName,
-      uid: _uid,
-    );
-    await fbg.Logger.notice(
-      'SPARRC inner_forcewake stored_breadcrumb_candidate',
-    );
   }
 
   /// Expose streams
@@ -1161,40 +922,16 @@ class TsbgEngine {
         'SPARRC foreground_heartbeat received has_location=${e.location != null} '
         'mode=${_mode.name} ready=$_ready started=$_started',
       );
-      await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
-        source: 'foreground_heartbeat_received',
-        timestamp: DateTime.now().toUtc(),
-      );
-      try {
-        final state = await fbg.BackgroundGeolocation.state;
-        await fbg.Logger.notice(
-          'SPARRC heartbeat_state path=foreground enabled=${state.enabled} '
-          'isMoving=${state.isMoving}',
-        );
-      } catch (e) {
-        await fbg.Logger.notice(
-          'SPARRC heartbeat_state path=foreground state_unreadable '
-          'error=${e.runtimeType}',
-        );
-      }
       FirebaseCrashlytics.instance.log(
         'hb mode=${_mode.name} ts=${DateTime.now().toUtc().toIso8601String()}',
       );
-      await fbg.Logger.notice('SPARRC foreground_watchdog invoke');
-      await _runHeartbeatWatchdog(e);
-      await fbg.Logger.notice('SPARRC foreground_watchdog returned');
-
-      // Use location attached to heartbeat event; only fetch fresh when foregrounded.
       fbg.Location? loc = e.location;
       if (loc == null) {
-        final isForegrounded =
-            WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
-        if (!isForegrounded) return;
         try {
           loc = await fbg.BackgroundGeolocation.getCurrentPosition(
             samples: 1,
             persist: true,
-            timeout: _heartbeatWatchdogTimeoutS,
+            timeout: 30,
           );
         } catch (e, st) {
           FirebaseCrashlytics.instance.recordError(

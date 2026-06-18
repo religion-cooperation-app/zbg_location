@@ -115,128 +115,7 @@ void geoBackgroundFetchHeadlessTask(HeadlessTask task) async {
 //
 // Registered via BackgroundGeolocation.registerHeadlessTask inside
 // GeoBootstrap.startFromFirestore() — Android-only.
-const Duration _headlessWatchdogInterval = Duration(minutes: 3);
-const Duration _headlessWatchdogStaleAfter = Duration(minutes: 2);
-const double _headlessWatchdogMovedM = 60;
 const Duration _nearEnterForceWakeCooldown = Duration(minutes: 10);
-const Duration _nearEnterForceWakeStaleAfter = Duration(minutes: 5);
-const int _nearEnterForceWakeTimeoutS = 20;
-const double _nearEnterForceWakeMovedM = 60;
-
-Future<bool> _runHeadlessHeartbeatWatchdog({fbg.HeartbeatEvent? event}) async {
-  final now = DateTime.now().toUtc();
-  const sourceName = 'fbg_heartbeat_headless';
-  await fbg.Logger.notice('SPARRC headless_watchdog heartbeat_check');
-
-  final lastRun = await GeoDiagnosticsWriter.readHeartbeatWatchdogRun(
-    source: sourceName,
-  );
-  if (lastRun != null && now.difference(lastRun) < _headlessWatchdogInterval) {
-    await fbg.Logger.notice(
-      'SPARRC headless_watchdog skipped reason=rate_limited',
-    );
-    return false;
-  }
-  await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
-    source: sourceName,
-    timestamp: now,
-  );
-
-  final loc = event?.location;
-  const locationSource = 'heartbeat_event_location';
-  await fbg.Logger.notice('SPARRC headless_watchdog using_event_location');
-
-  if (loc == null) {
-    await fbg.Logger.notice(
-      'SPARRC headless_watchdog skipped reason=no_location_available',
-    );
-    return false;
-  }
-
-  final lat = loc.coords.latitude;
-  final lng = loc.coords.longitude;
-
-  final identity = await GeoDiagnosticsWriter.readIdentity();
-  final persistedRef = await GeoDiagnosticsWriter.readLastBreadcrumbCandidate(
-    uid: identity?.uid,
-  );
-  if (persistedRef == null) {
-    await fbg.Logger.notice(
-      'SPARRC headless_watchdog skipped '
-      'reason=no_last_breadcrumb_reference after_location_persisted=true',
-    );
-    return false;
-  }
-
-  final staleS = now.difference(persistedRef.timestamp).inSeconds;
-  await fbg.Logger.notice(
-    'SPARRC headless_watchdog reference '
-    'source=local_persisted_candidate:${persistedRef.source ?? 'unknown'} '
-    'stale_s=$staleS',
-  );
-  if (staleS < _headlessWatchdogStaleAfter.inSeconds) {
-    await fbg.Logger.notice(
-      'SPARRC headless_watchdog skipped '
-      'reason=breadcrumb_not_stale stale_s=$staleS '
-      'after_location_persisted=true',
-    );
-    return false;
-  }
-
-  final movedM = haversineMeters(persistedRef.lat, persistedRef.lng, lat, lng);
-  await fbg.Logger.notice(
-    'SPARRC headless_watchdog using_location source=$locationSource '
-    'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
-  );
-
-  if (movedM < _headlessWatchdogMovedM) {
-    await fbg.Logger.notice(
-      'SPARRC headless_watchdog skipped reason=moved_too_little '
-      'distance_m=${movedM.toStringAsFixed(1)} '
-      'threshold_m=$_headlessWatchdogMovedM',
-    );
-    return false;
-  }
-
-  await fbg.Logger.notice(
-    'SPARRC headless_watchdog should_force_pace=true '
-    'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
-  );
-  return true;
-}
-
-Future<void> _forceHeadlessHeartbeatMovingPace() async {
-  const source = 'headless_heartbeat_watchdog';
-  await fbg.Logger.notice('SPARRC force_pace attempt source=$source');
-
-  try {
-    final state = await fbg.BackgroundGeolocation.state;
-    await fbg.Logger.notice(
-      'SPARRC force_pace state source=$source enabled=${state.enabled} '
-      'isMoving=${state.isMoving}',
-    );
-    if (state.enabled == true && state.isMoving == true) {
-      await fbg.Logger.notice(
-        'SPARRC force_pace skipped reason=already_moving source=$source',
-      );
-      return;
-    }
-  } catch (e) {
-    await fbg.Logger.notice(
-      'SPARRC force_pace state_unreadable source=$source '
-      'error=${e.runtimeType}',
-    );
-  }
-
-  try {
-    await fbg.BackgroundGeolocation.changePace(true);
-    await fbg.Logger.notice('SPARRC force_pace call_returned source=$source');
-  } catch (e) {
-    await fbg.Logger.notice(
-      'SPARRC force_pace error source=$source error=${e.runtimeType}',
-    );
-  }
-}
 
 Future<void> _forceHeadlessMovingPace({required String source}) async {
   await fbg.Logger.notice('SPARRC force_pace attempt source=$source');
@@ -318,97 +197,13 @@ Future<void> _maybeForceWakeFromNearEnter({
     return;
   }
 
-  final comparisonRef = await GeoDiagnosticsWriter.readLastBreadcrumbCandidate(
-    uid: uid,
-  );
-
   await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
     source: sourceName,
     timestamp: now,
   );
 
   await fbg.Logger.notice(
-    'SPARRC near_forcewake get_current_position_start '
-    'comparison_ref=${comparisonRef == null ? 'missing' : 'found'}',
-  );
-  fbg.Location? loc;
-  try {
-    loc = await fbg.BackgroundGeolocation.getCurrentPosition(
-      samples: 1,
-      persist: true,
-      timeout: _nearEnterForceWakeTimeoutS,
-    );
-    await fbg.Logger.notice(
-      'SPARRC near_forcewake get_current_position_success',
-    );
-  } catch (e) {
-    await fbg.Logger.notice(
-      'SPARRC near_forcewake get_current_position_error '
-      'error=${e.runtimeType}',
-    );
-  }
-
-  if (loc == null) {
-    await fbg.Logger.notice(
-      'SPARRC near_forcewake skipped reason=no_location_available',
-    );
-    return;
-  }
-
-  // Change L: always update SQLite breadcrumb candidate with fresh fix,
-  // regardless of whether changePace fires below.
-  await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
-    lat: loc.coords.latitude,
-    lng: loc.coords.longitude,
-    accuracyM: loc.coords.accuracy,
-    timestamp: now,
-    source: sourceName,
-    uid: uid,
-  );
-  await fbg.Logger.notice(
-    'SPARRC near_forcewake stored_breadcrumb_candidate',
-  );
-
-  if (comparisonRef == null) {
-    await fbg.Logger.notice(
-      'SPARRC near_forcewake skipped '
-      'reason=no_last_breadcrumb_reference after_location_persisted=true',
-    );
-    return;
-  }
-
-  final staleS = now.difference(comparisonRef.timestamp).inSeconds;
-  if (staleS < _nearEnterForceWakeStaleAfter.inSeconds) {
-    await fbg.Logger.notice(
-      'SPARRC near_forcewake skipped reason=breadcrumb_not_stale '
-      'stale_s=$staleS after_location_persisted=true',
-    );
-    return;
-  }
-
-  final movedM = haversineMeters(
-    comparisonRef.lat,
-    comparisonRef.lng,
-    loc.coords.latitude,
-    loc.coords.longitude,
-  );
-  await fbg.Logger.notice(
-    'SPARRC near_forcewake using_location '
-    'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
-  );
-
-  if (movedM < _nearEnterForceWakeMovedM) {
-    await fbg.Logger.notice(
-      'SPARRC near_forcewake skipped reason=moved_too_little '
-      'distance_m=${movedM.toStringAsFixed(1)} '
-      'threshold_m=$_nearEnterForceWakeMovedM',
-    );
-    return;
-  }
-
-  await fbg.Logger.notice(
-    'SPARRC near_forcewake force_pace '
-    'distance_m=${movedM.toStringAsFixed(1)} stale_s=$staleS',
+    'SPARRC near_forcewake force_pace fence=${event.identifier}',
   );
   await _forceHeadlessMovingPace(source: sourceName);
 }
@@ -466,45 +261,10 @@ Future<void> _maybeForceWakeFromInnerEnter({
     timestamp: now,
   );
 
-  // Change O: fire changePace before staleness check — inner geofence ENTER
-  // is strong movement evidence regardless of how fresh the last breadcrumb is.
   await fbg.Logger.notice(
     'SPARRC inner_forcewake force_pace fence=${event.identifier}',
   );
   await _forceHeadlessMovingPace(source: sourceName);
-
-  // Change L: capture a fresh fix and update the SQLite breadcrumb candidate
-  // so the heartbeat watchdog does not fire again immediately after this wake.
-  fbg.Location? loc;
-  try {
-    loc = await fbg.BackgroundGeolocation.getCurrentPosition(
-      samples: 1,
-      persist: true,
-      timeout: _nearEnterForceWakeTimeoutS,
-    );
-    await fbg.Logger.notice(
-      'SPARRC inner_forcewake get_current_position_success',
-    );
-  } catch (e) {
-    await fbg.Logger.notice(
-      'SPARRC inner_forcewake get_current_position_error '
-      'error=${e.runtimeType}',
-    );
-  }
-
-  if (loc == null) return;
-
-  await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
-    lat: loc.coords.latitude,
-    lng: loc.coords.longitude,
-    accuracyM: loc.coords.accuracy,
-    timestamp: now,
-    source: sourceName,
-    uid: uid,
-  );
-  await fbg.Logger.notice(
-    'SPARRC inner_forcewake stored_breadcrumb_candidate',
-  );
 }
 
 Future<void> _logHeadlessNativeGeofenceInventory(String source) async {
@@ -712,38 +472,10 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
       'payload_type=${headlessEvent.event.runtimeType} '
       'has_location=${event?.location != null}',
     );
-    await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
-      source: 'headless_heartbeat_received',
-      timestamp: DateTime.now().toUtc(),
-    );
-    try {
-      final state = await fbg.BackgroundGeolocation.state;
-      await fbg.Logger.notice(
-        'SPARRC heartbeat_state path=headless enabled=${state.enabled} '
-        'isMoving=${state.isMoving}',
-      );
-    } catch (e) {
-      await fbg.Logger.notice(
-        'SPARRC heartbeat_state path=headless state_unreadable '
-        'error=${e.runtimeType}',
-      );
-    }
     await GeoDiagnosticsHttp.recordHeadlessReceived(headlessEvent.name);
     await GeoDiagnosticsHttp.recordHeartbeatSnapshot(
       source: 'fbg_heartbeat_headless',
     );
-    await fbg.Logger.notice('SPARRC headless_watchdog invoke');
-    final shouldForcePace = await _runHeadlessHeartbeatWatchdog(event: event);
-    await fbg.Logger.notice(
-      'SPARRC headless_watchdog returned should_force_pace=$shouldForcePace',
-    );
-    if (shouldForcePace) {
-      await _forceHeadlessHeartbeatMovingPace();
-    } else {
-      await fbg.Logger.notice(
-        'SPARRC headless_watchdog force_pace_not_requested',
-      );
-    }
     return;
   }
 
@@ -763,37 +495,10 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
   if (headlessEvent.name == fbg.Event.MOTIONCHANGE) {
     final event = headlessEvent.event;
     var isMoving = 'unknown';
-    fbg.Location? motionLoc;
-    if (event is fbg.Location) {
-      isMoving = event.isMoving.toString();
-      motionLoc = event;
-    }
+    if (event is fbg.Location) isMoving = event.isMoving.toString();
     await fbg.Logger.notice(
       'SPARRC headless_event motionchange isMoving=$isMoving',
     );
-    if (motionLoc != null) {
-      final ts =
-          DateTime.tryParse(motionLoc.timestamp)?.toUtc() ??
-          DateTime.now().toUtc();
-      final extras =
-          (motionLoc.extras is Map ? motionLoc.extras : const {}) as Map;
-      await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
-        lat: motionLoc.coords.latitude,
-        lng: motionLoc.coords.longitude,
-        accuracyM: motionLoc.coords.accuracy,
-        timestamp: ts,
-        source: 'headless_motionchange',
-        uid: extras['uid'] as String?,
-        regionId: extras['regionId'] as String?,
-      );
-      try {
-        await fbg.BackgroundGeolocation.getCurrentPosition(
-          samples: 1,
-          persist: true,
-          timeout: 20,
-        );
-      } catch (_) {}
-    }
     return;
   }
 
@@ -806,62 +511,13 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
     await fbg.Logger.notice(
       'SPARRC headless_event activitychange $details',
     );
-    try {
-      final now = DateTime.now().toUtc();
-      final lastPersist = await GeoDiagnosticsWriter.readHeartbeatWatchdogRun(
-        source: 'activity_persist',
-      );
-      if (lastPersist == null ||
-          now.difference(lastPersist) > const Duration(minutes: 2)) {
-        await GeoDiagnosticsWriter.storeHeartbeatWatchdogRun(
-          source: 'activity_persist',
-          timestamp: now,
-        );
-        final loc = await fbg.BackgroundGeolocation.getCurrentPosition(
-          samples: 1,
-          persist: true,
-          timeout: 20,
-        );
-        await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
-          lat: loc.coords.latitude,
-          lng: loc.coords.longitude,
-          accuracyM: loc.coords.accuracy,
-          timestamp: now,
-          source: 'headless_activitychange',
-        );
-      }
-    } catch (_) {}
     return;
   }
 
   if (headlessEvent.name == fbg.Event.LOCATION) {
-    final event = headlessEvent.event;
     await fbg.Logger.notice(
       'SPARRC headless_event location payload_type='
       '${headlessEvent.event.runtimeType} force_pace=false',
-    );
-    if (event is fbg.Location) {
-      final rawExtras = event.extras;
-      final extras = rawExtras is Map ? rawExtras : const <String, dynamic>{};
-      final ts =
-          DateTime.tryParse(event.timestamp)?.toUtc() ?? DateTime.now().toUtc();
-      await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
-        lat: event.coords.latitude,
-        lng: event.coords.longitude,
-        accuracyM: event.coords.accuracy,
-        timestamp: ts,
-        source: 'headless_location',
-        uid: extras['uid'] as String?,
-        regionId: extras['regionId'] as String?,
-      );
-      await fbg.Logger.notice(
-        'SPARRC headless_event location stored_last_breadcrumb_candidate '
-        'source=headless_location',
-      );
-    }
-    await fbg.Logger.notice(
-      'SPARRC headless_location no_manual_sync '
-      'reason=defer_to_native_auto_sync',
     );
     return;
   }
@@ -932,16 +588,6 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
           ),
         );
       } catch (_) {}
-      // N2: update breadcrumb candidate from event location on near-fence ENTER.
-      await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
-        lat: event.location.coords.latitude,
-        lng: event.location.coords.longitude,
-        accuracyM: event.location.coords.accuracy,
-        timestamp: ts,
-        source: 'headless_near_fence_enter',
-        uid: uid,
-        regionId: regionId,
-      );
       await _maybeForceWakeFromNearEnter(event: event, uid: uid);
     } else if (action == 'EXIT') {
       try {
@@ -955,16 +601,6 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
           ),
         );
       } catch (_) {}
-      // N2: update breadcrumb candidate from event location on near-fence EXIT.
-      await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
-        lat: event.location.coords.latitude,
-        lng: event.location.coords.longitude,
-        accuracyM: event.location.coords.accuracy,
-        timestamp: ts,
-        source: 'headless_near_fence_exit',
-        uid: uid,
-        regionId: regionId,
-      );
     }
     return;
   }
@@ -979,18 +615,6 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
     'source': 'bg_headless',
     if (mode != null) 'mode': mode,
   });
-
-  // N1: update SQLite breadcrumb candidate from event location so the
-  // heartbeat watchdog staleness check reflects this geofence event.
-  await GeoDiagnosticsWriter.storeLastBreadcrumbCandidate(
-    lat: event.location.coords.latitude,
-    lng: event.location.coords.longitude,
-    accuracyM: event.location.coords.accuracy,
-    timestamp: ts,
-    source: 'headless_geofence_${action.toLowerCase()}',
-    uid: uid,
-    regionId: regionId,
-  );
 
   // Apply sampling mode config based on event type.
   if (action == 'ENTER') {
