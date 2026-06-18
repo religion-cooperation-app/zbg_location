@@ -50,6 +50,23 @@ This package is designed to be used from a FlutterFlow project via custom code f
 
 A Firebase Cloud Functions v2 HTTP endpoint (`zbgIngest`) receives GPS batches from FBG's native HTTP transport, runs a server-side zone state machine to compute ENTER/DWELL events across batch boundaries, and writes breadcrumbs and geofence events to Firestore. The Cloud Function source is maintained separately.
 
+## Development branches
+
+### `good-sensor/scheduled-continuous`
+
+Experimental branch replacing motion-detection-based sampling with continuous time-based periodic sampling within a scheduled window. Key differences from `main`/`good-sensor/headless-heartbeat-watchdog`:
+
+- **`disableStopDetection: true`** — FBG runs continuously; the device never transitions to the stationary state and motion detection is disabled.
+- **FBG schedule** — `schedule: ['1-7 05:00-00:00']` with `scheduleUseAlarmManager: true` (Android). `startSchedule()` replaces `start()` so FBG automatically stops at midnight and restarts at 5am via AlarmManager.
+- **Hardcoded sampling rates** — rates are not read from Firestore for this test:
+  - Outside zones: 600 s / 20 m
+  - Near zones: 300 s / 10 m
+  - Inside zones: 180 s / 5 m
+- **Immediate sync** — `autoSyncThreshold: 0`, `batchSync: false` for real-time testing visibility.
+- **Headless geofence handler** — `geo_fcm_handler.dart` uses the same hardcoded rates so terminated-state geofence `setConfig` calls are consistent with the live engine.
+
+**Side effect:** With `disableStopDetection: true`, `checkGeoConfigChange` in the SPARRC app will always return `deferred:is_moving` (because `state.isMoving` is always `true`). The config-hash check is effectively bypassed on this branch — which is fine for a pure test of the sampling behavior.
+
 ## Dependencies
 
 - `flutter_background_geolocation: ^5.0.1`
