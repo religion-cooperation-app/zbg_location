@@ -61,6 +61,12 @@ class TsbgEngine {
   double? _lastEmitLng;
   static const Duration _nearEnterForceWakeCooldown = Duration(minutes: 10);
 
+  // Silence GeoDiagnosticsWriter for 3 minutes after start() to avoid writing
+  // bootstrap noise (permission-grant cascade, fbg_enabled_change on first start).
+  static DateTime? _diagSilenceUntil;
+  static bool _isDiagSilenced() =>
+      _diagSilenceUntil != null && DateTime.now().isBefore(_diagSilenceUntil!);
+
   // Identity for native HTTP uploads → Cloud Function.
   String? _uid;
   String? _regionId;
@@ -478,6 +484,7 @@ class TsbgEngine {
       rethrow;
     }
     _started = true;
+    _diagSilenceUntil = DateTime.now().add(const Duration(minutes: 3));
 
     // Startup diagnostics — silent; must not block normal startup path.
     try {
@@ -949,9 +956,11 @@ class TsbgEngine {
     // OEM / OS interference monitoring
     fbg.BackgroundGeolocation.onPowerSaveChange((bool isPowerSave) {
       FirebaseCrashlytics.instance.log('power_save: $isPowerSave');
-      unawaited(
-        GeoDiagnosticsWriter.recordPowerSaveChange(isPowerSave, uid: _uid),
-      );
+      if (!_isDiagSilenced()) {
+        unawaited(
+          GeoDiagnosticsWriter.recordPowerSaveChange(isPowerSave, uid: _uid),
+        );
+      }
       if (isPowerSave) {
         FirebaseCrashlytics.instance.recordError(
           StateError('oem_power_save_enabled'),
@@ -967,7 +976,9 @@ class TsbgEngine {
       FirebaseCrashlytics.instance.log(
         'provider: gps=${e.gps} network=${e.network} enabled=${e.enabled} status=${e.status} accuracy=${e.accuracyAuthorization}',
       );
-      unawaited(GeoDiagnosticsWriter.recordProviderChange(e, uid: _uid));
+      if (!_isDiagSilenced()) {
+        unawaited(GeoDiagnosticsWriter.recordProviderChange(e, uid: _uid));
+      }
       if (!e.enabled) {
         FirebaseCrashlytics.instance.recordError(
           StateError('location_provider_disabled'),
@@ -980,9 +991,11 @@ class TsbgEngine {
 
     fbg.BackgroundGeolocation.onEnabledChange((bool enabled) {
       FirebaseCrashlytics.instance.log('fbg_enabled: $enabled');
-      unawaited(
-        GeoDiagnosticsWriter.recordFbgEnabledChange(enabled, uid: _uid),
-      );
+      if (!_isDiagSilenced()) {
+        unawaited(
+          GeoDiagnosticsWriter.recordFbgEnabledChange(enabled, uid: _uid),
+        );
+      }
       if (!enabled && _started) {
         FirebaseCrashlytics.instance.recordError(
           StateError('fbg_disabled_while_running'),
