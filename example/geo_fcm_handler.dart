@@ -542,9 +542,10 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
   if (uid == null || uid.isEmpty) return;
 
   // Read config once — used for mode switching and fence registration.
+  // Rates are hardcoded to match tsbg_engine._applyMode for scheduled-continuous branch.
   int loiteringDelayMs = 60000;
-  int rateInsideS = 60, rateNearS = 90, rateOutsideS = 120;
-  int distFilterInsideM = 10, distFilterNearM = 20, distFilterOutsideM = 100;
+  const int rateInsideS = 180, rateNearS = 300, rateOutsideS = 600;
+  const int distFilterInsideM = 5, distFilterNearM = 10, distFilterOutsideM = 20;
   double nearZoneRadiusM = 100.0;
   DateTime? geofencesUpdatedAt; // captured for version-stamp after EXIT re-arm
   try {
@@ -552,7 +553,6 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
     if (configSnap.exists) {
       final data = configSnap.data()!;
       final geoDetect = (data['geofenceDetect'] as Map?) ?? {};
-      final breadcrumbs = (data['breadcrumbs'] as Map?) ?? {};
       loiteringDelayMs =
           ((geoDetect['dwell_required_s'] as num?)?.toInt() ?? 60) * 1000;
       nearZoneRadiusM =
@@ -561,16 +561,6 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
       if (rawGeoTs != null) {
         geofencesUpdatedAt = (rawGeoTs as Timestamp).toDate().toUtc();
       }
-      rateInsideS = (breadcrumbs['rate_inside_zone_s'] as num?)?.toInt() ?? 60;
-      rateNearS = (breadcrumbs['rate_near_zone_s'] as num?)?.toInt() ?? 90;
-      rateOutsideS =
-          (breadcrumbs['rate_outside_zone_s'] as num?)?.toInt() ?? 120;
-      distFilterInsideM =
-          (breadcrumbs['distance_filter_inside_m'] as num?)?.toInt() ?? 10;
-      distFilterNearM =
-          (breadcrumbs['distance_filter_near_m'] as num?)?.toInt() ?? 20;
-      distFilterOutsideM =
-          (breadcrumbs['distance_filter_outside_m'] as num?)?.toInt() ?? 100;
     }
   } catch (_) {}
 
