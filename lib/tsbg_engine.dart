@@ -244,9 +244,8 @@ class TsbgEngine {
             // Sent with every request (query/body-level params)
             params: httpParams,
             autoSync: true,
-            batchSync: cfg.batchSync,
-            maxBatchSize: cfg.maxBatchSize,
-            autoSyncThreshold: cfg.autoSyncThreshold,
+            batchSync: false,       // test: one POST per location
+            autoSyncThreshold: 0,   // test: sync immediately, no accumulation
             // NOTE: no rootProperty here; defaults to 'location'
             // 25s timeout fits within iOS SLC / background-fetch wakeup windows
             // (~30s), giving FBG the best chance of completing a POST before iOS
@@ -314,7 +313,7 @@ class TsbgEngine {
     try {
       await fbg.BackgroundGeolocation.setConfig(
         fbg.Config(
-          autoSyncThreshold: cfg.autoSyncThreshold,
+          autoSyncThreshold: 0,
           persistence: fbg.PersistenceConfig(extras: httpParams),
         ),
       );
