@@ -1117,9 +1117,9 @@ class TsbgEngine {
 
     // Hardcoded rates for scheduled-continuous branch.
     // Motion detection is disabled; FBG runs continuously within the 05:00-00:00 window.
-    const int heartbeatS;
-    const int distanceM;
-    const int locationUpdateMs;
+    final int heartbeatS;
+    final int distanceM;
+    final int locationUpdateMs;
     switch (mode) {
       case SamplingMode.inside:
         heartbeatS = 180;   // 3 min
@@ -1217,8 +1217,8 @@ class TsbgEngine {
     if (cfg.geofenceOnlyMode && _enteredFenceId == null) return;
 
     // Mode-specific thresholds — hardcoded to match _applyMode.
-    const int rateS;
-    const int distM;
+    final int rateS;
+    final int distM;
     switch (_mode) {
       case SamplingMode.inside:
         rateS = 180;
