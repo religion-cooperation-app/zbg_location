@@ -575,6 +575,13 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
               locationUpdateInterval: rateNearS * 1000,
             ),
             app: fbg.AppConfig(heartbeatInterval: rateNearS.toDouble()),
+            persistence: fbg.PersistenceConfig(extras: {
+              if (uid != null) 'uid': uid,
+              if (regionId != null) 'regionId': regionId,
+              if (mode != null) 'mode': mode,
+              'zoneId': fenceId, // keeps _near suffix → precompute_zone_id = "site_001_near"
+              'inside_zone': false,
+            }),
           ),
         );
       } catch (_) {}
@@ -588,6 +595,12 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
               locationUpdateInterval: rateOutsideS * 1000,
             ),
             app: fbg.AppConfig(heartbeatInterval: rateOutsideS.toDouble()),
+            persistence: fbg.PersistenceConfig(extras: {
+              if (uid != null) 'uid': uid,
+              if (regionId != null) 'regionId': regionId,
+              if (mode != null) 'mode': mode,
+              'inside_zone': false, // zoneId absent → precompute_zone_id null
+            }),
           ),
         );
       } catch (_) {}
@@ -616,6 +629,13 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
             locationUpdateInterval: rateInsideS * 1000,
           ),
           app: fbg.AppConfig(heartbeatInterval: rateInsideS.toDouble()),
+          persistence: fbg.PersistenceConfig(extras: {
+            if (uid != null) 'uid': uid,
+            if (regionId != null) 'regionId': regionId,
+            if (mode != null) 'mode': mode,
+            'zoneId': fenceId, // inner zone id → precompute_zone_id = "site_001"
+            'inside_zone': true,
+          }),
         ),
       );
     } catch (_) {}
@@ -631,6 +651,13 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
             locationUpdateInterval: rateNearS * 1000,
           ),
           app: fbg.AppConfig(heartbeatInterval: rateNearS.toDouble()),
+          persistence: fbg.PersistenceConfig(extras: {
+            if (uid != null) 'uid': uid,
+            if (regionId != null) 'regionId': regionId,
+            if (mode != null) 'mode': mode,
+            'zoneId': '${fenceId}_near', // assume still in near ring on EXIT
+            'inside_zone': false,
+          }),
         ),
       );
     } catch (_) {}

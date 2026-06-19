@@ -1154,6 +1154,33 @@ class TsbgEngine {
       ),
     );
 
+    // Update persistence.extras with zone context for near/outside transitions.
+    // Inner-zone extras (zoneId + inside_zone:true) are set by setZoneContext,
+    // called from geo_bootstrap on inner fence events. Near and outside are
+    // handled here because they don't emit to the onGeofence() stream.
+    if (mode == SamplingMode.near || mode == SamplingMode.outside) {
+      final uid = _uid;
+      final regionId = _regionId;
+      // For near: use the first active near fence ID (keeps _near suffix so
+      // zbgIngest can distinguish near vs inner in precompute_zone_id).
+      final nearId = (mode == SamplingMode.near && _activeNearFences.isNotEmpty)
+          ? _activeNearFences.first
+          : null;
+      await fbg.BackgroundGeolocation.setConfig(
+        fbg.Config(
+          persistence: fbg.PersistenceConfig(
+            extras: {
+              if (uid != null) 'uid': uid,
+              if (regionId != null) 'regionId': regionId,
+              'mode': geoSystemMode,
+              if (nearId != null) 'zoneId': nearId,
+              'inside_zone': false,
+            },
+          ),
+        ),
+      );
+    }
+
     if (kDebugMode) {
       debugPrint(
         '[TsbgEngine] applyMode=$mode hb=${heartbeatS}s df=${distanceM}m locUpdateMs=$locationUpdateMs',
