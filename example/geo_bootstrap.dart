@@ -308,11 +308,10 @@ class GeoBootstrap {
     // (including homepage-triggered restarts — not just sign-in).
     // geo_mode records the active tracking mode so geoWakeupSweep can skip
     // users in geofence_only mode (they only emit breadcrumbs inside fences).
-    _uid = uid;
     FirebaseCrashlytics.instance.setUserIdentifier(uid);
     try {
-      await fs.doc('users/$uid').set(
-        {
+      await Future.wait([
+        fs.doc('geoSessions/$uid').set({
           'geo_running': true,
           'geo_session_started': FieldValue.serverTimestamp(),
           // tz_offset_minutes: device UTC offset in minutes (e.g. -300 for EST,
@@ -320,9 +319,13 @@ class GeoBootstrap {
           // DST changes. Used by geoWakeupSweep to evaluate local-time window.
           'tz_offset_minutes': DateTime.now().timeZoneOffset.inMinutes,
           'geo_mode': _engine.geoSystemMode,
-        },
-        SetOptions(merge: true),
-      );
+          'uid': uid,
+        }, SetOptions(merge: true)),
+        fs.doc('users/$uid').set({
+          'geo_running': true,
+        }, SetOptions(merge: true)),
+      ]);
+      _uid = uid;
     } catch (e, st) {
       FirebaseCrashlytics.instance.recordError(e, st,
           fatal: false, reason: 'user_doc_start_write_failed');
