@@ -360,13 +360,22 @@ class GeoBootstrap {
     // Mark geo as stopped so geoWakeupSweep no longer targets this user.
     if (_uid != null) {
       try {
-        await FirebaseFirestore.instance.doc('users/$_uid').set(
-          {
-            'geo_running': false,
-            'geo_session_stopped': FieldValue.serverTimestamp()
-          },
-          SetOptions(merge: true),
-        );
+        await Future.wait([
+          FirebaseFirestore.instance.doc('geoSessions/$_uid').set(
+            {
+              'geo_running': false,
+              'geo_session_stopped': FieldValue.serverTimestamp(),
+            },
+            SetOptions(merge: true),
+          ),
+          FirebaseFirestore.instance.doc('users/$_uid').set(
+            {
+              'geo_running': false,
+              'geo_session_stopped': FieldValue.serverTimestamp(),
+            },
+            SetOptions(merge: true),
+          ),
+        ]);
       } catch (e, st) {
         FirebaseCrashlytics.instance.recordError(e, st,
             fatal: false, reason: 'user_doc_stop_write_failed');
