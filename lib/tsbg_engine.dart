@@ -82,13 +82,39 @@ class TsbgEngine {
     _cfg = cfg;
 
     // Snapshot identity for HTTP params at config-time.
-    final uid = _uid;
-    final regionId = _regionId;
+    var uid = _uid;
+    var regionId = _regionId;
 
-    final httpParams = <String, dynamic>{};
-    if (uid != null) httpParams['uid'] = uid;
-    if (regionId != null) httpParams['regionId'] = regionId;
-    httpParams['mode'] = geoSystemMode;
+    // Hard guard: refuse to configure FBG without a valid uid. Calling ready()
+    // with uid=null writes {mode} to FBG's native SQLite http.params and wipes
+    // any previously stored uid permanently (until a reset:true bootstrap with
+    // a non-null uid). Attempt SQLite cache recovery first — setIdentity may
+    // not have been called yet in this process if the ordering race fired early.
+    if (uid == null || regionId == null) {
+      final cached = await GeoDiagnosticsWriter.readIdentity();
+      if (cached != null) {
+        if (uid == null) {
+          _uid = cached.uid;
+          uid = cached.uid;
+        }
+        if (regionId == null && cached.regionId != null) {
+          _regionId = cached.regionId;
+          regionId = cached.regionId;
+        }
+        FirebaseCrashlytics.instance.log(
+            'tbg_setconfig_recovered_from_cache uid_present=${uid != null} region_present=${regionId != null}');
+      }
+      if (uid == null) {
+        throw StateError(
+            'TsbgEngine.setConfig: uid is null — call setIdentity before setConfig');
+      }
+    }
+
+    final httpParams = <String, dynamic>{
+      'uid': uid,
+      if (regionId != null) 'regionId': regionId,
+      'mode': geoSystemMode,
+    };
 
     if (kDebugMode) {
       debugPrint(
@@ -220,11 +246,32 @@ class TsbgEngine {
             debug: false,
           ),
         ),
+      ).timeout(
+        const Duration(seconds: 60),
+        onTimeout: () => throw TimeoutException('fbg_ready_timeout'),
       );
     } catch (e, st) {
       FirebaseCrashlytics.instance
           .recordError(e, st, fatal: false, reason: 'fbg_ready_failed');
       rethrow;
+    } finally {
+      // Force-apply http.params, persistence.extras, and autoSyncThreshold even
+      // if ready() threw. ready(reset:false) silently ignores ALL config (FBG uses
+      // its stored config entirely); ready(reset:true) may partially write config
+      // before throwing (e.g. iOS permission suspension mid-init). setConfig()
+      // always applies and ensures uid/regionId are explicitly written into both the
+      // body-root params (so zbgIngest receives uid) and the per-location extras.
+      // Runs unconditionally so a partial-write by ready() is always corrected.
+      try {
+        await fbg.BackgroundGeolocation.setConfig(fbg.Config(
+          autoSyncThreshold: cfg.autoSyncThreshold,
+          http: fbg.HttpConfig(params: httpParams),
+          persistence: fbg.PersistenceConfig(extras: httpParams),
+        ));
+      } catch (e, st) {
+        FirebaseCrashlytics.instance
+            .recordError(e, st, fatal: false, reason: 'fbg_setconfig_failed');
+      }
     }
 
     // Only mark ready after success — if ready() threw, _ready stays false
@@ -239,20 +286,6 @@ class TsbgEngine {
         .setCustomKey('batch_sync', cfg.batchSync.toString());
     FirebaseCrashlytics.instance.setCustomKey(
         'prevent_suspend_inside', cfg.preventSuspendInsideZone.toString());
-
-    // Fix 1: Explicitly clear any stale persistence.extras from a previous session.
-    // ready() with reset:false silently ignores extras changes; direct setConfig() always applies.
-    // autoSyncThreshold is also applied here so live Firestore config changes propagate
-    // to the running engine (ready() with reset:false does not re-apply these).
-    try {
-      await fbg.BackgroundGeolocation.setConfig(fbg.Config(
-        autoSyncThreshold: cfg.autoSyncThreshold,
-        persistence: fbg.PersistenceConfig(extras: httpParams),
-      ));
-    } catch (e, st) {
-      FirebaseCrashlytics.instance
-          .recordError(e, st, fatal: false, reason: 'fbg_setconfig_failed');
-    }
 
     // Apply the current mode’s config (outside by default).
     await _applyMode(_mode);
@@ -514,9 +547,15 @@ class TsbgEngine {
   }) async {
     final uid = _uid;
     final regionId = _regionId;
+    // Guard: refuse to write partial extras. If identity is missing, writing
+    // mode-only extras would strip uid/regionId from FBG's native SQLite —
+    // the Android headless task reads uid exclusively from persistence.extras
+    // and would silently drop every geofence event until a full bootstrap
+    // restores the correct extras.
+    if (uid == null || regionId == null) return;
     final updatedExtras = <String, dynamic>{
-      if (uid != null) 'uid': uid,
-      if (regionId != null) 'regionId': regionId,
+      'uid': uid,
+      'regionId': regionId,
       if (zoneId != null) 'zoneId': zoneId,
       'inside_zone': insideZone,
       'mode': geoSystemMode,
@@ -562,10 +601,6 @@ class TsbgEngine {
     // OEM / OS interference monitoring
     fbg.BackgroundGeolocation.onPowerSaveChange((bool isPowerSave) {
       FirebaseCrashlytics.instance.log('power_save: $isPowerSave');
-      unawaited(GeoDiagnosticsWriter.recordPowerSaveChange(
-        isPowerSave,
-        uid: _uid,
-      ));
       if (isPowerSave) {
         FirebaseCrashlytics.instance.recordError(
           StateError('oem_power_save_enabled'),
@@ -580,10 +615,14 @@ class TsbgEngine {
     fbg.BackgroundGeolocation.onProviderChange((fbg.ProviderChangeEvent e) {
       FirebaseCrashlytics.instance.log(
           'provider: gps=${e.gps} network=${e.network} enabled=${e.enabled} status=${e.status} accuracy=${e.accuracyAuthorization}');
-      unawaited(GeoDiagnosticsWriter.recordProviderChange(
-        e,
-        uid: _uid,
-      ));
+      if (!e.enabled ||
+          e.status != fbg.ProviderChangeEvent.AUTHORIZATION_STATUS_ALWAYS) {
+        // Permission disruption — force next bootstrap to use ready(reset:true)
+        // so uid/regionId are written back to native SQLite after recovery.
+        _ready = false;
+        FirebaseCrashlytics.instance
+            .log('tbg_ready_reset status=${e.status} enabled=${e.enabled}');
+      }
       if (!e.enabled) {
         FirebaseCrashlytics.instance.recordError(
           StateError('location_provider_disabled'),
@@ -596,10 +635,6 @@ class TsbgEngine {
 
     fbg.BackgroundGeolocation.onEnabledChange((bool enabled) {
       FirebaseCrashlytics.instance.log('fbg_enabled: $enabled');
-      unawaited(GeoDiagnosticsWriter.recordFbgEnabledChange(
-        enabled,
-        uid: _uid,
-      ));
       if (!enabled && _started) {
         FirebaseCrashlytics.instance.recordError(
           StateError('fbg_disabled_while_running'),

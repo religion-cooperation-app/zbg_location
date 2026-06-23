@@ -46,6 +46,24 @@ class GeoBootstrap {
     _starting = true;
     try {
       await _startFromFirestoreInner(regionId);
+    } catch (e) {
+      // Bootstrap failed — cancel any partially-attached subscriptions.
+      // Without this, _configSub stays active and continues calling
+      // _engine.setConfig() from a half-initialised engine with null identity.
+      _configSub?.cancel();
+      _configSub = null;
+      _fenceSub?.cancel();
+      _fenceSub = null;
+      _geofenceSub?.cancel();
+      _geofenceSub = null;
+      _locSub?.cancel();
+      _locSub = null;
+      // If the engine reached start() before the failure, stop it so native FBG
+      // does not keep running while isRunning returns false.
+      try {
+        await _engine.stop();
+      } catch (_) {}
+      rethrow;
     } finally {
       _starting = false;
     }
@@ -133,9 +151,10 @@ class GeoBootstrap {
             configReady.completeError(StateError('geo:missing_runtime_config'));
           return;
         }
+        final rawData = snap.data()! as Map<String, dynamic>;
         RuntimeConfig cfg;
         try {
-          cfg = _buildRuntimeConfig(snap.data()! as Map<String, dynamic>);
+          cfg = _buildRuntimeConfig(rawData);
         } catch (e, st) {
           FirebaseCrashlytics.instance.recordError(e, st,
               fatal: false, reason: 'runtime_config_parse_failed');
@@ -143,6 +162,18 @@ class GeoBootstrap {
             configReady.completeError(StateError('geo:config_parse_failed'));
           return;
         }
+        // Cache only the primitive sub-maps that _buildRuntimeConfig reads —
+        // avoids jsonEncode failures on Timestamp/GeoPoint values elsewhere in
+        // the document.
+        unawaited(GeoDiagnosticsWriter.storeRawRuntimeConfig({
+          if (rawData.containsKey('breadcrumbs'))
+            'breadcrumbs': rawData['breadcrumbs'],
+          if (rawData.containsKey('platform')) 'platform': rawData['platform'],
+          if (rawData.containsKey('geofenceDetect'))
+            'geofenceDetect': rawData['geofenceDetect'],
+          if (rawData.containsKey('ingest_api_key'))
+            'ingest_api_key': rawData['ingest_api_key'],
+        }));
         final fut = _engine.setConfig(cfg);
         if (!configReady.isCompleted) {
           fut
@@ -166,9 +197,23 @@ class GeoBootstrap {
       },
     );
     try {
-      await configReady.future.timeout(const Duration(seconds: 15));
+      await configReady.future.timeout(const Duration(seconds: 30));
     } on TimeoutException {
-      throw StateError('geo:config_timeout');
+      // Firestore unavailable — try cached config from last successful bootstrap.
+      final cachedData = await GeoDiagnosticsWriter.readRawRuntimeConfig();
+      if (cachedData != null) {
+        try {
+          final cfg = _buildRuntimeConfig(cachedData);
+          await _engine.setConfig(cfg);
+          FirebaseCrashlytics.instance.log('geo_config_loaded_from_cache');
+        } catch (e, st) {
+          FirebaseCrashlytics.instance.recordError(e, st,
+              fatal: false, reason: 'geo_config_cache_fallback_failed');
+          throw StateError('geo:config_timeout');
+        }
+      } else {
+        throw StateError('geo:config_timeout');
+      }
     }
 
     // ----- 2) Writer (shared) -----
@@ -249,7 +294,19 @@ class GeoBootstrap {
     try {
       await geofencesReady.future.timeout(const Duration(seconds: 15));
     } on TimeoutException {
-      throw StateError('geo:geofences_timeout');
+      // Firestore unavailable — use natively-registered geofences from prior session.
+      // _geofenceSub stays alive and re-registers with fresh defs when connectivity
+      // recovers.
+      bool hasNative = false;
+      try {
+        final existing = await fbg.BackgroundGeolocation.geofences;
+        hasNative = existing.isNotEmpty;
+        if (hasNative) {
+          FirebaseCrashlytics.instance.log(
+              'geo_geofences_timeout_using_native count=${existing.length}');
+        }
+      } catch (_) {}
+      if (!hasNative) throw StateError('geo:geofences_timeout');
     }
 
     // ----- 5) Dart breadcrumb writes (foreground + background) -----
@@ -309,25 +366,38 @@ class GeoBootstrap {
     // geo_mode records the active tracking mode so geoWakeupSweep can skip
     // users in geofence_only mode (they only emit breadcrumbs inside fences).
     FirebaseCrashlytics.instance.setUserIdentifier(uid);
-    try {
-      await Future.wait([
-        fs.doc('geoSessions/$uid').set({
-          'geo_running': true,
-          'geo_session_started': FieldValue.serverTimestamp(),
-          // tz_offset_minutes: device UTC offset in minutes (e.g. -300 for EST,
-          // 330 for IST). Written each session start so it stays current across
-          // DST changes. Used by geoWakeupSweep to evaluate local-time window.
-          'tz_offset_minutes': DateTime.now().timeZoneOffset.inMinutes,
-          'geo_mode': _engine.geoSystemMode,
-          'uid': uid,
-        }, SetOptions(merge: true)),
-        fs.doc('users/$uid').set({
-          'geo_running': true,
-        }, SetOptions(merge: true)),
-      ]);
-      _uid = uid;
-    } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st,
+    Object? lastWriteError;
+    StackTrace? lastWriteSt;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await Future.wait([
+          fs.doc('geoSessions/$uid').set({
+            'geo_running': true,
+            'geo_session_started': FieldValue.serverTimestamp(),
+            // tz_offset_minutes: device UTC offset in minutes (e.g. -300 for EST,
+            // 330 for IST). Written each session start so it stays current across
+            // DST changes. Used by geoWakeupSweep to evaluate local-time window.
+            'tz_offset_minutes': DateTime.now().timeZoneOffset.inMinutes,
+            'geo_mode': _engine.geoSystemMode,
+            'uid': uid,
+          }, SetOptions(merge: true)),
+          fs.doc('users/$uid').set({
+            'geo_running': true,
+          }, SetOptions(merge: true)),
+        ]);
+        _uid = uid;
+        lastWriteError = null;
+        break;
+      } catch (e, st) {
+        lastWriteError = e;
+        lastWriteSt = st;
+        FirebaseCrashlytics.instance
+            .log('geo_step7_write_attempt_$attempt failed: $e');
+        if (attempt < 3) await Future.delayed(const Duration(seconds: 2));
+      }
+    }
+    if (lastWriteError != null) {
+      FirebaseCrashlytics.instance.recordError(lastWriteError, lastWriteSt,
           fatal: false, reason: 'user_doc_start_write_failed');
       throw StateError('geo:user_doc_write_failed');
     }
