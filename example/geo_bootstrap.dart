@@ -8,6 +8,7 @@ import 'dart:io' show Platform;
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_installations/firebase_installations.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:background_fetch/background_fetch.dart';
 import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
@@ -78,8 +79,18 @@ class GeoBootstrap {
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null) throw StateError('geo:no_user');
 
-    // Tell the engine who we are + what region we're in
-    _engine.setIdentity(uid: uid, regionId: regionId);
+    // Fetch Firebase Installation ID for FID→UID attribution in zbgIngest.
+    // Non-fatal: a failed fetch still allows bootstrap to continue.
+    String? fid;
+    try {
+      fid = await FirebaseInstallations.instance.getId();
+    } catch (e, st) {
+      FirebaseCrashlytics.instance
+          .recordError(e, st, fatal: false, reason: 'fid_fetch_failed');
+    }
+
+    // Tell the engine who we are, what region we're in, and our FID.
+    _engine.setIdentity(uid: uid, regionId: regionId, fid: fid);
 
     // ----- 0b) Register background wakeup handlers -----
     // FCM silent-push handler: invoked by firebase_messaging when a

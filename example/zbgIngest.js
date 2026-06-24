@@ -222,10 +222,92 @@ exports.zbgIngest = onRequest({ cors: true }, async (req, res) => {
 
     const uid = getUid(body);
     const regionId = getRegionId(body);
+    const fid = req.headers['x-fid'] ?? null;
 
     if (!uid) {
-      console.warn('zbgIngest WARNING: Missing uid, dropping payload');
-      return res.status(400).send('Missing uid');
+      const allRows = normalizeLocations(body);
+      console.warn('zbgIngest: missing uid', JSON.stringify({
+        rawCount: allRows.length,
+        headers_api_key_present: !!req.headers['x-api-key'],
+        headers_fid: fid,
+        headers_forwarded_for: req.headers['x-forwarded-for'] ?? null,
+      }));
+
+      // Attempt FID → UID recovery via device_installations lookup.
+      if (fid) {
+        let recoveredUid = null;
+        try {
+          const fidSnap = await db.doc(`device_installations/${fid}`).get();
+          if (fidSnap.exists) recoveredUid = fidSnap.data()?.uid ?? null;
+        } catch (e) {
+          console.error('zbgIngest: device_installations lookup failed', { fid, err: e.message });
+        }
+
+        if (recoveredUid) {
+          const rescueBatch = db.batch();
+          let rescueCount = 0;
+          for (const loc of allRows) {
+            const lat = loc?.coords?.latitude ?? null;
+            const lng = loc?.coords?.longitude ?? null;
+            if (lat == null || lng == null) continue;
+            const ts = loc?.timestamp ? new Date(loc.timestamp) : new Date();
+            const tsIso = ts.toISOString();
+            rescueBatch.set(
+              db.collection('breadcrumbs').doc(`${recoveredUid}_${tsIso}`),
+              {
+                uid: recoveredUid,
+                regionId: null,
+                ts_iso: tsIso,
+                lat, lng,
+                accuracy_m: loc?.coords?.accuracy ?? null,
+                geohash_p7: gh7(lat, lng),
+                fid,
+                source: 'bg_native_http_fid_recovered',
+                mode: loc?.extras?.mode || body?.mode || null,
+              },
+              { merge: false }
+            );
+            rescueCount++;
+          }
+          if (rescueCount > 0) await rescueBatch.commit();
+          return res.status(200).json({ ok: true, fid_recovered: true, count: rescueCount });
+        }
+      }
+
+      // Fallback: write to orphaned_breadcrumbs.
+      const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() ?? null;
+      const orphanBatch = db.batch();
+      let orphanCount = 0;
+      for (const loc of allRows) {
+        const lat = loc?.coords?.latitude ?? null;
+        const lng = loc?.coords?.longitude ?? null;
+        if (lat == null || lng == null) continue;
+        const ts = loc?.timestamp ? new Date(loc.timestamp) : new Date();
+        const tsIso = ts.toISOString();
+        const docId = loc?.uuid ?? `${fid ?? 'nofid'}_${tsIso}`;
+        orphanBatch.set(
+          db.collection('orphaned_breadcrumbs').doc(docId),
+          {
+            uuid: loc?.uuid ?? null, timestamp: tsIso, lat, lng,
+            accuracy: loc?.coords?.accuracy ?? null,
+            altitude: loc?.coords?.altitude ?? null,
+            speed: loc?.coords?.speed ?? null,
+            heading: loc?.coords?.heading ?? null,
+            odometer: loc?.odometer ?? null,
+            battery_level: loc?.battery?.level ?? null,
+            battery_charging: loc?.battery?.is_charging ?? null,
+            activity_type: loc?.activity?.type ?? null,
+            activity_confidence: loc?.activity?.confidence ?? null,
+            is_moving: loc?.is_moving ?? null,
+            mode: loc?.extras?.mode || body?.mode || null,
+            fid: fid ?? null, ip,
+            server_received_at: FieldValue.serverTimestamp(),
+          }
+        );
+        orphanCount++;
+      }
+      if (orphanCount > 0) await orphanBatch.commit();
+      return res.status(200).json({ ok: true, orphaned: true, count: orphanCount, reason: 'missing_uid_no_fid_mapping' });
     }
 
     const batch = db.batch();
@@ -449,6 +531,7 @@ exports.zbgIngest = onRequest({ cors: true }, async (req, res) => {
           precompute_inside_zone: precomputeInside,
           precompute_zone_id: precomputeZoneId,
           activity_type: activityType,
+          fid: fid || null,
           source: 'bg_native_http',
           mode: mode || null,
         },
