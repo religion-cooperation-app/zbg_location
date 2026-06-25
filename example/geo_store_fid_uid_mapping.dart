@@ -17,7 +17,7 @@
 // The action is idempotent (uses set with merge:true) so calling it on
 // both sign-up and sign-in is safe and produces no side effects.
 
-import 'package:firebase_installations/firebase_installations.dart';
+import 'package:firebase_app_installations/firebase_app_installations.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'dart:io' show Platform;
