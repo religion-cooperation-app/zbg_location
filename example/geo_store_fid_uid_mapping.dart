@@ -22,7 +22,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'dart:io' show Platform;
 
-Future<void> geoStoreFidUidMapping({required String regionId}) async {
+Future<void> geoStoreFidUidMapping(String regionId) async {
   final uid = FirebaseAuth.instance.currentUser?.uid;
   if (uid == null || uid.isEmpty) return;
   if (regionId.isEmpty) return;
