@@ -62,15 +62,18 @@ class TsbgEngine {
   // Identity for native HTTP uploads → Cloud Function.
   String? _uid;
   String? _regionId;
+  String? _fid;
 
   /// Called by app layer before setConfig/start to tag native HTTP uploads
-  /// with the signed-in user and active region.
-  void setIdentity({required String uid, required String regionId}) {
+  /// with the signed-in user, active region, and Firebase Installation ID.
+  void setIdentity({required String uid, required String regionId, String? fid}) {
     _uid = uid;
     _regionId = regionId;
+    _fid = fid;
     unawaited(GeoDiagnosticsWriter.storeIdentity(
       uid: uid,
       regionId: regionId,
+      fid: fid,
     ));
   }
 
@@ -186,6 +189,7 @@ class TsbgEngine {
               'X-Api-Key': cfg.ingestApiKey ??
                   (throw StateError(
                       'ingestApiKey is null — add ingest_api_key to appConfig/runtime')),
+              if (_fid != null) 'X-Fid': _fid!,
             },
             // Sent with every request (query/body-level params)
             params: httpParams,

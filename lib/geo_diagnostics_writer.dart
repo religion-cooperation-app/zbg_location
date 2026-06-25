@@ -18,6 +18,7 @@ class GeoDiagnosticsWriter {
   static Future<void> storeIdentity({
     required String uid,
     required String regionId,
+    String? fid,
   }) async {
     if (kIsWeb) return;
     if (uid.isEmpty || regionId.isEmpty) return;
@@ -29,6 +30,7 @@ class GeoDiagnosticsWriter {
           'uid': uid,
           'region_id': regionId,
           'client_updated_at_iso': DateTime.now().toUtc().toIso8601String(),
+          if (fid != null && fid.isNotEmpty) 'fid': fid,
         }),
       );
     } catch (e, st) {
@@ -47,7 +49,11 @@ class GeoDiagnosticsWriter {
       final uid = decoded['uid'] as String?;
       final regionId = decoded['region_id'] as String?;
       if (uid == null || uid.isEmpty) return null;
-      return GeoDiagnosticsIdentity(uid: uid, regionId: regionId);
+      return GeoDiagnosticsIdentity(
+        uid: uid,
+        regionId: regionId,
+        fid: decoded['fid'] as String?,
+      );
     } catch (e, st) {
       await _recordNonFatal(e, st, 'zbg_geo_diag_read_identity_failed');
       return null;
@@ -461,8 +467,10 @@ class GeoDiagnosticsIdentity {
   const GeoDiagnosticsIdentity({
     required this.uid,
     required this.regionId,
+    this.fid,
   });
 
   final String uid;
   final String? regionId;
+  final String? fid;
 }
