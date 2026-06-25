@@ -140,6 +140,11 @@ class TsbgEngine {
             // Android-only per FBG docs — enables active GPS for geofence EXIT
             // detection. Has no effect on iOS (CLRegionMonitoring handles that).
             geofenceModeHighAccuracy: Platform.isAndroid,
+            // With 300-400 geofences planned, proximity management activates
+            // above the OS 100-geofence limit. 5000m gives adequate lead time
+            // at highway speed (~3.75 min at 80 km/h) while keeping active
+            // registrations well under 100 at expected site density.
+            geofenceProximityRadius: 5000,
             // iOS: request Always authorisation explicitly and provide all required
             // dialog keys so FBG can render the upgrade prompt on iOS 13+.
             // Without the full key set, FBG cannot show the Settings shortcut for
