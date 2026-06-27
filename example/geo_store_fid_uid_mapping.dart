@@ -20,9 +20,10 @@
 import 'package:firebase_app_installations/firebase_app_installations.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'dart:io' show Platform;
+import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, TargetPlatform;
 
 Future<void> geoStoreFidUidMapping(String regionId) async {
+  if (kIsWeb) return;
   final uid = FirebaseAuth.instance.currentUser?.uid;
   if (uid == null || uid.isEmpty) return;
   if (regionId.isEmpty) return;
@@ -37,6 +38,6 @@ Future<void> geoStoreFidUidMapping(String regionId) async {
     'uid': uid,
     'regionId': regionId,
     'updated_at': FieldValue.serverTimestamp(),
-    'platform': Platform.isAndroid ? 'android' : 'ios',
+    'platform': defaultTargetPlatform == TargetPlatform.android ? 'android' : 'ios',
   }, SetOptions(merge: true));
 }
