@@ -114,25 +114,20 @@ class TsbgEngine {
           reset: !_ready,
           foregroundService: true,
 
+          // Collect locations only between 05:00–00:00 every day.
+          // startSchedule() activates this; FBG stops automatically outside the window.
+          schedule: ['1-7 05:00-00:00'],
+          scheduleUseAlarmManager: Platform.isAndroid,
+
           geolocation: fbg.GeoConfig(
             desiredAccuracy: fbg.DesiredAccuracy.high,
-            // Allow FBG to scale distanceFilter with speed (elasticity).
-            // At rest/walking: baseline distanceFilter applies. At speed: FBG
-            // multiplies it proportionally, reducing GPS polling when moving fast.
-            // distanceFilter per mode is the minimum floor — never scaled below it.
             disableElasticity: false,
-            // Configurable from Firestore — how long before FBG stops GPS after no motion.
-            stopTimeout: cfg.stopTimeoutMinutes,
             // iOS: prevent CoreLocation from pausing updates on stationary devices.
             pausesLocationUpdatesAutomatically: false,
             // iOS: declare walking/non-automotive movement so CoreLocation applies
             // less aggressive power management in background. FBG silently ignores
             // this on Android — no platform guard needed.
             activityType: fbg.ActivityType.otherNavigation,
-            // Minimum distance device must move from stationary position before
-            // FBG transitions to moving state. 25 is FBG's enforced minimum.
-            // iOS applies its own ~200m floor in terminated state regardless.
-            stationaryRadius: 25,
             // Fire ENTER immediately if device is already inside a fence when
             // geofences are registered. Complements synthesizeEnterIfInside()
             // with a native-layer check that requires no GPS fetch.
@@ -218,11 +213,8 @@ class TsbgEngine {
           ),
 
           activity: fbg.ActivityConfig(
-            // Allow FBG to enter low-power stationary mode when the device stops
-            // moving. The heartbeat handles breadcrumb emission while stationary;
-            // the accelerometer wakes FBG when motion resumes. Keeping this true
-            // burns maximum battery and causes iOS to throttle/kill the process.
-            disableStopDetection: false,
+            // Engine runs continuously within the schedule window — no stop/start cycles.
+            disableStopDetection: true,
           ),
 
           logger: fbg.LoggerConfig(
@@ -351,7 +343,8 @@ class TsbgEngine {
       if (_cfg?.geofenceOnlyMode == true) {
         await fbg.BackgroundGeolocation.startGeofences();
       } else {
-        await fbg.BackgroundGeolocation.start();
+        // startSchedule() activates the 05:00-00:00 window; FBG owns on/off.
+        await fbg.BackgroundGeolocation.startSchedule();
       }
     } catch (e, st) {
       FirebaseCrashlytics.instance
@@ -727,60 +720,48 @@ class TsbgEngine {
       return;
     }
 
-    int heartbeatS;
-    int distanceM;
-    bool useSigChange;
-    int? locationUpdateMs; // NEW: per-mode locationUpdateInterval
-
+    // Hardcoded rates for scheduled-continuous mode.
+    // Motion detection is disabled; FBG runs continuously within the schedule window.
+    final int heartbeatS;
+    final int distanceM;
+    final int locationUpdateMs;
     switch (mode) {
       case SamplingMode.inside:
-        useSigChange = false;
-        heartbeatS = cfg.rateInsideS;
-        distanceM = cfg.distanceFilterInsideM;
-        locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
+        heartbeatS = 180;       // 3 min
+        distanceM = 5;
+        locationUpdateMs = 180000;
         break;
       case SamplingMode.near:
-        useSigChange = false;
-        heartbeatS = cfg.rateNearS;
-        distanceM = cfg.distanceFilterNearM;
-        locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
+        heartbeatS = 300;       // 5 min
+        distanceM = 10;
+        locationUpdateMs = 300000;
         break;
       case SamplingMode.outside:
-        final allowSigChange = cfg.useSignificantChangeWhenOutside &&
-            (cfg.rateOutsideS >= cfg.significantChangeOutsideThresholdS);
-        useSigChange = allowSigChange;
-        heartbeatS = cfg.rateOutsideS;
-        distanceM = cfg.distanceFilterOutsideM;
-
-        // NEW: when you're "outside", ask the plugin for more frequent updates
-        // tied to your configured rate (in seconds).
-        locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
+        heartbeatS = 600;       // 10 min
+        distanceM = 20;
+        locationUpdateMs = 600000;
         break;
     }
 
     await fbg.BackgroundGeolocation.setConfig(
       fbg.Config(
         geolocation: fbg.GeoConfig(
-          useSignificantChangesOnly: useSigChange,
+          useSignificantChangesOnly: false,
           distanceFilter: distanceM.toDouble(),
           locationUpdateInterval: locationUpdateMs,
         ),
         app: fbg.AppConfig(
-          heartbeatInterval: heartbeatS
-              .toDouble(), // seconds, per AppConfig v5 API (Android min: 60s)
-          // iOS only — engage preventSuspend while inside a zone so heartbeat
-          // breadcrumbs fire reliably while stationary. Off outside/near so iOS
-          // manages the process normally and CLRegionMonitoring handles wakeups.
-          // cfg.preventSuspendInsideZone is a Firestore kill switch (default true).
-          preventSuspend:
-              (mode == SamplingMode.inside) && cfg.preventSuspendInsideZone,
+          heartbeatInterval: heartbeatS.toDouble(),
+          // iOS: engage preventSuspend inside a zone so heartbeats fire reliably
+          // while stationary. Off outside/near so iOS manages normally.
+          preventSuspend: mode == SamplingMode.inside,
         ),
       ),
     );
 
     if (kDebugMode) {
       debugPrint(
-          '[TsbgEngine] applyMode=$mode sc=$useSigChange hb=${heartbeatS}s df=${distanceM}m locUpdateMs=$locationUpdateMs');
+          '[TsbgEngine] applyMode=$mode hb=${heartbeatS}s df=${distanceM}m locUpdateMs=$locationUpdateMs');
     }
 
     _mode = mode;
@@ -810,21 +791,21 @@ class TsbgEngine {
     // to the app-layer stream and prevents SQLite accumulation of outside fixes.
     if (cfg.geofenceOnlyMode && _enteredFenceId == null) return;
 
-    // Mode-specific thresholds
+    // Mode-specific thresholds — hardcoded to match _applyMode.
     final int rateS;
     final int distM;
     switch (_mode) {
       case SamplingMode.inside:
-        rateS = cfg.rateInsideS;
-        distM = cfg.distanceFilterInsideM;
+        rateS = 180;
+        distM = 5;
         break;
       case SamplingMode.near:
-        rateS = cfg.rateNearS;
-        distM = cfg.distanceFilterNearM;
+        rateS = 300;
+        distM = 10;
         break;
       case SamplingMode.outside:
-        rateS = cfg.rateOutsideS;
-        distM = cfg.distanceFilterOutsideM;
+        rateS = 600;
+        distM = 20;
         break;
     }
 
