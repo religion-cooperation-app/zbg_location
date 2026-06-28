@@ -122,6 +122,10 @@ class TsbgEngine {
           geolocation: fbg.GeoConfig(
             desiredAccuracy: fbg.DesiredAccuracy.high,
             disableElasticity: false,
+            // Allow time-based FLP deliveries (locationUpdateInterval) to pass through
+            // onLocation even when stationary. Without this, FBG suppresses identical
+            // coords and stationary sampling falls back entirely to the heartbeat.
+            allowIdenticalLocations: true,
             // iOS: prevent CoreLocation from pausing updates on stationary devices.
             pausesLocationUpdatesAutomatically: false,
             // iOS: declare walking/non-automotive movement so CoreLocation applies
