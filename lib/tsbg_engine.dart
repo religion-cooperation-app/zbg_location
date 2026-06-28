@@ -769,8 +769,8 @@ class TsbgEngine {
     final double lng = c.longitude;
     final double acc = c.accuracy;
 
-    // Accuracy gate
-    if (acc > cfg.accuracyDropM) return;
+    // Accuracy gate — hardcoded to 5000m for testing on devices with approximate location only.
+    if (acc > 5000) return;
 
     // Geofence-only mode: suppress breadcrumb emission while outside all fences.
     // Server-side zbgIngest applies the same rule, but gating here avoids writing
