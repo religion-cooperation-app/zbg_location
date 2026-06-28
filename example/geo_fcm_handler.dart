@@ -124,59 +124,23 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
 
   if (uid == null || uid.isEmpty) return;
 
-  // Read config once — used for mode switching and fence registration.
+  // Read only geofence geometry config — breadcrumb rates are flat in this branch.
   int loiteringDelayMs = 60000;
-  int rateInsideS = 30, rateNearS = 60, rateOutsideS = 300;
-  int distFilterInsideM = 10, distFilterNearM = 20, distFilterOutsideM = 100;
   double nearZoneRadiusM = 100.0;
   try {
     final configSnap = await fs.doc('appConfig/runtime').get();
     if (configSnap.exists) {
       final data = configSnap.data()! as Map<String, dynamic>;
       final geoDetect = (data['geofenceDetect'] as Map?) ?? {};
-      final breadcrumbs = (data['breadcrumbs'] as Map?) ?? {};
       loiteringDelayMs =
           ((geoDetect['dwell_required_s'] as num?)?.toInt() ?? 60) * 1000;
       nearZoneRadiusM =
           (geoDetect['near_zone_radius_m'] as num?)?.toDouble() ?? 100.0;
-      rateInsideS = (breadcrumbs['rate_inside_zone_s'] as num?)?.toInt() ?? 30;
-      rateNearS = (breadcrumbs['rate_near_zone_s'] as num?)?.toInt() ?? 60;
-      rateOutsideS =
-          (breadcrumbs['rate_outside_zone_s'] as num?)?.toInt() ?? 300;
-      distFilterInsideM =
-          (breadcrumbs['distance_filter_inside_m'] as num?)?.toInt() ?? 10;
-      distFilterNearM =
-          (breadcrumbs['distance_filter_near_m'] as num?)?.toInt() ?? 20;
-      distFilterOutsideM =
-          (breadcrumbs['distance_filter_outside_m'] as num?)?.toInt() ?? 100;
     }
   } catch (_) {}
 
-  // Near-zone fences: mode switch only, no Firestore event write.
-  if (isNearFence) {
-    if (action == 'ENTER') {
-      try {
-        await fbg.BackgroundGeolocation.setConfig(fbg.Config(
-          geolocation: fbg.GeoConfig(
-            distanceFilter: distFilterNearM.toDouble(),
-            locationUpdateInterval: rateNearS * 1000,
-          ),
-          app: fbg.AppConfig(heartbeatInterval: rateNearS.toDouble()),
-        ));
-      } catch (_) {}
-    } else if (action == 'EXIT') {
-      try {
-        await fbg.BackgroundGeolocation.setConfig(fbg.Config(
-          geolocation: fbg.GeoConfig(
-            distanceFilter: distFilterOutsideM.toDouble(),
-            locationUpdateInterval: rateOutsideS * 1000,
-          ),
-          app: fbg.AppConfig(heartbeatInterval: rateOutsideS.toDouble()),
-        ));
-      } catch (_) {}
-    }
-    return;
-  }
+  // Near-zone fences: no Firestore event write. Rate is flat — no setConfig needed.
+  if (isNearFence) return;
 
   // Inner fence: write event to Firestore.
   await fs.collection('geofence_events').add({
@@ -189,30 +153,7 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
     if (mode != null) 'mode': mode,
   });
 
-  // Apply sampling mode config based on event type.
-  if (action == 'ENTER') {
-    try {
-      await fbg.BackgroundGeolocation.setConfig(fbg.Config(
-        geolocation: fbg.GeoConfig(
-          distanceFilter: distFilterInsideM.toDouble(),
-          locationUpdateInterval: rateInsideS * 1000,
-        ),
-        app: fbg.AppConfig(heartbeatInterval: rateInsideS.toDouble()),
-      ));
-    } catch (_) {}
-  } else if (action == 'EXIT') {
-    // Apply near mode — user is likely still within the near zone.
-    // The _near EXIT event will switch to outside mode when they fully leave.
-    try {
-      await fbg.BackgroundGeolocation.setConfig(fbg.Config(
-        geolocation: fbg.GeoConfig(
-          distanceFilter: distFilterNearM.toDouble(),
-          locationUpdateInterval: rateNearS * 1000,
-        ),
-        app: fbg.AppConfig(heartbeatInterval: rateNearS.toDouble()),
-      ));
-    } catch (_) {}
-  }
+  // Rate is flat in this branch — no setConfig needed on ENTER/EXIT.
 
   // EXIT: re-arm Android's Geofencing API including outer near-zone fences.
   if (action == 'EXIT' && regionId != null) {
