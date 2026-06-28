@@ -724,28 +724,11 @@ class TsbgEngine {
       return;
     }
 
-    // Hardcoded rates for scheduled-continuous mode.
-    // Motion detection is disabled; FBG runs continuously within the schedule window.
-    final int heartbeatS;
-    final int distanceM;
-    final int locationUpdateMs;
-    switch (mode) {
-      case SamplingMode.inside:
-        heartbeatS = 180;       // 3 min
-        distanceM = 5;
-        locationUpdateMs = 180000;
-        break;
-      case SamplingMode.near:
-        heartbeatS = 300;       // 5 min
-        distanceM = 10;
-        locationUpdateMs = 300000;
-        break;
-      case SamplingMode.outside:
-        heartbeatS = 600;       // 10 min
-        distanceM = 20;
-        locationUpdateMs = 600000;
-        break;
-    }
+    // Flat 5-minute rate everywhere — zone state still tracked for geofence
+    // logic but no longer drives sampling frequency.
+    const int heartbeatS = 300;
+    const int distanceM = 10;
+    const int locationUpdateMs = 300000;
 
     await fbg.BackgroundGeolocation.setConfig(
       fbg.Config(
@@ -764,8 +747,7 @@ class TsbgEngine {
     );
 
     if (kDebugMode) {
-      debugPrint(
-          '[TsbgEngine] applyMode=$mode hb=${heartbeatS}s df=${distanceM}m locUpdateMs=$locationUpdateMs');
+      debugPrint('[TsbgEngine] applyMode=$mode hb=${heartbeatS}s df=${distanceM}m');
     }
 
     _mode = mode;
@@ -795,23 +777,8 @@ class TsbgEngine {
     // to the app-layer stream and prevents SQLite accumulation of outside fixes.
     if (cfg.geofenceOnlyMode && _enteredFenceId == null) return;
 
-    // Mode-specific thresholds — hardcoded to match _applyMode.
-    final int rateS;
-    final int distM;
-    switch (_mode) {
-      case SamplingMode.inside:
-        rateS = 180;
-        distM = 5;
-        break;
-      case SamplingMode.near:
-        rateS = 300;
-        distM = 10;
-        break;
-      case SamplingMode.outside:
-        rateS = 600;
-        distM = 20;
-        break;
-    }
+    const int rateS = 300;
+    const int distM = 10;
 
     final lastLat = _lastEmitLat;
     final lastLng = _lastEmitLng;
