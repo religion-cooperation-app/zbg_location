@@ -548,20 +548,20 @@ class TsbgEngine {
     fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent e) async {
       FirebaseCrashlytics.instance.log(
           'hb mode=${_mode.name} ts=${DateTime.now().toUtc().toIso8601String()}');
-      // Prefer last known location from SDK; fall back to a lightweight fetch.
-      fbg.Location? loc = e.location;
-      if (loc == null) {
-        try {
-          loc = await fbg.BackgroundGeolocation.getCurrentPosition(
-            samples: 1,
-            persist: true,
-          );
-        } catch (e, st) {
-          FirebaseCrashlytics.instance.recordError(e, st,
-              fatal: false, reason: 'heartbeat_gps_unavailable');
-          return;
-        }
+      // Always fetch and persist so the fix lands in FBG's SQLite buffer for
+      // batch upload, even when stationary (identical coords allowed by config).
+      fbg.Location? loc;
+      try {
+        loc = await fbg.BackgroundGeolocation.getCurrentPosition(
+          samples: 1,
+          persist: true,
+        );
+      } catch (err, st) {
+        FirebaseCrashlytics.instance.recordError(err, st,
+            fatal: false, reason: 'heartbeat_gps_unavailable');
+        loc = e.location;
       }
+      if (loc == null) return;
       await _maybeEmitFromFBGLocation(loc, reason: 'heartbeat');
     });
 
@@ -724,11 +724,11 @@ class TsbgEngine {
       return;
     }
 
-    // Flat 5-minute rate everywhere — zone state still tracked for geofence
+    // Flat 6-minute rate everywhere — zone state still tracked for geofence
     // logic but no longer drives sampling frequency.
-    const int heartbeatS = 300;
-    const int distanceM = 10;
-    const int locationUpdateMs = 300000;
+    const int heartbeatS = 360;
+    const int distanceM = 20;
+    const int locationUpdateMs = 360000;
 
     await fbg.BackgroundGeolocation.setConfig(
       fbg.Config(
@@ -777,7 +777,7 @@ class TsbgEngine {
     // to the app-layer stream and prevents SQLite accumulation of outside fixes.
     if (cfg.geofenceOnlyMode && _enteredFenceId == null) return;
 
-    const int rateS = 300;
+    const int rateS = 360;
     const int distM = 10;
 
     final lastLat = _lastEmitLat;

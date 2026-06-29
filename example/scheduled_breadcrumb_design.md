@@ -1,5 +1,20 @@
 # Scheduled Breadcrumb System — Design Notes
 
+## Current Status
+
+**Branch:** `laventure_2_scheduled`
+
+| Item | Status |
+|---|---|
+| Heartbeat interval | 360s (6 min) |
+| locationUpdateInterval | 360000ms (6 min) |
+| distanceFilter | 20m |
+| `getCurrentPosition(persist: true)` on every heartbeat | ✓ implemented |
+| Headless task heartbeat handling (terminated state GPS fix) | ✗ not yet — native FLP recording covers terminated state but no explicit Dart GPS fix |
+| Heartbeat batch sync (`autoSync: false` + manual `sync()`) | ✗ not yet — zbgIngest is called on every heartbeat via native flush |
+
+---
+
 ## Goal
 
 Record a location breadcrumb approximately every 5 minutes across all app states:
@@ -200,3 +215,59 @@ foreground and background for the vast majority of participants.
 For terminated state, the FCM silent push (Option B) is the most reliable
 complement that doesn't require native code, since it's a server-initiated wakeup
 independent of Doze's local timer restrictions.
+
+---
+
+## Pending Changes and Open Questions
+
+### Native recording in terminated state — contrast with `laventure_2`
+
+In `laventure_2` (motion-detection branch, no schedule), FBG's engine enters
+**stationary mode** when the accelerometer detects the device is not moving
+(`disableStopDetection: false`, the default). In stationary mode, FBG's native
+service drops its FLP subscription — no location updates are delivered, nothing
+is written to SQLite. So in terminated state with a stationary participant,
+`laventure_2` produces no breadcrumbs at all between geofence events. The engine
+only reactivates when the accelerometer triggers a `motionchange:true`.
+
+In `laventure_2_scheduled`, `disableStopDetection: true` keeps the FLP subscription
+permanently active within the schedule window. FBG's native Android foreground
+service (which survives app termination / swipe-away) holds this subscription and
+writes every FLP delivery directly to SQLite — no Dart code required. The native
+heartbeat then flushes SQLite → zbgIngest on its own schedule.
+
+This means:
+- **Terminated + stationary participant**: `laventure_2` → no breadcrumbs. `laventure_2_scheduled` → ~1 per 6 min from native FLP recording.
+- Our Dart `getCurrentPosition(persist: true)` in `onHeartbeat` adds a second explicit
+  GPS fix per cycle in foreground/background only. In terminated state it does not run,
+  but the native FLP record still appears — the Dart handler is a supplement, not the
+  source of the breadcrumb.
+
+### Pending: distanceFilter → 25m
+
+Currently hardcoded at 10m in `_applyMode`. With the heartbeat guaranteeing one fix
+per 6 min regardless of movement, the distanceFilter's only role is how often FBG
+delivers distance-triggered fixes during movement. 25m reduces onLocation callback
+frequency without meaningfully degrading route quality for zone-detection purposes.
+Both the FBG config `distanceFilter` and the Dart-layer `distM` constant (used by
+`_maybeEmitFromFBGLocation` for `distDue`) should be updated together.
+
+### Pending: heartbeat batch sync
+
+Currently `autoSync: true` is set in the HTTP config. FBG's native heartbeat handler
+flushes the SQLite buffer immediately on every heartbeat, regardless of
+`autoSyncThreshold`. This means a zbgIngest POST fires every 6 minutes even when only
+1 record has accumulated.
+
+To batch:
+1. Set `autoSync: false` in `HttpConfig` — locations accumulate in SQLite but are
+   never POSTed automatically.
+2. Add a heartbeat counter in `TsbgEngine` and call
+   `BackgroundGeolocation.sync()` every N heartbeats (e.g. N=5 → one upload every
+   30 min with ~5 records per batch).
+3. Keep explicit `sync()` calls on app foreground (`geoFlushBuffer`) and on geofence
+   events so those are not delayed by the batch window.
+
+Open question: whether 30-min upload latency is acceptable for the study, or whether
+geofence-event-triggered sync is sufficient to keep zone-entry data timely while
+heartbeat records batch in the background.
