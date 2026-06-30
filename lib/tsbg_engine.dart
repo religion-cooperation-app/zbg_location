@@ -344,6 +344,10 @@ class TsbgEngine {
       _started = false;
     }
     try {
+      // startSchedule() does not call requestPermission() internally the way
+      // start() does. Request explicitly so the user sees the full permission
+      // flow (precise location → Allow all the time) on first launch.
+      await fbg.BackgroundGeolocation.requestPermission();
       if (_cfg?.geofenceOnlyMode == true) {
         await fbg.BackgroundGeolocation.startGeofences();
       } else {
