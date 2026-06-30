@@ -733,26 +733,20 @@ class TsbgEngine {
 
     int heartbeatS;
     int distanceM;
-    bool useSigChange;
     int? locationUpdateMs;
 
     switch (mode) {
       case SamplingMode.inside:
-        useSigChange = false;
         heartbeatS = cfg.rateInsideS;
         distanceM = cfg.distanceFilterInsideM;
         locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
         break;
       case SamplingMode.near:
-        useSigChange = false;
         heartbeatS = cfg.rateNearS;
         distanceM = cfg.distanceFilterNearM;
         locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
         break;
       case SamplingMode.outside:
-        final allowSigChange = cfg.useSignificantChangeWhenOutside &&
-            (cfg.rateOutsideS >= cfg.significantChangeOutsideThresholdS);
-        useSigChange = allowSigChange;
         heartbeatS = cfg.rateOutsideS;
         distanceM = cfg.distanceFilterOutsideM;
         locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
@@ -762,7 +756,7 @@ class TsbgEngine {
     await fbg.BackgroundGeolocation.setConfig(
       fbg.Config(
         geolocation: fbg.GeoConfig(
-          useSignificantChangesOnly: useSigChange,
+          useSignificantChangesOnly: false,
           distanceFilter: distanceM.toDouble(),
           locationUpdateInterval: locationUpdateMs,
         ),
