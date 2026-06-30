@@ -157,6 +157,7 @@ class TsbgEngine {
               'cancelButton': 'Cancel',
               'settingsButton': 'Settings',
             },
+            stopTimeout: 30,
           ),
 
           app: fbg.AppConfig(
@@ -730,24 +731,45 @@ class TsbgEngine {
       return;
     }
 
-    // Flat 6-minute rate everywhere — zone state still tracked for geofence
-    // logic but no longer drives sampling frequency.
-    const int heartbeatS = 360;
-    const int distanceM = 20;
-    const int locationUpdateMs = 360000;
+    int heartbeatS;
+    int distanceM;
+    bool useSigChange;
+    int? locationUpdateMs;
+
+    switch (mode) {
+      case SamplingMode.inside:
+        useSigChange = false;
+        heartbeatS = cfg.rateInsideS;
+        distanceM = cfg.distanceFilterInsideM;
+        locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
+        break;
+      case SamplingMode.near:
+        useSigChange = false;
+        heartbeatS = cfg.rateNearS;
+        distanceM = cfg.distanceFilterNearM;
+        locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
+        break;
+      case SamplingMode.outside:
+        final allowSigChange = cfg.useSignificantChangeWhenOutside &&
+            (cfg.rateOutsideS >= cfg.significantChangeOutsideThresholdS);
+        useSigChange = allowSigChange;
+        heartbeatS = cfg.rateOutsideS;
+        distanceM = cfg.distanceFilterOutsideM;
+        locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
+        break;
+    }
 
     await fbg.BackgroundGeolocation.setConfig(
       fbg.Config(
         geolocation: fbg.GeoConfig(
-          useSignificantChangesOnly: false,
+          useSignificantChangesOnly: useSigChange,
           distanceFilter: distanceM.toDouble(),
           locationUpdateInterval: locationUpdateMs,
         ),
         app: fbg.AppConfig(
           heartbeatInterval: heartbeatS.toDouble(),
-          // iOS: engage preventSuspend inside a zone so heartbeats fire reliably
-          // while stationary. Off outside/near so iOS manages normally.
-          preventSuspend: mode == SamplingMode.inside,
+          preventSuspend:
+              (mode == SamplingMode.inside) && cfg.preventSuspendInsideZone,
         ),
       ),
     );
@@ -783,8 +805,22 @@ class TsbgEngine {
     // to the app-layer stream and prevents SQLite accumulation of outside fixes.
     if (cfg.geofenceOnlyMode && _enteredFenceId == null) return;
 
-    const int rateS = 360;
-    const int distM = 10;
+    final int rateS;
+    final int distM;
+    switch (_mode) {
+      case SamplingMode.inside:
+        rateS = cfg.rateInsideS;
+        distM = cfg.distanceFilterInsideM;
+        break;
+      case SamplingMode.near:
+        rateS = cfg.rateNearS;
+        distM = cfg.distanceFilterNearM;
+        break;
+      case SamplingMode.outside:
+        rateS = cfg.rateOutsideS;
+        distM = cfg.distanceFilterOutsideM;
+        break;
+    }
 
     final lastLat = _lastEmitLat;
     final lastLng = _lastEmitLng;
