@@ -217,8 +217,10 @@ class TsbgEngine {
           ),
 
           activity: fbg.ActivityConfig(
-            // Engine runs continuously within the schedule window — no stop/start cycles.
-            disableStopDetection: true,
+            // disableStopDetection was removed. With it set to true, FBG cancels
+            // the heartbeat on motionchange:true and never restarts it because
+            // motionchange:false never fires. The heartbeat only works in stationary
+            // mode — let FBG's normal stop detection restore it after each walk.
           ),
 
           logger: fbg.LoggerConfig(

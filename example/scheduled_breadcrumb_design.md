@@ -36,7 +36,7 @@ without a breadcrumb.
 
 | Setting | Value | Why |
 |---|---|---|
-| `disableStopDetection` | `true` | Engine never enters stationary mode — no stop/start cycles, heartbeat fires continuously |
+| `disableStopDetection` | `false` (removed) | Originally set to true to keep FLP active when stationary. Removed: FBG cancels the heartbeat on motionchange:true and never restarts it while disableStopDetection is true, because motionchange:false never fires. Normal stop detection is needed so heartbeat restarts after each walk. |
 | `schedule` | `['1-7 05:00-00:00']` | Tracking window midnight to midnight (effectively always on, with a midnight reset) |
 | `scheduleUseAlarmManager` | `true` (Android) | Schedule START/STOP uses `AlarmManager` to pierce Doze, ensuring the window begins on time |
 | `startSchedule()` | replaces `start()` | FBG owns the on/off window; app calls `startSchedule()` once |
@@ -231,14 +231,20 @@ is written to SQLite. So in terminated state with a stationary participant,
 `laventure_2` produces no breadcrumbs at all between geofence events. The engine
 only reactivates when the accelerometer triggers a `motionchange:true`.
 
-In `laventure_2_scheduled`, `disableStopDetection: true` keeps the FLP subscription
-permanently active within the schedule window. FBG's native Android foreground
-service (which survives app termination / swipe-away) holds this subscription and
-writes every FLP delivery directly to SQLite — no Dart code required. The native
-heartbeat then flushes SQLite → zbgIngest on its own schedule.
+In `laventure_2_scheduled`, FBG's normal stop/start cycle is preserved
+(`disableStopDetection: false`). When the device is stationary, the heartbeat fires
+every 6 min → headless `getCurrentPosition(persist:true)` + `sync()` → zbgIngest.
+When the device is moving, FLP distance triggers handle recording. When the walk
+ends, `motionchange: false` fires → heartbeat restarts.
+
+**Why `disableStopDetection: true` was removed:** FBG cancels the heartbeat on
+`motionchange: true`. With stop detection disabled, `motionchange: false` never
+fires, so the heartbeat never restarts after the first walk. This was confirmed in
+June 30 testing — heartbeat was cancelled at 14:24:54 and never resumed, producing
+zero terminated breadcrumbs for the rest of the session.
 
 This means:
-- **Terminated + stationary participant**: `laventure_2` → no breadcrumbs. `laventure_2_scheduled` → ~1 per 6 min from native FLP recording.
+- **Terminated + stationary participant**: `laventure_2` → no breadcrumbs. `laventure_2_scheduled` → ~1 per 6 min from headless heartbeat handler.
 - Our Dart `getCurrentPosition(persist: true)` in `onHeartbeat` adds a second explicit
   GPS fix per cycle in foreground/background only. In terminated state it does not run,
   but the native FLP record still appears — the Dart handler is a supplement, not the
