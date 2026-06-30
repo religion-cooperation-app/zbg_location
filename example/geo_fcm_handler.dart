@@ -105,6 +105,17 @@ void geoBackgroundFetchHeadlessTask(HeadlessTask task) async {
 // GeoBootstrap.startFromFirestore() — Android-only.
 @pragma('vm:entry-point')
 void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
+  if (headlessEvent.name == 'heartbeat') {
+    try {
+      await fbg.BackgroundGeolocation.getCurrentPosition(
+        samples: 1,
+        persist: true,
+        timeout: 25,
+      );
+      await fbg.BackgroundGeolocation.sync();
+    } catch (_) {}
+    return;
+  }
   if (headlessEvent.name != 'geofence') return;
   await Firebase.initializeApp();
   final fs = FirebaseFirestore.instance;

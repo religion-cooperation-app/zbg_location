@@ -10,7 +10,7 @@
 | locationUpdateInterval | 360000ms (6 min) |
 | distanceFilter | 20m |
 | `getCurrentPosition(persist: true)` on every heartbeat | ✓ implemented |
-| Headless task heartbeat handling (terminated state GPS fix) | ✗ not yet — native FLP recording covers terminated state but no explicit Dart GPS fix |
+| Headless task heartbeat handling (terminated state GPS fix) | ✓ implemented |
 | Heartbeat batch sync (`autoSync: false` + manual `sync()`) | ✗ not yet — zbgIngest is called on every heartbeat via native flush |
 
 ---
@@ -80,8 +80,9 @@ fire close together.
 In terminated state (swipe-away), FBG's foreground service is killed. FBG's native
 Android `HeadlessTask` (`geoFbgHeadlessTask`) is registered to handle events from
 the native layer. It:
-- Ignores heartbeat events (returns early — breadcrumbs in terminated state come
-  via FBG's own SQLite → HTTP upload path, not the Dart layer)
+- Handles heartbeat events: calls `getCurrentPosition(persist: true)` then
+  `sync()` → GPS fix saved to SQLite → immediately flushed to zbgIngest →
+  Firestore breadcrumb. This is the primary breadcrumb path in terminated state.
 - Writes geofence ENTER/EXIT/DWELL events to Firestore
 - Re-arms Android's Geofencing API on EXIT (re-registers all fences)
 - Uses flat 300s/10m — does not read breadcrumb rates from Firestore
