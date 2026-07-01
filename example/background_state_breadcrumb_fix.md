@@ -1,5 +1,7 @@
 # Background State Breadcrumb Fix
 
+**Commit:** `8c15de1` — branch `laventure_2_scheduled`
+
 ## Problem
 
 When the app transitions from terminated state to background state, FBG resets its
