@@ -462,19 +462,15 @@ class TsbgEngine {
     await fbg.BackgroundGeolocation.sync();
   }
 
-  /// Re-attaches FBG Dart listeners after the native layer clears them.
-  /// FBG clears its native-to-Dart bridge on every resume from terminated state
-  /// ("Cleared callbacks" in the log), orphaning all onHeartbeat/onLocation/
-  /// onGeofence/onMotionChange handlers. Call this from
-  /// WidgetsBindingObserver.didChangeAppLifecycleState on resumed to restore them.
-  void reattachListeners() {
-    if (!_started) return;
-    FirebaseCrashlytics.instance.log('reattachListeners: start');
-    fbg.BackgroundGeolocation.removeListeners();
-    _listenersAttached = false;
+  /// Registers FBG Dart event listeners if not already registered this session.
+  /// Safe to call before ready() or start() — only subscribes to EventChannels.
+  /// Idempotent: guarded by _listenersAttached so duplicate calls are no-ops.
+  /// Called on every app open via registerLifecycleTracker so background
+  /// heartbeats reach Dart handlers regardless of whether startFromFirestore ran.
+  void ensureListeners() {
+    if (_listenersAttached) return;
     _attachListeners();
     _listenersAttached = true;
-    FirebaseCrashlytics.instance.log('reattachListeners: done');
   }
 
   /// Expose streams
@@ -568,6 +564,7 @@ class TsbgEngine {
 
     // HEARTBEAT — ensures timed emission even when stationary
     fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent e) async {
+      FirebaseCrashlytics.instance.log('onHeartbeat: dart handler entered');
       FirebaseCrashlytics.instance.log(
           'hb mode=${_mode.name} ts=${DateTime.now().toUtc().toIso8601String()}');
       // Always fetch and persist so the fix lands in FBG's SQLite buffer for

@@ -1,290 +1,214 @@
 # Background State Breadcrumb Fix
 
-**Commit:** `8c15de1` — branch `laventure_2_scheduled`
+**Branch:** `laventure_2_scheduled`
+
+---
 
 ## Problem
 
-When the app transitions from terminated state to background state, FBG resets its
-native-to-Dart bridge ("Cleared callbacks" in the log). After this reset, all Dart
-listeners registered via `onHeartbeat`, `onLocation`, `onGeofence`, and
-`onMotionChange` are orphaned — the native FBG service continues running and firing
-events, but no Dart handler receives them.
+When the app opens from a terminated state, FBG resets its native-to-Dart bridge
+("Cleared callbacks" in the log). This orphans any Dart listeners registered from a
+previous session. On a **normal daily app open** — one where `startFromFirestore`
+does not run (no stale breadcrumbs, no permission change, no config change) — Dart
+listeners are never re-registered, so FBG native heartbeats that fire while the app
+is backgrounded are silently dropped.
 
-The root cause is a one-time guard in `TsbgEngine.setConfig()`:
+The mechanics:
 
-```dart
-if (!_listenersAttached) {
-  _attachListeners();
-  _listenersAttached = true;
-}
-```
+- `TsbgEngine._attachListeners()` is only called from `setConfig()`, which is only
+  called from `startFromFirestore`
+- `startFromFirestore` only runs when `permissionUpdated == true` in the FlutterFlow
+  homepage action flow — not on every app open
+- On a normal daily open, `_started = false`, `_listenersAttached = false`, and
+  `_attachListeners()` is never called
+- FBG heartbeat fires in background → native service fires alarm → "TERMINATE_EVENT
+  ignored (MainActivity is still active)" → no headless task → no Dart handler → event
+  dropped
 
-`_listenersAttached` is set to `true` after the first registration and never reset.
-When FBG clears its callbacks on resume, `_listenersAttached` is still `true`, so
-`_attachListeners()` never runs again. From this point forward:
+Evidence in `background-geolocation (85).log`: heartbeat alarms fire during the
+16:41–16:49 background window with zero `getCurrentPosition` calls, zero SQLite
+writes, and zero HTTP POSTs.
 
-- `onHeartbeat` does not fire → no `getCurrentPosition(persist: true)` → no
-  breadcrumb via the Dart path
-- `onLocation` does not fire → no `_maybeEmitFromFBGLocation` → no Dart breadcrumb
-- `onGeofence` does not fire → geofence events are not written to Firestore from
-  the Dart path
-- `onMotionChange` does not fire → `_applyMode()` is never called on motion state
-  transitions
+### What the broken fix also introduced (regression)
 
-Confirmed in logs (`background-geolocation (84) Wcp Jul 1.log`): the 12:45–13:06
-background window shows heartbeat alarms firing (`❤️` + OneShot entries) but zero
-`getCurrentPosition` calls, zero `💾 ✅` SQLite writes, and zero HTTP POSTs. On app
-open at 13:06:41, `HTTP Service (count: 0)` confirms nothing accumulated in SQLite
-during the entire background window.
+An earlier attempt added `with WidgetsBindingObserver` to `GeoBootstrap` and called
+`_engine.reattachListeners()` on every `AppLifecycleState.resumed`. This made things
+worse:
 
-This does not affect terminated state. In terminated state the Dart VM is dead
-entirely — `geoFbgHeadlessTask` handles all events in its own isolate, independently
-of `TsbgEngine` and `GeoBootstrap`. The headless path is unaffected by this fix.
+- `reattachListeners()` called `BackgroundGeolocation.removeListeners()` (which
+  returns Futures that are not awaited) then immediately called `_attachListeners()`
+- The subscription cancellations did not settle before re-registration, so old and
+  new listeners coexisted → 5x `getCurrentPosition` per heartbeat → corrupted bridge
+- Background→foreground transitions (no "Cleared callbacks") also triggered the
+  re-registration unnecessarily
+- Log 85 shows exactly this: 5x `getCurrentPosition` per heartbeat in the 15:18–15:36
+  background window, followed by a broken bridge from 16:18 onward
+
+---
+
+## Root cause summary
+
+**FBG listeners must be registered on every app open**, not just when
+`startFromFirestore` runs. The hook that runs on every app open already exists:
+`_AppSessionTracker._onForeground()` in `register_lifecycle_tracker.dart`, called
+from `initState` on the homepage.
 
 ---
 
 ## Fix
 
-Two files are changed.
+### What the fix does
+
+Add `TsbgEngine.ensureListeners()` — a simple, idempotent method that registers
+FBG Dart listeners if not already registered in this Dart VM session. Call it from
+`_AppSessionTracker._onForeground()` so it runs on every app open.
+
+**No `removeListeners()` is needed.** The `_listenersAttached` flag is `false` on
+every fresh Dart VM (FBG has already cleared callbacks by the time `_onForeground()`
+fires), so we just call `_attachListeners()` directly. On background→foreground, the
+flag is `true` (listeners are still alive), so `ensureListeners()` is a no-op.
+
+### Files changed
+
+---
 
 ### 1. `zbg_location/lib/tsbg_engine.dart`
 
-**Add `reattachListeners()` method** after `flushBuffer()`:
+**Replace `reattachListeners()` with `ensureListeners()`:**
 
 ```dart
-/// Re-attaches FBG Dart listeners after the native layer clears them.
-/// FBG clears its native-to-Dart bridge on every resume from terminated state
-/// ("Cleared callbacks" in the log), orphaning all onHeartbeat/onLocation/
-/// onGeofence/onMotionChange handlers. Call this from
-/// WidgetsBindingObserver.didChangeAppLifecycleState on resumed to restore them.
-void reattachListeners() {
-  if (!_started) return;
-  fbg.BackgroundGeolocation.removeListeners();
-  _listenersAttached = false;
+/// Registers FBG Dart event listeners if not already registered this session.
+/// Safe to call before ready() or start() — only subscribes to EventChannels.
+/// Idempotent: guarded by _listenersAttached so duplicate calls are no-ops.
+/// Called on every app open via registerLifecycleTracker so background
+/// heartbeats reach Dart handlers regardless of whether startFromFirestore ran.
+void ensureListeners() {
+  if (_listenersAttached) return;
   _attachListeners();
   _listenersAttached = true;
 }
 ```
 
-**Line-by-line:**
+**Add entry log to `onHeartbeat`:**
 
-- `if (!_started) return` — no-ops before `start()` has ever been called. Prevents
-  a spurious `removeListeners` + `_attachListeners` on the very first app open before
-  the engine is running.
-- `fbg.BackgroundGeolocation.removeListeners()` — FBG's own API for clearing all
-  registered Dart callbacks. Called first to guarantee a clean slate before
-  re-registering, in case any stale partial registrations remain.
-- `_listenersAttached = false` — resets the guard so `_attachListeners()` runs
-  unconditionally. Without this reset, `_attachListeners()` would not be entered
-  (the guard checks `!_listenersAttached` at the call site in `setConfig()`).
-- `_attachListeners()` — re-registers all Dart callbacks: `onHeartbeat`,
-  `onLocation`, `onPowerSaveChange`, `onProviderChange`, `onEnabledChange`,
-  `onGeofence`, `onMotionChange`.
-- `_listenersAttached = true` — restores the guard so any subsequent `setConfig()`
-  call (e.g. a live Firestore config update) does not attempt another registration
-  on top of the freshly-attached listeners.
+```dart
+fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent e) async {
+  FirebaseCrashlytics.instance.log('onHeartbeat: dart handler entered');
+  // ... rest unchanged
+```
+
+This marker distinguishes "native heartbeat fired" (visible in FBG verbose log as
+`❤️`) from "Dart handler ran" (visible in Crashlytics). If the marker is absent
+after a heartbeat, `ensureListeners()` did not register the handler.
 
 ---
 
 ### 2. `example/geo_bootstrap.dart`
 
-**Four changes:**
+**Remove** the broken lifecycle observer approach:
+- Remove `with WidgetsBindingObserver`
+- Remove `import 'package:flutter/widgets.dart'`
+- Remove `bool _observerRegistered = false`
+- Remove the `addObserver(this)` block from `_startFromFirestoreInner`
+- Remove the `didChangeAppLifecycleState` override
 
-#### a) New import
-
-```dart
-import 'package:flutter/widgets.dart';
-```
-
-Brings in `WidgetsBindingObserver` and `WidgetsBinding`. Added after
-`dart:io` and before `package:cloud_firestore`.
-
-#### b) Class declaration — add `WidgetsBindingObserver` mixin
+**Add** public forwarding method:
 
 ```dart
-// before
-class GeoBootstrap {
-
-// after
-class GeoBootstrap with WidgetsBindingObserver {
+/// Ensures FBG Dart listeners are registered in this Dart VM session.
+/// Delegates to TsbgEngine.ensureListeners() — idempotent, safe before start().
+/// Call from registerLifecycleTracker on every app open.
+void ensureListeners() => _engine.ensureListeners();
 ```
-
-Makes `GeoBootstrap` a Flutter lifecycle observer. No base class change; `with` is
-sufficient. The singleton pattern (`GeoBootstrap._()`) is unchanged.
-
-#### c) New field `_observerRegistered`
-
-```dart
-bool _observerRegistered = false;
-```
-
-Added alongside the other bool fields (`_starting`, `_inside`). Guards the
-`addObserver(this)` call so it is only made once per singleton lifetime. Without
-this guard, a second call to `startFromFirestore` (e.g. from a homepage action
-running twice) would register a second observer and cause
-`didChangeAppLifecycleState` to fire twice per lifecycle event, resulting in a
-double `removeListeners` + `_attachListeners` cycle.
-
-#### d) Observer registration + `didChangeAppLifecycleState` override
-
-At the top of `_startFromFirestoreInner`:
-
-```dart
-if (!_observerRegistered) {
-  WidgetsBinding.instance.addObserver(this);
-  _observerRegistered = true;
-}
-```
-
-`addObserver(this)` registers the singleton with Flutter's binding. After this
-single call, Flutter invokes `didChangeAppLifecycleState` automatically on every
-app lifecycle transition for the lifetime of the app. Placed at the very top of
-`_startFromFirestoreInner` so the observer is active as early as possible,
-regardless of whether subsequent startup steps succeed or throw.
-
-The override, placed before `stop()`:
-
-```dart
-@override
-void didChangeAppLifecycleState(AppLifecycleState state) {
-  if (state == AppLifecycleState.resumed) {
-    _engine.reattachListeners();
-  }
-}
-```
-
-`AppLifecycleState.resumed` fires every time the app comes to the foreground from
-any prior state (terminated, background, or paused). This is the same moment at
-which FBG performs its "Cleared callbacks" bridge reset on the native side. By
-calling `reattachListeners()` here, Dart listeners are restored immediately after
-the reset, before the user can background the app again or any FBG event fires into
-the now-dead bridge.
-
-Only `resumed` is handled. No action is taken on `paused`, `inactive`,
-`detached`, or `hidden` — these do not require listener re-registration.
 
 ---
 
-## Interaction with `setConfig()` and `startFromFirestore()`
+### 3. `sparrc/lib/custom_code/actions/register_lifecycle_tracker.dart`
 
-`setConfig()` is called by the Firestore config listener inside
-`_startFromFirestoreInner` and on every live config update. It contains:
+**Add import:**
 
 ```dart
-if (!_listenersAttached) {
-  _attachListeners();
-  _listenersAttached = true;
-}
+import '/custom_code/geo_bootstrap.dart';
 ```
 
-The ordering on every resume from terminated state is:
+**Add call at top of `_onForeground()`:**
 
-1. `didChangeAppLifecycleState(resumed)` fires (OS-level, before any page renders)
-2. `reattachListeners()` runs → `removeListeners()` → `_attachListeners()` →
-   `_listenersAttached = true`
-3. Homepage renders → any `geoStartFromFirestore` custom action runs →
-   `startFromFirestore()` → `setConfig()` → `_listenersAttached == true` → **skips
-   `_attachListeners()`**
+```dart
+void _onForeground() {
+  if (_isInForeground) return;
+  _isInForeground = true;
+  GeoBootstrap.instance.ensureListeners();  // ← added
+  final uid = FirebaseAuth.instance.currentUser?.uid;
+  // ... rest unchanged
+```
 
-There is no double-registration. The lifecycle callback always wins the race because
-Flutter fires it before Dart page logic runs.
+`_onForeground()` fires via `register()` in homepage `initState` on every app open
+from terminated state, and via `didChangeAppLifecycleState(resumed)` on every
+background→foreground transition. The `_isInForeground` guard ensures it fires once
+per foreground entry. `ensureListeners()` is idempotent so both code paths are safe.
 
-On first-ever startup (app has never run before), `reattachListeners()` is a no-op
-because `_started == false`. `setConfig()` performs the initial registration
-normally.
+---
+
+## How it solves the problem
+
+On a normal daily app open (no `startFromFirestore`):
+
+1. App opens from terminated
+2. FBG fires "Cleared callbacks" (very early, native side)
+3. Flutter starts → homepage `initState` → `registerLifecycleTracker()`
+4. `_onForeground()` → `GeoBootstrap.instance.ensureListeners()`
+5. `_listenersAttached = false` → `_attachListeners()` → listeners registered
+6. `_listenersAttached = true`
+7. User backgrounds app → Dart VM stays alive → listeners remain registered
+8. FBG heartbeat fires → `onHeartbeat` Dart handler executes
+9. `getCurrentPosition(persist: true)` → saved to SQLite
+10. FBG `autoSync` uploads via zbgIngest → Firestore breadcrumb written
+
+When `startFromFirestore` also runs (stale breadcrumbs, config change):
+
+- `setConfig()` checks `!_listenersAttached` → already `true` → skips `_attachListeners()`
+- No double-registration
+- `startFromFirestore` sets up `_cfg`, `_locSub`, `_writer` → real-time Dart emission
+  to Firestore also works (not just SQLite-buffered)
+
+On background→foreground (same Dart VM session):
+
+- `_onForeground()` → `ensureListeners()` → `_listenersAttached = true` → no-op
+- No `removeListeners()` called, no listener churn
 
 ---
 
 ## What this does NOT affect
 
 - **Terminated state breadcrumbs**: unaffected. In terminated state the Dart VM is
-  dead — no lifecycle observer fires, no Dart code runs. `geoFbgHeadlessTask`
-  handles heartbeat and geofence events entirely independently in its own isolate.
-  The headless path (`getCurrentPosition(persist:true)` + `sync()`) continues to
-  work exactly as before.
+  dead — `geoFbgHeadlessTask` handles events in its own isolate independently.
 
-- **Foreground state breadcrumbs**: unaffected. Listeners are already alive in
-  foreground; `reattachListeners()` on resume simply refreshes them to the same
-  state they were already in.
+- **Foreground state breadcrumbs**: unaffected. Listeners are alive; `ensureListeners()`
+  is a no-op.
 
-- **Geofence re-arming**: unaffected. Android geofence re-arming on EXIT is handled
-  natively by FBG and confirmed separately in `geoFbgHeadlessTask`. The Dart-side
-  `onGeofence` handler in `GeoBootstrap` now fires correctly in background state
-  after this fix, which is an improvement for geofence event Firestore writes when
-  the app is backgrounded but not terminated.
+- **`startFromFirestore` when it does run**: unaffected. `setConfig()` still skips
+  `_attachListeners()` when `_listenersAttached = true`, preventing double-registration.
 
 ---
 
-## Motion-to-still transitions in background state
+## Confirming the fix end-to-end
 
-Before this fix: `onMotionChange` was dead in background state, so `_applyMode()`
-was never called when the device stopped after a walk. FBG's native heartbeat would
-restart correctly (the native service handles `motionchange: false` itself), but the
-Dart sampling-mode state would be stale.
-
-After this fix: `onMotionChange` is alive in background state. When FBG fires
-`motionchange: false` after the 30-minute `stopTimeout`, `_applyMode()` runs
-correctly and updates `heartbeatInterval`, `distanceFilter`, and
-`locationUpdateInterval` for the new mode. Zone-based rate changes now work
-correctly in background state.
-
----
-
-## Diagnostic logging
-
-Three log lines are written to both **Crashlytics** and the **FBG verbose log file**
-(the `.log` files shared for debugging). FBG logger entries appear inline with FBG's
-own events with a `[D]` prefix.
-
-### In `geo_bootstrap.dart` — `didChangeAppLifecycleState`
+After deploying, look for this Crashlytics sequence during a background window on a
+normal app open (no `startFromFirestore`):
 
 ```
-[D] lifecycle: resumed → reattachListeners
+onHeartbeat: dart handler entered    ← Dart handler executed
+hb mode=... ts=...                   ← existing mode/time log
 ```
 
-Confirms Flutter's `WidgetsBindingObserver` fired on app resume and that
-`reattachListeners()` was called. If this line never appears in the FBG log, the
-observer was not registered or `AppLifecycleState.resumed` did not fire.
-
-### In `tsbg_engine.dart` — `reattachListeners()`
+In the FBG verbose log, the heartbeat should now be followed by `getCurrentPosition`
+and `💾 ✅` entries:
 
 ```
-[D] reattachListeners: start
-[D] reattachListeners: done
+❤️ HeartbeatEvent ...
+getCurrentPosition ...
+💾 ✅ ...
 ```
 
-`start` appearing without `done` would indicate a crash inside `removeListeners()`
-or `_attachListeners()`. Both appearing confirms the bridge was cleared and all
-listeners re-registered successfully.
-
-### Confirming the fix worked end-to-end
-
-After seeing the three lines above, look for the existing Crashlytics log in
-`onHeartbeat`:
-
-```
-hb mode=... ts=...
-```
-
-This is Crashlytics-only (not in the FBG verbose log). The FBG verbose log already
-writes its own `❤️ HeartbeatEvent` entry natively — if that entry is followed by a
-`getCurrentPosition` call in the same background window (i.e. after
-`reattachListeners: done`), the Dart heartbeat handler is executing and the fix is
-confirmed working end-to-end.
-
-### What the log sequence should look like after the fix
-
-In a background window following a terminated-state period:
-
-```
-[D] lifecycle: resumed → reattachListeners   ← GeoBootstrap lifecycle callback
-[D] reattachListeners: start                 ← TsbgEngine begins re-registration
-[D] reattachListeners: done                  ← all listeners restored
-... (some time passes, FBG heartbeat alarm fires) ...
-❤️ HeartbeatEvent ...                        ← FBG native heartbeat
-getCurrentPosition ...                        ← Dart onHeartbeat handler executed
-💾 ✅ ...                                     ← location persisted to SQLite
-```
-
-Before the fix, the `getCurrentPosition` and `💾 ✅` lines were absent during any
-background window that followed a terminated-state period.
+Before the fix: `getCurrentPosition` and `💾 ✅` were absent on normal daily opens
+during any background window.
