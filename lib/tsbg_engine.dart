@@ -470,13 +470,11 @@ class TsbgEngine {
   void reattachListeners() {
     if (!_started) return;
     FirebaseCrashlytics.instance.log('reattachListeners: start');
-    fbg.BackgroundGeolocation.logger.debug('reattachListeners: start');
     fbg.BackgroundGeolocation.removeListeners();
     _listenersAttached = false;
     _attachListeners();
     _listenersAttached = true;
     FirebaseCrashlytics.instance.log('reattachListeners: done');
-    fbg.BackgroundGeolocation.logger.debug('reattachListeners: done');
   }
 
   /// Expose streams

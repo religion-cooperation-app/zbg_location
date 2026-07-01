@@ -357,7 +357,6 @@ class GeoBootstrap with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       FirebaseCrashlytics.instance.log('lifecycle: resumed → reattachListeners');
-      fbg.BackgroundGeolocation.logger.debug('lifecycle: resumed → reattachListeners');
       _engine.reattachListeners();
     }
   }
