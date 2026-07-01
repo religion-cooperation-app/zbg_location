@@ -5,6 +5,7 @@
 
 import 'dart:async';
 import 'dart:io' show Platform;
+import 'package:flutter/widgets.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -19,7 +20,7 @@ import 'package:zbg_proximity/zbg_proximity.dart'; // for ZoneState
 import '/custom_code/zbg_firestore_adapter.dart'; // your shared WriteFn adapter
 import '/custom_code/geo_fcm_handler.dart'; // FCM handler + background fetch headless task
 
-class GeoBootstrap {
+class GeoBootstrap with WidgetsBindingObserver {
   GeoBootstrap._();
   static final instance = GeoBootstrap._();
 
@@ -36,6 +37,7 @@ class GeoBootstrap {
   bool _inside = false;
   bool _starting =
       false; // concurrency guard — prevents overlapping startFromFirestore calls
+  bool _observerRegistered = false;
 
   // Broadcasts zone state changes to any subscriber (e.g. BtBootstrap).
   // Purely in-memory — no network involved.
@@ -53,6 +55,13 @@ class GeoBootstrap {
   }
 
   Future<void> _startFromFirestoreInner(String regionId) async {
+    // Register lifecycle observer once so reattachListeners() fires on every
+    // resume. Must be idempotent — addObserver stacks duplicates if called twice.
+    if (!_observerRegistered) {
+      WidgetsBinding.instance.addObserver(this);
+      _observerRegistered = true;
+    }
+
     final fs = FirebaseFirestore.instance;
 
     // ----- 0) Get user + set identity FIRST -----
@@ -341,6 +350,15 @@ class GeoBootstrap {
       FirebaseCrashlytics.instance.recordError(e, st,
           fatal: false, reason: 'user_doc_start_write_failed');
       throw StateError('geo:user_doc_write_failed');
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      FirebaseCrashlytics.instance.log('lifecycle: resumed → reattachListeners');
+      fbg.BackgroundGeolocation.logger.debug('lifecycle: resumed → reattachListeners');
+      _engine.reattachListeners();
     }
   }
 

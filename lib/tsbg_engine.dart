@@ -462,6 +462,23 @@ class TsbgEngine {
     await fbg.BackgroundGeolocation.sync();
   }
 
+  /// Re-attaches FBG Dart listeners after the native layer clears them.
+  /// FBG clears its native-to-Dart bridge on every resume from terminated state
+  /// ("Cleared callbacks" in the log), orphaning all onHeartbeat/onLocation/
+  /// onGeofence/onMotionChange handlers. Call this from
+  /// WidgetsBindingObserver.didChangeAppLifecycleState on resumed to restore them.
+  void reattachListeners() {
+    if (!_started) return;
+    FirebaseCrashlytics.instance.log('reattachListeners: start');
+    fbg.BackgroundGeolocation.logger.debug('reattachListeners: start');
+    fbg.BackgroundGeolocation.removeListeners();
+    _listenersAttached = false;
+    _attachListeners();
+    _listenersAttached = true;
+    FirebaseCrashlytics.instance.log('reattachListeners: done');
+    fbg.BackgroundGeolocation.logger.debug('reattachListeners: done');
+  }
+
   /// Expose streams
   Stream<LocationSample> onLocation() => _locCtl.stream;
   Stream<GeofenceEvent> onGeofence() => _fenceCtl.stream;
