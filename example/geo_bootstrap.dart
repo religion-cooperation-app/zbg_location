@@ -467,7 +467,7 @@ class GeoBootstrap {
           (platform['use_significant_change_outside'] ?? true) as bool,
       significantChangeOutsideThresholdS:
           (platform['significant_change_outside_threshold_s'] ?? 300) as int,
-      stopTimeoutMinutes: (platform['stop_timeout_minutes'] ?? 60) as int,
+      stopTimeoutMinutes: 10, // TEMP: hardcoded; restore: (platform['stop_timeout_minutes'] ?? 60) as int
       batchSync: (platform['batch_sync'] ?? true) as bool,
       maxBatchSize: (platform['max_batch_size'] ?? 8) as int,
       autoSyncThreshold: (platform['auto_sync_threshold'] ?? 0) as int,
