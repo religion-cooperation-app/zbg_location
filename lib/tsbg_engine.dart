@@ -467,10 +467,22 @@ class TsbgEngine {
   /// Idempotent: guarded by _listenersAttached so duplicate calls are no-ops.
   /// Called on every app open via registerLifecycleTracker so background
   /// heartbeats reach Dart handlers regardless of whether startFromFirestore ran.
+  ///
+  /// Also calls BackgroundGeolocation.ready(reset:false) to increment the
+  /// native EventManager's clientReadyEpoch. Without this, the EventManager
+  /// does not dispatch heartbeat/geofence events to Dart after a process kill
+  /// where geoStartFromConfig has not run in the new Dart VM. reset:false
+  /// preserves all existing native config and state loaded from FBG's SQLite.
   void ensureListeners() {
     if (_listenersAttached) return;
     _attachListeners();
     _listenersAttached = true;
+    // Fire-and-forget: signals Dart readiness to the native EventManager.
+    fbg.BackgroundGeolocation.ready(fbg.Config(reset: false))
+        .catchError((Object e) {
+      FirebaseCrashlytics.instance
+          .log('ensureListeners: ready() failed: $e');
+    });
   }
 
   /// Expose streams
