@@ -59,6 +59,10 @@ class TsbgEngine {
   double? _lastEmitLat;
   double? _lastEmitLng;
 
+  /// Throttle active-tracking wakeups caused by zone transitions/reconciliation.
+  DateTime? _lastForcePaceUtc;
+  String? _lastForcePaceReason;
+
   // Identity for native HTTP uploads → Cloud Function.
   String? _uid;
   String? _regionId;
@@ -66,15 +70,21 @@ class TsbgEngine {
 
   /// Called by app layer before setConfig/start to tag native HTTP uploads
   /// with the signed-in user, active region, and Firebase Installation ID.
-  void setIdentity({required String uid, required String regionId, String? fid}) {
+  void setIdentity({
+    required String uid,
+    required String regionId,
+    String? fid,
+  }) {
     _uid = uid;
     _regionId = regionId;
     _fid = fid;
-    unawaited(GeoDiagnosticsWriter.storeIdentity(
-      uid: uid,
-      regionId: regionId,
-      fid: fid,
-    ));
+    unawaited(
+      GeoDiagnosticsWriter.storeIdentity(
+        uid: uid,
+        regionId: regionId,
+        fid: fid,
+      ),
+    );
   }
 
   /// --------------------------------------------
@@ -95,7 +105,8 @@ class TsbgEngine {
 
     if (kDebugMode) {
       debugPrint(
-          '[TsbgEngine] HTTP params at setConfig: uid=$uid regionId=$regionId httpParams=$httpParams');
+        '[TsbgEngine] HTTP params at setConfig: uid=$uid regionId=$regionId httpParams=$httpParams',
+      );
     }
 
     // One-time BG Geolocation init
@@ -191,9 +202,11 @@ class TsbgEngine {
             // Native HTTP → Cloud Function (background-safe).
             url: _zbgIngestUrl,
             headers: {
-              'X-Api-Key': cfg.ingestApiKey ??
+              'X-Api-Key':
+                  cfg.ingestApiKey ??
                   (throw StateError(
-                      'ingestApiKey is null — add ingest_api_key to appConfig/runtime')),
+                    'ingestApiKey is null — add ingest_api_key to appConfig/runtime',
+                  )),
               if (_fid != null) 'X-Fid': _fid!,
             },
             // Sent with every request (query/body-level params)
@@ -225,14 +238,16 @@ class TsbgEngine {
             disableStopDetection: false,
           ),
 
-          logger: fbg.LoggerConfig(
-            debug: false,
-          ),
+          logger: fbg.LoggerConfig(debug: false),
         ),
       );
     } catch (e, st) {
-      FirebaseCrashlytics.instance
-          .recordError(e, st, fatal: false, reason: 'fbg_ready_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'fbg_ready_failed',
+      );
       rethrow;
     }
 
@@ -240,27 +255,41 @@ class TsbgEngine {
     // so the next start attempt retries with reset: true.
     _ready = true;
 
-    FirebaseCrashlytics.instance
-        .setCustomKey('geofence_only_mode', cfg.geofenceOnlyMode.toString());
-    FirebaseCrashlytics.instance
-        .setCustomKey('auto_sync_threshold', cfg.autoSyncThreshold);
-    FirebaseCrashlytics.instance
-        .setCustomKey('batch_sync', cfg.batchSync.toString());
     FirebaseCrashlytics.instance.setCustomKey(
-        'prevent_suspend_inside', cfg.preventSuspendInsideZone.toString());
+      'geofence_only_mode',
+      cfg.geofenceOnlyMode.toString(),
+    );
+    FirebaseCrashlytics.instance.setCustomKey(
+      'auto_sync_threshold',
+      cfg.autoSyncThreshold,
+    );
+    FirebaseCrashlytics.instance.setCustomKey(
+      'batch_sync',
+      cfg.batchSync.toString(),
+    );
+    FirebaseCrashlytics.instance.setCustomKey(
+      'prevent_suspend_inside',
+      cfg.preventSuspendInsideZone.toString(),
+    );
 
     // Fix 1: Explicitly clear any stale persistence.extras from a previous session.
     // ready() with reset:false silently ignores extras changes; direct setConfig() always applies.
     // autoSyncThreshold is also applied here so live Firestore config changes propagate
     // to the running engine (ready() with reset:false does not re-apply these).
     try {
-      await fbg.BackgroundGeolocation.setConfig(fbg.Config(
-        autoSyncThreshold: cfg.autoSyncThreshold,
-        persistence: fbg.PersistenceConfig(extras: httpParams),
-      ));
+      await fbg.BackgroundGeolocation.setConfig(
+        fbg.Config(
+          autoSyncThreshold: cfg.autoSyncThreshold,
+          persistence: fbg.PersistenceConfig(extras: httpParams),
+        ),
+      );
     } catch (e, st) {
-      FirebaseCrashlytics.instance
-          .recordError(e, st, fatal: false, reason: 'fbg_setconfig_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'fbg_setconfig_failed',
+      );
     }
 
     // Apply the current mode’s config (outside by default).
@@ -294,7 +323,8 @@ class TsbgEngine {
       // Add fences that are new or whose geometry has changed
       for (final d in incoming.values) {
         final existing = current[d.ident];
-        final changed = existing == null ||
+        final changed =
+            existing == null ||
             existing.lat != d.lat ||
             existing.lng != d.lng ||
             existing.radiusM != d.radiusM;
@@ -332,8 +362,12 @@ class TsbgEngine {
         ..addAll(defs);
       FirebaseCrashlytics.instance.setCustomKey('fence_count', _defs.length);
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st,
-          fatal: false, reason: 'geofence_registration_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'geofence_registration_failed',
+      );
       rethrow;
     }
   }
@@ -354,8 +388,12 @@ class TsbgEngine {
         await fbg.BackgroundGeolocation.start();
       }
     } catch (e, st) {
-      FirebaseCrashlytics.instance
-          .recordError(e, st, fatal: false, reason: 'fbg_start_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'fbg_start_failed',
+      );
       rethrow;
     }
     _started = true;
@@ -380,8 +418,12 @@ class TsbgEngine {
     try {
       await fbg.BackgroundGeolocation.stop();
     } catch (e, st) {
-      FirebaseCrashlytics.instance
-          .recordError(e, st, fatal: false, reason: 'fbg_stop_failed');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'fbg_stop_failed',
+      );
       rethrow;
     } finally {
       // Always clear all state — even if the native stop() threw — so a
@@ -401,11 +443,13 @@ class TsbgEngine {
       _lastEmitUtc = null;
       _lastEmitLat = null;
       _lastEmitLng = null;
+      _lastForcePaceUtc = null;
+      _lastForcePaceReason = null;
     }
   }
 
-  /// Check current GPS position and emit a synthetic ENTER if the device is
-  /// already inside a registered geofence but _enteredAt is not set.
+  /// Check current GPS position and synthesize initial zone state if the device
+  /// is already inside or near a registered geofence.
   ///
   /// Call this from GeoBootstrap after engine.start() with _fenceSub attached.
   /// Catches the race where FBG fires an ENTER during addGeofences() (step 2)
@@ -421,6 +465,10 @@ class TsbgEngine {
       );
       final lat = loc.coords.latitude;
       final lng = loc.coords.longitude;
+      GeofenceDef? nearDef;
+      double? nearDist;
+      final nearRadiusM = (_cfg?.nearZoneRadiusM ?? 100).toDouble();
+
       for (final def in _defs) {
         if (def.type != 'circle' ||
             def.lat == null ||
@@ -438,15 +486,38 @@ class TsbgEngine {
           await _applyMode(SamplingMode.inside);
           if (kDebugMode) {
             debugPrint(
-                '[TsbgEngine] synthesizeEnterIfInside: inside ${def.ident} '
-                '(${dist.toStringAsFixed(1)}m <= ${def.radiusM}m)');
+              '[TsbgEngine] synthesizeEnterIfInside: inside ${def.ident} '
+              '(${dist.toStringAsFixed(1)}m <= ${def.radiusM}m)',
+            );
           }
-          break; // only one zone active at a time
+          unawaited(_kickActiveTracking('synthetic_inner_enter'));
+          return; // only one zone active at a time
+        }
+        if (nearDef == null && dist <= def.radiusM! + nearRadiusM) {
+          nearDef = def;
+          nearDist = dist;
         }
       }
+
+      if (nearDef != null) {
+        _activeNearFences.add('${nearDef.ident}_near');
+        await _applyMode(SamplingMode.near);
+        if (kDebugMode) {
+          debugPrint(
+            '[TsbgEngine] synthesizeEnterIfInside: near ${nearDef.ident} '
+            '(${nearDist!.toStringAsFixed(1)}m <= '
+            '${(nearDef.radiusM! + nearRadiusM).toStringAsFixed(1)}m)',
+          );
+        }
+        unawaited(_kickActiveTracking('synthetic_near_enter'));
+      }
     } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st,
-          fatal: false, reason: 'synthesize_enter_gps_unavailable');
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'synthesize_enter_gps_unavailable',
+      );
     }
   }
 
@@ -456,6 +527,43 @@ class TsbgEngine {
   Future<void> flushBuffer() async {
     if (!_ready) return;
     await fbg.BackgroundGeolocation.sync();
+  }
+
+  /// Nudge FBG into active tracking after meaningful zone transitions.
+  ///
+  /// This records one fresh persisted fix, flushes it, then asks FBG to enter
+  /// moving mode. Normal stop detection remains enabled and will return the
+  /// engine to stationary/heartbeat behavior after the configured stop timeout.
+  Future<void> _kickActiveTracking(String reason) async {
+    final now = DateTime.now().toUtc();
+    final last = _lastForcePaceUtc;
+    if (last != null && now.difference(last).inSeconds < 120) {
+      FirebaseCrashlytics.instance.log(
+        'force_pace_skip reason=$reason last=$_lastForcePaceReason',
+      );
+      return;
+    }
+
+    _lastForcePaceUtc = now;
+    _lastForcePaceReason = reason;
+
+    try {
+      FirebaseCrashlytics.instance.log('force_pace_kick: $reason');
+      await fbg.BackgroundGeolocation.getCurrentPosition(
+        samples: 1,
+        persist: true,
+        timeout: 25,
+      );
+      await fbg.BackgroundGeolocation.sync();
+      await fbg.BackgroundGeolocation.changePace(true);
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(
+        e,
+        st,
+        fatal: false,
+        reason: 'force_pace_kick_failed_$reason',
+      );
+    }
   }
 
   /// Expose streams
@@ -531,9 +639,7 @@ class TsbgEngine {
       'mode': geoSystemMode,
     };
     await fbg.BackgroundGeolocation.setConfig(
-      fbg.Config(
-        persistence: fbg.PersistenceConfig(extras: updatedExtras),
-      ),
+      fbg.Config(persistence: fbg.PersistenceConfig(extras: updatedExtras)),
     );
   }
 
@@ -550,7 +656,8 @@ class TsbgEngine {
     // HEARTBEAT — ensures timed emission even when stationary
     fbg.BackgroundGeolocation.onHeartbeat((fbg.HeartbeatEvent e) async {
       FirebaseCrashlytics.instance.log(
-          'hb mode=${_mode.name} ts=${DateTime.now().toUtc().toIso8601String()}');
+        'hb mode=${_mode.name} ts=${DateTime.now().toUtc().toIso8601String()}',
+      );
       // Prefer last known location from SDK; fall back to a lightweight fetch.
       fbg.Location? loc = e.location;
       if (loc == null) {
@@ -560,8 +667,12 @@ class TsbgEngine {
             persist: true,
           );
         } catch (e, st) {
-          FirebaseCrashlytics.instance.recordError(e, st,
-              fatal: false, reason: 'heartbeat_gps_unavailable');
+          FirebaseCrashlytics.instance.recordError(
+            e,
+            st,
+            fatal: false,
+            reason: 'heartbeat_gps_unavailable',
+          );
           return;
         }
       }
@@ -571,10 +682,9 @@ class TsbgEngine {
     // OEM / OS interference monitoring
     fbg.BackgroundGeolocation.onPowerSaveChange((bool isPowerSave) {
       FirebaseCrashlytics.instance.log('power_save: $isPowerSave');
-      unawaited(GeoDiagnosticsWriter.recordPowerSaveChange(
-        isPowerSave,
-        uid: _uid,
-      ));
+      unawaited(
+        GeoDiagnosticsWriter.recordPowerSaveChange(isPowerSave, uid: _uid),
+      );
       if (isPowerSave) {
         FirebaseCrashlytics.instance.recordError(
           StateError('oem_power_save_enabled'),
@@ -588,11 +698,9 @@ class TsbgEngine {
 
     fbg.BackgroundGeolocation.onProviderChange((fbg.ProviderChangeEvent e) {
       FirebaseCrashlytics.instance.log(
-          'provider: gps=${e.gps} network=${e.network} enabled=${e.enabled} status=${e.status} accuracy=${e.accuracyAuthorization}');
-      unawaited(GeoDiagnosticsWriter.recordProviderChange(
-        e,
-        uid: _uid,
-      ));
+        'provider: gps=${e.gps} network=${e.network} enabled=${e.enabled} status=${e.status} accuracy=${e.accuracyAuthorization}',
+      );
+      unawaited(GeoDiagnosticsWriter.recordProviderChange(e, uid: _uid));
       if (!e.enabled) {
         FirebaseCrashlytics.instance.recordError(
           StateError('location_provider_disabled'),
@@ -605,10 +713,9 @@ class TsbgEngine {
 
     fbg.BackgroundGeolocation.onEnabledChange((bool enabled) {
       FirebaseCrashlytics.instance.log('fbg_enabled: $enabled');
-      unawaited(GeoDiagnosticsWriter.recordFbgEnabledChange(
-        enabled,
-        uid: _uid,
-      ));
+      unawaited(
+        GeoDiagnosticsWriter.recordFbgEnabledChange(enabled, uid: _uid),
+      );
       if (!enabled && _started) {
         FirebaseCrashlytics.instance.recordError(
           StateError('fbg_disabled_while_running'),
@@ -627,11 +734,13 @@ class TsbgEngine {
         if (e.action == 'ENTER') {
           _activeNearFences.add(e.identifier);
           if (_enteredFenceId == null) await _applyMode(SamplingMode.near);
+          unawaited(_kickActiveTracking('native_near_enter'));
         } else if (e.action == 'EXIT') {
           _activeNearFences.remove(e.identifier);
           if (_enteredFenceId == null && _activeNearFences.isEmpty) {
             await _applyMode(SamplingMode.outside);
           }
+          unawaited(_kickActiveTracking('native_near_exit'));
         }
         return;
       }
@@ -652,7 +761,8 @@ class TsbgEngine {
       }
 
       // Use SDK timestamp for event time
-      final ts = DateTime.tryParse(e.location.timestamp)?.toUtc() ??
+      final ts =
+          DateTime.tryParse(e.location.timestamp)?.toUtc() ??
           DateTime.now().toUtc();
 
       // Dwell tracking state machine
@@ -687,8 +797,9 @@ class TsbgEngine {
 
       // Emit to app FIRST — before calling setConfig back into FBG native,
       // so geo_bootstrap can update zone context while FBG callback is still clean.
-      _fenceCtl
-          .add(GeofenceEvent(e.identifier, t, ts, dwellSeconds: dwellSeconds));
+      _fenceCtl.add(
+        GeofenceEvent(e.identifier, t, ts, dwellSeconds: dwellSeconds),
+      );
 
       // Switch mode AFTER emitting, so _applyMode's setConfig() call does not
       // re-enter FBG native while the geofence callback is still mid-execution.
@@ -697,7 +808,11 @@ class TsbgEngine {
         _exitHysteresisTimer?.cancel();
         _exitHysteresisTimer = null;
         await _applyMode(SamplingMode.inside);
+        if (t == GeofenceEventType.enter) {
+          unawaited(_kickActiveTracking('native_inner_enter'));
+        }
       } else if (t == GeofenceEventType.exit) {
+        unawaited(_kickActiveTracking('native_inner_exit'));
         // Delay the outside-mode switch by 2 minutes. GPS jitter can fire a
         // spurious EXIT while the device is physically still inside the fence;
         // if a new ENTER arrives before the timer fires we stay in inside mode.
@@ -746,7 +861,8 @@ class TsbgEngine {
         locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
         break;
       case SamplingMode.outside:
-        final allowSigChange = cfg.useSignificantChangeWhenOutside &&
+        final allowSigChange =
+            cfg.useSignificantChangeWhenOutside &&
             (cfg.rateOutsideS >= cfg.significantChangeOutsideThresholdS);
         useSigChange = allowSigChange;
         heartbeatS = cfg.rateOutsideS;
@@ -780,7 +896,8 @@ class TsbgEngine {
 
     if (kDebugMode) {
       debugPrint(
-          '[TsbgEngine] applyMode=$mode sc=$useSigChange hb=${heartbeatS}s df=${distanceM}m locUpdateMs=$locationUpdateMs');
+        '[TsbgEngine] applyMode=$mode sc=$useSigChange hb=${heartbeatS}s df=${distanceM}m locUpdateMs=$locationUpdateMs',
+      );
     }
 
     _mode = mode;
@@ -789,8 +906,10 @@ class TsbgEngine {
   }
 
   /// Central gate for "whatever's first" (distance OR time) emission.
-  Future<void> _maybeEmitFromFBGLocation(fbg.Location l,
-      {required String reason}) async {
+  Future<void> _maybeEmitFromFBGLocation(
+    fbg.Location l, {
+    required String reason,
+  }) async {
     final cfg = _cfg;
     if (cfg == null || !cfg.enabled) return;
 
@@ -832,24 +951,21 @@ class TsbgEngine {
     final lastLng = _lastEmitLng;
     final lastTs = _lastEmitUtc;
 
-    final bool timeDue =
-        (lastTs == null) ? true : nowUtc.difference(lastTs).inSeconds >= rateS;
+    final bool timeDue = (lastTs == null)
+        ? true
+        : nowUtc.difference(lastTs).inSeconds >= rateS;
 
     final double movedM = (lastLat == null || lastLng == null)
         ? double.infinity
         : haversineMeters(lastLat, lastLng, lat, lng);
 
-    final bool distDue =
-        (lastLat == null || lastLng == null) ? true : movedM >= distM;
+    final bool distDue = (lastLat == null || lastLng == null)
+        ? true
+        : movedM >= distM;
 
     if (timeDue || distDue) {
       // Emit a sample to app layer (positional ctor: lat, lng, acc, ts)
-      _locCtl.add(LocationSample(
-        lat,
-        lng,
-        acc,
-        nowUtc,
-      ));
+      _locCtl.add(LocationSample(lat, lng, acc, nowUtc));
 
       // Reset the emission reference
       _lastEmitUtc = nowUtc;
@@ -858,12 +974,14 @@ class TsbgEngine {
 
       if (kDebugMode) {
         debugPrint(
-            '[TsbgEngine] emit reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue moved=${movedM.toStringAsFixed(1)}m rate=${rateS}s dist=${distM}m acc=${acc}m');
+          '[TsbgEngine] emit reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue moved=${movedM.toStringAsFixed(1)}m rate=${rateS}s dist=${distM}m acc=${acc}m',
+        );
       }
     } else {
       if (kDebugMode) {
         debugPrint(
-            '[TsbgEngine] skip reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue');
+          '[TsbgEngine] skip reason=$reason mode=$_mode timeDue=$timeDue distDue=$distDue',
+        );
       }
     }
 
@@ -884,9 +1002,11 @@ class TsbgEngine {
         if (haversineMeters(lat, lng, d.lat!, d.lng!) <=
             d.radiusM! + nearRadiusM) {
           await _applyMode(SamplingMode.near);
+          unawaited(_kickActiveTracking('gps_reconcile_near'));
           if (kDebugMode) {
             debugPrint(
-                '[TsbgEngine] near-mode reconciliation: within near zone of ${d.ident}');
+              '[TsbgEngine] near-mode reconciliation: within near zone of ${d.ident}',
+            );
           }
           break;
         }
@@ -919,11 +1039,14 @@ class TsbgEngine {
           _enteredFenceId = containingFence;
           _firedMilestones.clear();
           _fenceCtl.add(
-              GeofenceEvent(containingFence, GeofenceEventType.enter, nowUtc));
+            GeofenceEvent(containingFence, GeofenceEventType.enter, nowUtc),
+          );
           await _applyMode(SamplingMode.inside);
+          unawaited(_kickActiveTracking('gps_reconcile_inner_enter'));
           if (kDebugMode) {
             debugPrint(
-                '[TsbgEngine] synthetic ENTER (reconciliation): $containingFence');
+              '[TsbgEngine] synthetic ENTER (reconciliation): $containingFence',
+            );
           }
         }
       } else {
@@ -946,16 +1069,19 @@ class TsbgEngine {
           (elapsedS ~/ dwellCfg.dwellEveryS) * dwellCfg.dwellEveryS;
       if (milestone > 0 && !_firedMilestones.contains(milestone)) {
         _firedMilestones.add(milestone); // boundary used as dedup key
-        _fenceCtl.add(GeofenceEvent(
-          enteredFenceId,
-          GeofenceEventType.dwell,
-          nowUtc,
-          dwellSeconds:
-              elapsedS, // actual elapsed time, not the rounded boundary
-        ));
+        _fenceCtl.add(
+          GeofenceEvent(
+            enteredFenceId,
+            GeofenceEventType.dwell,
+            nowUtc,
+            dwellSeconds:
+                elapsedS, // actual elapsed time, not the rounded boundary
+          ),
+        );
         if (kDebugMode) {
           debugPrint(
-              '[TsbgEngine] dwell milestone fired: ${milestone}s for fence $enteredFenceId');
+            '[TsbgEngine] dwell milestone fired: ${milestone}s for fence $enteredFenceId',
+          );
         }
       }
     }
@@ -993,16 +1119,19 @@ class TsbgEngine {
           _enteredAt = null;
           _enteredFenceId = null;
           _firedMilestones.clear();
-          _fenceCtl.add(GeofenceEvent(
-            softExitFenceId,
-            GeofenceEventType.exit,
-            nowUtc,
-            dwellSeconds: dwellSecs,
-          ));
+          _fenceCtl.add(
+            GeofenceEvent(
+              softExitFenceId,
+              GeofenceEventType.exit,
+              nowUtc,
+              dwellSeconds: dwellSecs,
+            ),
+          );
           if (kDebugMode) {
             debugPrint(
-                '[TsbgEngine] software EXIT: ${distToCenter.toStringAsFixed(1)}m > '
-                '${def.radiusM! + 30.0}m threshold for fence $softExitFenceId');
+              '[TsbgEngine] software EXIT: ${distToCenter.toStringAsFixed(1)}m > '
+              '${def.radiusM! + 30.0}m threshold for fence $softExitFenceId',
+            );
           }
         }
       }
