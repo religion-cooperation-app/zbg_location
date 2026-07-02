@@ -106,6 +106,9 @@ void geoBackgroundFetchHeadlessTask(HeadlessTask task) async {
 @pragma('vm:entry-point')
 void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
   if (headlessEvent.name == 'heartbeat') {
+    final ts = DateTime.now().toUtc().toIso8601String();
+    fbg.BackgroundGeolocation.logger
+        .debug('SPARRC headless_heartbeat ts=$ts');
     try {
       await fbg.BackgroundGeolocation.getCurrentPosition(
         samples: 1,
