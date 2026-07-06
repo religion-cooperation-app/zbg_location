@@ -452,9 +452,9 @@ class GeoBootstrap {
       enabled: (breadcrumbs['enabled'] == true),
       dwellRequiredS: (geoDetect['dwell_required_s'] ?? 60) as int,
       dwellEveryS: (geoDetect['dwell_every_s'] ?? 0) as int,
-      rateOutsideS: 600, // TEMP: 10 min; restore: (breadcrumbs['rate_outside_zone_s'] ?? 300) as int
-      rateNearS: 300, // TEMP: 5 min; restore: (breadcrumbs['rate_near_zone_s'] ?? 60) as int
-      rateInsideS: 180, // TEMP: 3 min; restore: (breadcrumbs['rate_inside_zone_s'] ?? 30) as int
+      rateOutsideS: 900, // TEMP: 15 min; restore: (breadcrumbs['rate_outside_zone_s'] ?? 300) as int
+      rateNearS: 600, // TEMP: 10 min; restore: (breadcrumbs['rate_near_zone_s'] ?? 60) as int
+      rateInsideS: 300, // TEMP: 5 min; restore: (breadcrumbs['rate_inside_zone_s'] ?? 30) as int
       accuracyDropM: (breadcrumbs['accuracy_drop_m'] ?? 50).toDouble(),
       distanceFilterInsideM:
           (breadcrumbs['distance_filter_inside_m'] ?? 10) as int,
@@ -467,7 +467,7 @@ class GeoBootstrap {
           (platform['use_significant_change_outside'] ?? true) as bool,
       significantChangeOutsideThresholdS:
           (platform['significant_change_outside_threshold_s'] ?? 300) as int,
-      stopTimeoutMinutes: 10, // TEMP: hardcoded; restore: (platform['stop_timeout_minutes'] ?? 60) as int
+      stopTimeoutMinutes: 15, // TEMP: hardcoded; restore: (platform['stop_timeout_minutes'] ?? 60) as int
       batchSync: (platform['batch_sync'] ?? true) as bool,
       maxBatchSize: (platform['max_batch_size'] ?? 8) as int,
       autoSyncThreshold: (platform['auto_sync_threshold'] ?? 0) as int,

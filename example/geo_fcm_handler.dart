@@ -112,7 +112,8 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
         persist: true,
         timeout: 25,
       );
-      await fbg.BackgroundGeolocation.sync();
+      // sync() removed — fixes accumulate to autoSyncThreshold instead of
+      // forcing a batch(1) upload on every heartbeat.
     } catch (_) {}
     return;
   }
