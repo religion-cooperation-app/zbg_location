@@ -453,7 +453,7 @@ class GeoBootstrap {
       dwellRequiredS: (geoDetect['dwell_required_s'] ?? 60) as int,
       dwellEveryS: (geoDetect['dwell_every_s'] ?? 0) as int,
       rateOutsideS: 600, // TEMP: 10 min; restore: (breadcrumbs['rate_outside_zone_s'] ?? 300) as int
-      rateNearS: 300, // TEMP: 5 min; restore: (breadcrumbs['rate_near_zone_s'] ?? 60) as int
+      rateNearS: 360, // TEMP: 6 min; restore: (breadcrumbs['rate_near_zone_s'] ?? 60) as int
       rateInsideS: 300, // TEMP: 5 min; restore: (breadcrumbs['rate_inside_zone_s'] ?? 30) as int
       accuracyDropM: (breadcrumbs['accuracy_drop_m'] ?? 50).toDouble(),
       distanceFilterInsideM:
