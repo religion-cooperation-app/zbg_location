@@ -174,7 +174,7 @@ class TsbgEngine {
             // The notification still appears in the shade (OS requirement for
             // foreground services) but is otherwise invisible during normal use.
             notification: fbg.Notification(
-              title: 'SPARRC',
+              title: '',
               text: '',
               smallIcon: 'drawable/ic_stat_ic_launcher_foreground',
               priority: fbg.NotificationPriority.min,
