@@ -1,3 +1,11 @@
+// Writes background-geolocation callbacks to structured diagnostic snapshots.
+//
+// This preserves the public API used by tsbg_engine.dart while writing:
+//   - provider events -> geo_diagnostics/current.provider_state
+//   - power events    -> geo_diagnostics/current.battery_state
+//   - FBG events      -> geo_diagnostics/current.fbg_state
+//   - event IDs       -> timestamp_type_randomSuffix
+
 import 'dart:convert';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -12,7 +20,7 @@ import 'package:sqflite/sqflite.dart';
 class GeoDiagnosticsWriter {
   static const _dbName = 'sparrc_offline.db';
   static const _kvTable = 'kv_store';
-  static const _lastStateKey = 'geo_diag_fbg_event_last_state';
+  static const _lastStateKey = 'geo_diag_fbg_event_last_state_v2';
   static const _identityKey = 'geo_diag_identity';
 
   static Future<void> storeIdentity({
@@ -20,9 +28,7 @@ class GeoDiagnosticsWriter {
     required String regionId,
     String? fid,
   }) async {
-    if (kIsWeb) return;
-    if (uid.isEmpty || regionId.isEmpty) return;
-
+    if (kIsWeb || uid.isEmpty || regionId.isEmpty) return;
     try {
       await _writeString(
         _identityKey,
@@ -33,29 +39,36 @@ class GeoDiagnosticsWriter {
           if (fid != null && fid.isNotEmpty) 'fid': fid,
         }),
       );
-    } catch (e, st) {
-      await _recordNonFatal(e, st, 'zbg_geo_diag_store_identity_failed');
+    } catch (error, stackTrace) {
+      await _recordNonFatal(
+        error,
+        stackTrace,
+        'zbg_geo_diag_store_identity_failed',
+      );
     }
   }
 
   static Future<GeoDiagnosticsIdentity?> readIdentity() async {
     if (kIsWeb) return null;
-
     try {
       final raw = await _readString(_identityKey);
       if (raw == null || raw.isEmpty) return null;
       final decoded = jsonDecode(raw);
       if (decoded is! Map) return null;
-      final uid = decoded['uid'] as String?;
-      final regionId = decoded['region_id'] as String?;
-      if (uid == null || uid.isEmpty) return null;
+      final uid = decoded['uid']?.toString() ?? '';
+      final regionId = decoded['region_id']?.toString() ?? '';
+      if (uid.isEmpty) return null;
       return GeoDiagnosticsIdentity(
         uid: uid,
         regionId: regionId,
-        fid: decoded['fid'] as String?,
+        fid: decoded['fid']?.toString(),
       );
-    } catch (e, st) {
-      await _recordNonFatal(e, st, 'zbg_geo_diag_read_identity_failed');
+    } catch (error, stackTrace) {
+      await _recordNonFatal(
+        error,
+        stackTrace,
+        'zbg_geo_diag_read_identity_failed',
+      );
       return null;
     }
   }
@@ -70,28 +83,24 @@ class GeoDiagnosticsWriter {
   static Future<GeoDiagnosticsWriteResult> recordProviderChangeResult(
     fbg.ProviderChangeEvent event, {
     String? uid,
-  }) async {
-    final locationPermission = _locationPermissionName(event.status);
-    final locationPrecise = event.accuracyAuthorization ==
-        fbg.ProviderChangeEvent.ACCURACY_AUTHORIZATION_FULL;
+  }) {
     final state = <String, dynamic>{
       'location_services_enabled': event.enabled,
       'gps_provider_enabled': event.gps,
       'network_provider_enabled': event.network,
-      'location_permission': locationPermission,
+      'location_permission': _locationPermissionName(event.status),
       'location_authorization_status_code': event.status,
-      'location_precise': locationPrecise,
+      'location_precise':
+          event.accuracyAuthorization ==
+          fbg.ProviderChangeEvent.ACCURACY_AUTHORIZATION_FULL,
       'location_accuracy_authorization_code': event.accuracyAuthorization,
     };
-
     return _writeEventIfChanged(
       uid: uid,
       type: 'provider_change',
       source: 'fbg_onProviderChange',
       currentState: state,
-      eventFields: state,
-      currentSnapshotFields: state,
-      compareKeys: state.keys.toList(),
+      currentSection: 'provider_state',
     );
   }
 
@@ -105,17 +114,13 @@ class GeoDiagnosticsWriter {
   static Future<GeoDiagnosticsWriteResult> recordPowerSaveChangeResult(
     bool isPowerSave, {
     String? uid,
-  }) async {
-    const key = 'power_save_mode';
-    final state = <String, dynamic>{key: isPowerSave};
+  }) {
     return _writeEventIfChanged(
       uid: uid,
       type: 'power_save_change',
       source: 'fbg_onPowerSaveChange',
-      currentState: state,
-      eventFields: state,
-      currentSnapshotFields: state,
-      compareKeys: const [key],
+      currentState: {'power_save_mode': isPowerSave},
+      currentSection: 'battery_state',
     );
   }
 
@@ -129,17 +134,13 @@ class GeoDiagnosticsWriter {
   static Future<GeoDiagnosticsWriteResult> recordFbgEnabledChangeResult(
     bool enabled, {
     String? uid,
-  }) async {
-    const key = 'fbg_enabled';
-    final state = <String, dynamic>{key: enabled};
+  }) {
     return _writeEventIfChanged(
       uid: uid,
       type: 'fbg_enabled_change',
       source: 'fbg_onEnabledChange',
-      currentState: state,
-      eventFields: state,
-      currentSnapshotFields: state,
-      compareKeys: const [key],
+      currentState: {'enabled': enabled},
+      currentSection: 'fbg_state',
     );
   }
 
@@ -148,9 +149,7 @@ class GeoDiagnosticsWriter {
     required String type,
     required String source,
     required Map<String, dynamic> currentState,
-    required Map<String, dynamic> eventFields,
-    required Map<String, dynamic> currentSnapshotFields,
-    required List<String> compareKeys,
+    required String currentSection,
   }) async {
     if (kIsWeb) {
       return GeoDiagnosticsWriteResult.skipped(
@@ -159,6 +158,7 @@ class GeoDiagnosticsWriter {
         source: source,
       );
     }
+
     final resolvedUid = _resolveUid(uid);
     if (resolvedUid == null || resolvedUid.isEmpty) {
       return GeoDiagnosticsWriteResult.skipped(
@@ -169,17 +169,11 @@ class GeoDiagnosticsWriter {
     }
 
     try {
-      await _log('geo_diag_write_start type=$type source=$source');
-      final cleanState = _scalarMap(currentState);
-      await _log('geo_diag_read_last_state_start type=$type');
       final previous = await _readLastState();
-      await _log('geo_diag_read_last_state_done type=$type');
-      if (!_hasChanged(
-        previous: previous,
-        current: cleanState,
-        compareKeys: compareKeys,
-      )) {
-        await _log('geo_diag_deduped_no_change type=$type');
+      final namespacedState = currentState.map(
+        (key, value) => MapEntry('$currentSection.$key', value),
+      );
+      if (!_hasChanged(previous, namespacedState)) {
         return GeoDiagnosticsWriteResult.skipped(
           status: GeoDiagnosticsWriteStatus.dedupedNoChange,
           type: type,
@@ -187,50 +181,59 @@ class GeoDiagnosticsWriter {
         );
       }
 
-      final nowIso = DateTime.now().toUtc().toIso8601String();
-      final firestore = FirebaseFirestore.instance;
-      final batch = firestore.batch();
+      final clientIso = DateTime.now().toUtc().toIso8601String();
+      final fs = FirebaseFirestore.instance;
+      final userRef = fs.collection('users').doc(resolvedUid);
+      final eventRef = userRef
+          .collection('geo_events')
+          .doc(_eventDocumentId(type));
+      final currentRef = userRef.collection('geo_diagnostics').doc('current');
+      final batch = fs.batch();
 
-      final userRef = firestore.collection('users').doc(resolvedUid);
-      final eventRef = userRef.collection('geo_events').doc();
       batch.set(eventRef, {
         'type': type,
         'source': source,
         'timestamp': FieldValue.serverTimestamp(),
-        'client_ts_iso': nowIso,
-        ..._scalarMap(eventFields),
+        'client_ts_iso': clientIso,
+        ...currentState,
       });
 
-      final currentRef = userRef.collection('geo_diagnostics').doc('current');
-      batch.set(
-        currentRef,
-        {
-          'updated_at': FieldValue.serverTimestamp(),
-          'client_updated_at_iso': nowIso,
-          'last_event_type': type,
-          ..._scalarMap(currentSnapshotFields),
+      batch.set(currentRef, {
+        'schema_version': 2,
+        currentSection: {
+          ...currentState,
+          'observed_at': FieldValue.serverTimestamp(),
+          'client_observed_at_iso': clientIso,
+          'source': source,
         },
-        SetOptions(merge: true),
-      );
+        'last_update': {
+          'observed_at': FieldValue.serverTimestamp(),
+          'client_observed_at_iso': clientIso,
+          'source': source,
+        },
+      }, SetOptions(merge: true));
 
-      await _log('geo_diag_firestore_commit_start type=$type');
       await batch.commit();
-      await _log('geo_diag_firestore_commit_done type=$type');
-      await _log('geo_diag_write_last_state_start type=$type');
-      await _writeLastState({...previous, ...cleanState});
-      await _log('geo_diag_write_last_state_done type=$type');
-      return GeoDiagnosticsWriteResult.written(
-        type: type,
-        source: source,
-      );
-    } catch (e, st) {
-      await _recordNonFatal(e, st, 'zbg_geo_diag_write_failed');
+      await _writeLastState({...previous, ...namespacedState});
+      return GeoDiagnosticsWriteResult.written(type: type, source: source);
+    } catch (error, stackTrace) {
+      await _recordNonFatal(error, stackTrace, 'zbg_geo_diag_write_failed');
       return GeoDiagnosticsWriteResult.failed(
         type: type,
         source: source,
-        error: e,
+        error: error,
       );
     }
+  }
+
+  static String _eventDocumentId(String type) {
+    final compact = DateTime.now().toUtc().toIso8601String().replaceAll(
+      RegExp(r'[-:.]'),
+      '',
+    );
+    final safeType = type.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+    final autoId = FirebaseFirestore.instance.collection('_event_ids').doc().id;
+    return '${compact}_${safeType}_${autoId.substring(0, 6)}';
   }
 
   static String? _resolveUid(String? uid) {
@@ -259,6 +262,16 @@ class GeoDiagnosticsWriter {
     }
   }
 
+  static bool _hasChanged(
+    Map<String, dynamic> previous,
+    Map<String, dynamic> current,
+  ) {
+    for (final entry in current.entries) {
+      if (previous[entry.key] != entry.value) return true;
+    }
+    return false;
+  }
+
   static Future<Database> _openDb() async {
     final dbPath = await getDatabasesPath();
     final fullPath = path_helper.join(dbPath, _dbName);
@@ -282,14 +295,14 @@ class GeoDiagnosticsWriter {
       if (raw == null || raw.isEmpty) return {};
       final decoded = jsonDecode(raw);
       if (decoded is! Map) return {};
-      return _scalarMap(Map<String, dynamic>.from(decoded));
+      return Map<String, dynamic>.from(decoded);
     } catch (_) {
       return {};
     }
   }
 
-  static Future<void> _writeLastState(Map<String, dynamic> state) async {
-    await _writeString(_lastStateKey, jsonEncode(_scalarMap(state)));
+  static Future<void> _writeLastState(Map<String, dynamic> state) {
+    return _writeString(_lastStateKey, jsonEncode(state));
   }
 
   static Future<String?> _readString(String key) async {
@@ -312,79 +325,28 @@ class GeoDiagnosticsWriter {
   static Future<void> _writeString(String key, String value) async {
     final db = await _openDb();
     try {
-      await db.insert(
-        _kvTable,
-        {'key': key, 'value': value},
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
+      await db.insert(_kvTable, {
+        'key': key,
+        'value': value,
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
     } finally {
       await db.close();
     }
   }
 
-  static bool _hasChanged({
-    required Map<String, dynamic> previous,
-    required Map<String, dynamic> current,
-    required List<String> compareKeys,
-  }) {
-    for (final key in compareKeys) {
-      if (previous[key] != current[key]) return true;
-    }
-    return false;
-  }
-
-  static Map<String, dynamic> _scalarMap(Map<String, dynamic> input) {
-    final out = <String, dynamic>{};
-    input.forEach((key, value) {
-      if (value == null ||
-          value is String ||
-          value is bool ||
-          value is int ||
-          value is double) {
-        out[key] = value;
-      } else if (value is num) {
-        out[key] = value.toDouble();
-      } else if (value is List) {
-        out[key] = value
-            .where(
-              (e) =>
-                  e == null ||
-                  e is String ||
-                  e is bool ||
-                  e is int ||
-                  e is double,
-            )
-            .toList();
-      } else {
-        out[key] = value.toString();
-      }
-    });
-    return out;
-  }
-
   static Future<void> _recordNonFatal(
     Object error,
-    StackTrace stack,
+    StackTrace stackTrace,
     String reason,
   ) async {
     try {
       await FirebaseCrashlytics.instance.recordError(
         error,
-        stack,
+        stackTrace,
         fatal: false,
         reason: reason,
       );
-    } catch (_) {
-      // Diagnostics must not affect location tracking.
-    }
-  }
-
-  static Future<void> _log(String message) async {
-    try {
-      FirebaseCrashlytics.instance.log(message);
-    } catch (_) {
-      // Diagnostics must not affect location tracking.
-    }
+    } catch (_) {}
   }
 }
 
@@ -449,7 +411,6 @@ class GeoDiagnosticsWriteResult {
   final String? errorMessage;
 
   String get statusName => status.name;
-
   bool get wrote => status == GeoDiagnosticsWriteStatus.written;
 
   Map<String, dynamic> toDebugMap() {
