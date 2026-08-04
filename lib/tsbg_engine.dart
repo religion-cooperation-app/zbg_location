@@ -225,7 +225,7 @@ class TsbgEngine {
           ),
 
           logger: fbg.LoggerConfig(
-            debug: true,
+            debug: false,
           ),
         ),
       );
