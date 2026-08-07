@@ -105,6 +105,25 @@ void geoBackgroundFetchHeadlessTask(HeadlessTask task) async {
 // GeoBootstrap.startFromFirestore() — Android-only.
 @pragma('vm:entry-point')
 void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
+  // laventure_3_noNotif: motion wakeups in terminated state get one synced
+  // sample, then FBG is forced back to stationary so the foreground-service
+  // notification lasts seconds, not the whole trip. Mirrors the foreground
+  // suppression in TsbgEngine. Stateless — no Firestore read, no engine
+  // state; if this isolate dies mid-handler, native FBG behavior resumes
+  // unmodified. motionTriggerDelay (2 min, native config) spaces re-triggers
+  // during sustained movement.
+  if (headlessEvent.name == 'motionchange') {
+    final location = headlessEvent.event as fbg.Location;
+    if (!location.isMoving) return;
+    // FBG has already persisted the motionchange fix; give native autoSync a
+    // window to POST it before the foreground service stops.
+    await Future.delayed(const Duration(seconds: 15));
+    try {
+      await fbg.BackgroundGeolocation.changePace(false);
+    } catch (_) {}
+    return;
+  }
+
   if (headlessEvent.name != 'geofence') return;
   await Firebase.initializeApp();
   final fs = FirebaseFirestore.instance;

@@ -107,8 +107,9 @@ class TsbgEngine {
         FirebaseCrashlytics.instance.log(
             'tbg_setconfig_recovered_from_cache uid_present=${uid != null} region_present=${regionId != null}');
       }
-      if (_fid == null && cached.fid != null) {
-        _fid = cached.fid;
+      final cachedFid = cached?.fid;
+      if (_fid == null && cachedFid != null) {
+        _fid = cachedFid;
       }
       if (uid == null) {
         throw StateError(
@@ -247,6 +248,13 @@ class TsbgEngine {
             // the accelerometer wakes FBG when motion resumes. Keeping this true
             // burns maximum battery and causes iOS to throttle/kill the process.
             disableStopDetection: false,
+            // laventure_3_noNotif: require 2 min of sustained motion before FBG
+            // transitions to moving. Combined with the changePace(false)
+            // suppression in onMotionChange, this spaces motion wakeups during
+            // continuous travel so the foreground-service notification appears
+            // briefly at most once per ~2 min instead of staying on for the
+            // whole trip. Android-only; iOS ignores this field.
+            motionTriggerDelay: 120000,
           ),
 
           logger: fbg.LoggerConfig(
@@ -584,10 +592,83 @@ class TsbgEngine {
   /// Internal wiring
   /// --------------------------------------------
 
+  /// laventure_3_noNotif: true when the last app-layer emission is younger
+  /// than the current mode's heartbeat rate — i.e. samples are already
+  /// landing on schedule and a motion wakeup adds nothing.
+  bool _lastSampleIsFresh() {
+    final cfg = _cfg;
+    final last = _lastEmitUtc;
+    if (cfg == null || last == null) return false;
+    final int rateS;
+    switch (_mode) {
+      case SamplingMode.inside:
+        rateS = cfg.rateInsideS;
+        break;
+      case SamplingMode.near:
+        rateS = cfg.rateNearS;
+        break;
+      case SamplingMode.outside:
+        rateS = cfg.rateOutsideS;
+        break;
+    }
+    if (rateS <= 0) return false;
+    return DateTime.now().toUtc().difference(last).inSeconds < rateS;
+  }
+
+  /// laventure_3_noNotif: force FBG back to stationary after a motion wakeup.
+  ///
+  /// Stateless by design — no timers, no persisted flags, no config toggles.
+  /// If the process dies at any point, native FBG behavior resumes unmodified;
+  /// there is no stuck state to recover from. If the last sample was fresh,
+  /// suppress immediately; otherwise wait briefly so the motionchange fix FBG
+  /// just persisted can autoSync before the foreground service stops.
+  Future<void> _suppressActivePace({required bool hadFreshSample}) async {
+    // iOS has no tracking notification — suppressing moving state there costs
+    // data (motion tracking is the primary outside-zone source on iOS, since
+    // preventSuspend/heartbeat only engage inside a zone) for zero benefit.
+    if (!Platform.isAndroid) return;
+    final cfg = _cfg;
+    if (cfg == null || !cfg.enabled) return;
+    // In geofence-only mode FBG manages GPS entirely for fence evaluation;
+    // forcing stationary would fight geofenceModeHighAccuracy.
+    if (cfg.geofenceOnlyMode) return;
+
+    if (!hadFreshSample) {
+      // Give native autoSync a window to POST the motionchange fix.
+      await Future.delayed(const Duration(seconds: 15));
+    }
+    try {
+      await fbg.BackgroundGeolocation.changePace(false);
+      FirebaseCrashlytics.instance.log(
+          'pace_suppress instant=$hadFreshSample mode=${_mode.name}');
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st,
+          fatal: false, reason: 'pace_suppress_failed');
+    }
+  }
+
   void _attachListeners() {
     // LOCATION — gate emission by "whatever's first"
     fbg.BackgroundGeolocation.onLocation((fbg.Location l) async {
       await _maybeEmitFromFBGLocation(l, reason: 'location');
+    });
+
+    // MOTIONCHANGE — laventure_3_noNotif experiment: heartbeat is the primary
+    // sampling mechanism; motion-triggered active tracking exists only as a
+    // wakeup for devices whose heartbeats have died. On Android, drop back to
+    // stationary as soon as the wakeup has produced a synced sample, so the
+    // foreground-service notification is visible for seconds rather than the
+    // duration of a trip. motionTriggerDelay (2 min, native config in ready())
+    // spaces re-triggers during sustained movement.
+    fbg.BackgroundGeolocation.onMotionChange((fbg.Location l) async {
+      // Capture freshness BEFORE the emit below updates _lastEmitUtc.
+      final hadFreshSample = _lastSampleIsFresh();
+      FirebaseCrashlytics.instance.log(
+          'motionchange isMoving=${l.isMoving} mode=${_mode.name} fresh=$hadFreshSample');
+      await _maybeEmitFromFBGLocation(l, reason: 'motionchange');
+      if (l.isMoving) {
+        await _suppressActivePace(hadFreshSample: hadFreshSample);
+      }
     });
 
     // HEARTBEAT — ensures timed emission even when stationary
