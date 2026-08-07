@@ -414,6 +414,11 @@ class GeoBootstrap {
     }
   }
 
+  /// Ensures FBG Dart listeners are registered in this Dart VM session.
+  /// Delegates to TsbgEngine.ensureListeners() — idempotent, safe before start().
+  /// Call from registerLifecycleTracker on every app open.
+  void ensureListeners() => _engine.ensureListeners();
+
   Future<void> stop() async {
     await _locSub?.cancel();
     await _fenceSub?.cancel();
