@@ -524,11 +524,13 @@ class TsbgEngine {
     _attachListeners();
     _listenersAttached = true;
     // Fire-and-forget: signals Dart readiness to the native EventManager.
-    fbg.BackgroundGeolocation.ready(fbg.Config(reset: false))
-        .catchError((Object e) {
-      FirebaseCrashlytics.instance
-          .log('ensureListeners: ready() failed: $e');
-    });
+    fbg.BackgroundGeolocation.ready(fbg.Config(reset: false)).then<void>(
+      (_) {},
+      onError: (Object e) {
+        FirebaseCrashlytics.instance
+            .log('ensureListeners: ready() failed: $e');
+      },
+    );
   }
 
   /// Expose streams
