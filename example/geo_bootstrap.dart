@@ -349,6 +349,17 @@ class GeoBootstrap {
   /// Call from registerLifecycleTracker on every app open.
   void ensureListeners() => _engine.ensureListeners();
 
+  /// Huawei reliability profile: true when this device is Huawei/Honor AND
+  /// platform.huawei_reliability_mode is on in appConfig/runtime.
+  bool get isHuaweiReliabilityMode => _engine.isHuaweiReliabilityMode;
+
+  /// Huawei self-repair ladder (plan §8/§10/§12) — delegates to the engine.
+  /// Idempotent; safe from app foreground, push wake, boot, notification tap.
+  /// Returns 'ok' | 'restarted' | 'restart_failed' | 'skipped:…'. Callers
+  /// should show the visible recovery notification on 'restart_failed'.
+  Future<String> repairTracking({String source = 'manual'}) =>
+      _engine.huaweiRepairTracking(source: source);
+
   Future<void> stop() async {
     await _locSub?.cancel();
     await _fenceSub?.cancel();
@@ -452,9 +463,9 @@ class GeoBootstrap {
       enabled: (breadcrumbs['enabled'] == true),
       dwellRequiredS: (geoDetect['dwell_required_s'] ?? 60) as int,
       dwellEveryS: (geoDetect['dwell_every_s'] ?? 0) as int,
-      rateOutsideS: 480, // TEMP: 8 min; restore: (breadcrumbs['rate_outside_zone_s'] ?? 300) as int
-      rateNearS: 420, // TEMP: 7 min; restore: (breadcrumbs['rate_near_zone_s'] ?? 60) as int
-      rateInsideS: 300, // TEMP: 5 min; restore: (breadcrumbs['rate_inside_zone_s'] ?? 30) as int
+      rateOutsideS: (breadcrumbs['rate_outside_zone_s'] ?? 300) as int,
+      rateNearS: (breadcrumbs['rate_near_zone_s'] ?? 60) as int,
+      rateInsideS: (breadcrumbs['rate_inside_zone_s'] ?? 30) as int,
       accuracyDropM: (breadcrumbs['accuracy_drop_m'] ?? 50).toDouble(),
       distanceFilterInsideM:
           (breadcrumbs['distance_filter_inside_m'] ?? 10) as int,
@@ -467,10 +478,26 @@ class GeoBootstrap {
           (platform['use_significant_change_outside'] ?? true) as bool,
       significantChangeOutsideThresholdS:
           (platform['significant_change_outside_threshold_s'] ?? 300) as int,
-      stopTimeoutMinutes: 15, // TEMP: hardcoded; restore: (platform['stop_timeout_minutes'] ?? 60) as int
+      stopTimeoutMinutes: (platform['stop_timeout_minutes'] ?? 60) as int,
       batchSync: (platform['batch_sync'] ?? true) as bool,
       maxBatchSize: (platform['max_batch_size'] ?? 8) as int,
-      autoSyncThreshold: 10, // TEMP: hardcoded; restore: (platform['auto_sync_threshold'] ?? 0) as int
+      autoSyncThreshold: (platform['auto_sync_threshold'] ?? 0) as int,
+      // Huawei reliability profile — master switch defaults false so this
+      // config is inert everywhere until enabled remotely per-study.
+      huaweiReliabilityMode:
+          (platform['huawei_reliability_mode'] ?? false) as bool,
+      huaweiKeepFbgContinuous:
+          (platform['huawei_keep_fbg_continuous'] ?? true) as bool,
+      huaweiDisableSignificantChanges:
+          (platform['huawei_disable_significant_changes'] ?? true) as bool,
+      huaweiForceMovingOnRecovery:
+          (platform['huawei_force_moving_on_recovery'] ?? true) as bool,
+      huaweiPushRecoveryEnabled:
+          (platform['huawei_push_recovery_enabled'] ?? true) as bool,
+      huaweiPushLocationIntervalMinutes:
+          ((platform['huawei_push_location_interval_minutes'] as num?)
+                  ?.toInt() ??
+              7),
       // Geofence-only mode — default false so existing builds are unaffected
       geofenceOnlyMode: (platform['geofence_only_mode'] ?? false) as bool,
       // preventSuspend kill switch — default true so existing behavior is preserved

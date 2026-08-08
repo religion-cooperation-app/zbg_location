@@ -36,7 +36,17 @@ import 'package:flutter_background_geolocation/flutter_background_geolocation.da
 Future<void> geoFirebaseMessagingBackgroundHandler(
     RemoteMessage message) async {
   if (message.data['type'] != 'geo_wakeup') return;
-  if (!Platform.isIOS) return; // Android FBG foreground service handles Android
+  if (!Platform.isIOS) {
+    // Android: FBG's foreground service normally makes push wakeups redundant
+    // — EXCEPT in Huawei reliability mode, where FCM acts as the secondary/
+    // fallback recovery channel (plan §7; Huawei Push Kit is primary, see
+    // huaweiPushHandler.dart). Where GMS is present on a Huawei device this
+    // runs the same repair ladder as an HPK wake.
+    if (Platform.isAndroid && await huaweiHeadlessProfileActive()) {
+      await huaweiHeadlessRepair(source: 'fcm_geo_wakeup');
+    }
+    return;
+  }
 
   // 1. Flush SQLite — recover any locations FBG stored but could not POST
   try {
@@ -105,6 +115,29 @@ void geoBackgroundFetchHeadlessTask(HeadlessTask task) async {
 // GeoBootstrap.startFromFirestore() — Android-only.
 @pragma('vm:entry-point')
 void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
+  // Huawei activation trigger (plan §6, headless): connectivity regained is a
+  // free native wakeup — force FBG into active moving mode. Requires a
+  // Firestore flag read (no extras on connectivity events); the device check
+  // short-circuits first so non-Huawei devices pay nothing.
+  if (headlessEvent.name == 'connectivitychange') {
+    final e = headlessEvent.event as fbg.ConnectivityChangeEvent;
+    if (!e.connected) return;
+    if (!await huaweiHeadlessProfileActive()) return;
+    try {
+      await fbg.BackgroundGeolocation.changePace(true);
+    } catch (_) {}
+    return;
+  }
+  // Huawei boot recovery (plan §13): startOnBoot restarted the native
+  // service after reboot — restore active moving mode once so tracking
+  // resumes without waiting for a push or app open.
+  if (headlessEvent.name == 'boot') {
+    if (!await huaweiHeadlessProfileActive()) return;
+    try {
+      await fbg.BackgroundGeolocation.changePace(true);
+    } catch (_) {}
+    return;
+  }
   if (headlessEvent.name == 'heartbeat') {
     try {
       await fbg.BackgroundGeolocation.getCurrentPosition(
@@ -133,6 +166,18 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
   final uid = extras['uid'] as String?;
   final regionId = extras['regionId'] as String?;
   final mode = extras['mode'] as String?;
+
+  // Huawei activation trigger (plan §6, headless): geofence ENTER/EXIT are
+  // native wakeups that fire even with the Flutter UI dead — use them to
+  // force FBG back into active moving mode. Gated on the huawei_mode flag
+  // the engine writes into persistence.extras, so this is a no-op for every
+  // other OEM and whenever the remote profile switch is off.
+  if (extras['huawei_mode'] == true &&
+      (action == 'ENTER' || action == 'EXIT')) {
+    try {
+      await fbg.BackgroundGeolocation.changePace(true);
+    } catch (_) {}
+  }
 
   if (uid == null || uid.isEmpty) return;
 
@@ -207,4 +252,95 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
       // from breadcrumbs when the device re-enters the zone.
     }
   }
+}
+
+// ── Huawei headless helpers (laventure_huawei) ────────────────────────────────
+// Shared by the FCM fallback path above and huaweiPushHandler.dart (HPK
+// primary channel). Headless isolates cannot reach GeoBootstrap/TsbgEngine
+// singletons, so these talk to FBG and Firestore directly.
+
+/// True when this device is Huawei/Honor AND appConfig/runtime has the
+/// profile enabled. Device check runs first so every other OEM returns
+/// without any Firestore read.
+Future<bool> huaweiHeadlessProfileActive() async {
+  try {
+    final info = await fbg.DeviceInfo.getInstance();
+    final m = info.manufacturer.toLowerCase();
+    if (!m.contains('huawei') && !m.contains('honor')) return false;
+  } catch (_) {
+    return false;
+  }
+  try {
+    await Firebase.initializeApp();
+    final snap =
+        await FirebaseFirestore.instance.doc('appConfig/runtime').get();
+    final platform = (snap.data()?['platform'] as Map?) ?? {};
+    return (platform['huawei_reliability_mode'] ?? false) == true &&
+        (platform['huawei_push_recovery_enabled'] ?? true) == true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Huawei headless repair ladder (plan §8/§10): inspect FBG state → restart
+/// if disabled (Android may reject foreground-service starts from background
+/// — recorded, not fatal) → fresh persisted fix → sync → changePace(true).
+///
+/// Every attempt writes an outcome doc to huawei_recovery_events so the
+/// restart success/reject/timeout/fix question (plan §10) is answerable from
+/// the server without device logs.
+///
+/// Returns 'ok' | 'restarted' | 'no_fix' | 'restarted_no_fix' |
+/// 'restart_failed'. Callers with a notification surface should show the
+/// visible recovery notification (plan §11) on 'restart_failed'.
+Future<String> huaweiHeadlessRepair({required String source}) async {
+  String outcome = 'ok';
+  bool restarted = false;
+  try {
+    final state = await fbg.BackgroundGeolocation.state;
+    if (!state.enabled) {
+      try {
+        await fbg.BackgroundGeolocation.start();
+        restarted = true;
+      } catch (_) {
+        outcome = 'restart_failed';
+      }
+    }
+  } catch (_) {
+    outcome = 'restart_failed';
+  }
+
+  if (outcome != 'restart_failed') {
+    try {
+      // maximumAge:0 → force a real acquisition, not a cached replay.
+      // persist:true → native SQLite → HTTP path stays the data path (§14).
+      await fbg.BackgroundGeolocation.getCurrentPosition(
+        samples: 1,
+        maximumAge: 0,
+        persist: true,
+        timeout: 30,
+      );
+    } catch (_) {
+      outcome = restarted ? 'restarted_no_fix' : 'no_fix';
+    }
+    try {
+      await fbg.BackgroundGeolocation.sync();
+    } catch (_) {}
+    try {
+      await fbg.BackgroundGeolocation.changePace(true);
+    } catch (_) {}
+    if (outcome == 'ok' && restarted) outcome = 'restarted';
+  }
+
+  // Plan §10: record the outcome. Best-effort — never let bookkeeping break
+  // the repair path.
+  try {
+    await Firebase.initializeApp();
+    await FirebaseFirestore.instance.collection('huawei_recovery_events').add({
+      'source': source,
+      'outcome': outcome,
+      'ts_iso': DateTime.now().toUtc().toIso8601String(),
+    });
+  } catch (_) {}
+  return outcome;
 }

@@ -5,6 +5,7 @@
 
 import 'index.dart'; // Imports other custom actions
 
+import 'dart:async';
 import 'package:flutter/widgets.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -33,6 +34,13 @@ class _AppSessionTracker with WidgetsBindingObserver {
     if (_isInForeground) return;
     _isInForeground = true;
     GeoBootstrap.instance.ensureListeners();
+    // Huawei app-open self-repair (plan §12): every foreground is a repair
+    // opportunity — restart FBG if EMUI killed it, fresh fix, sync, force
+    // moving. No-ops on non-Huawei devices or when the profile is off.
+    // Fire-and-forget so session bookkeeping below is never delayed.
+    // This is also the tap target of the recovery notification (plan §11):
+    // tapping it foregrounds SPARRC, which lands here.
+    unawaited(GeoBootstrap.instance.repairTracking(source: 'app_foreground'));
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null) return;
 

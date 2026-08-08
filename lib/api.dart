@@ -141,6 +141,39 @@ class RuntimeConfig {
   /// wake-ups at the cost of a short upload delay.
   final int autoSyncThreshold;
 
+  /// ---- Huawei reliability profile (laventure_huawei) ----
+  /// Master switch for the Huawei-specific reliability profile. Only takes
+  /// effect on devices whose manufacturer reports Huawei/Honor — other OEMs
+  /// are unaffected regardless of this flag. Remotely controllable via
+  /// appConfig/runtime platform.huawei_reliability_mode so the profile can be
+  /// enabled/disabled without shipping a new APK.
+  final bool huaweiReliabilityMode;
+
+  /// Keep FBG continuously enabled on Huawei (start() instead of the daily
+  /// startSchedule() window). Removes the fragile 05:00 foreground-service
+  /// restart requirement. platform.huawei_keep_fbg_continuous.
+  final bool huaweiKeepFbgContinuous;
+
+  /// Force useSignificantChangesOnly:false in outside mode on Huawei.
+  /// Significant-change tracking depends on passive OS wakeups, which are
+  /// unreliable on aggressively managed EMUI/HarmonyOS devices.
+  /// platform.huawei_disable_significant_changes.
+  final bool huaweiDisableSignificantChanges;
+
+  /// Call changePace(true) at activation/recovery points (startup, push wake,
+  /// app foreground with stale tracking, geofence ENTER/EXIT, connectivity
+  /// change, boot). platform.huawei_force_moving_on_recovery.
+  final bool huaweiForceMovingOnRecovery;
+
+  /// Enable push-wake recovery handling (Huawei Push Kit primary, FCM
+  /// fallback). platform.huawei_push_recovery_enabled.
+  final bool huaweiPushRecoveryEnabled;
+
+  /// Requested cadence for server-side Huawei geo-wake pushes, in minutes.
+  /// Advisory for the sender; Huawei may delay or suppress pushes.
+  /// platform.huawei_push_location_interval_minutes.
+  final int huaweiPushLocationIntervalMinutes;
+
   /// Construct full runtime config
   const RuntimeConfig({
     required this.enabled,
@@ -165,6 +198,12 @@ class RuntimeConfig {
     this.ingestApiKey,
     this.nearZoneRadiusM = 100,
     this.autoSyncThreshold = 0,
+    this.huaweiReliabilityMode = false,
+    this.huaweiKeepFbgContinuous = true,
+    this.huaweiDisableSignificantChanges = true,
+    this.huaweiForceMovingOnRecovery = true,
+    this.huaweiPushRecoveryEnabled = true,
+    this.huaweiPushLocationIntervalMinutes = 7,
   });
 
   /// Factory loader from Firestore or JSON blob
@@ -214,6 +253,23 @@ class RuntimeConfig {
 
       // Accumulate this many records before syncing; 0 = sync immediately
       autoSyncThreshold: (m['platform']?['auto_sync_threshold'] as num?)?.toInt() ?? 0,
+
+      // Huawei reliability profile — all remotely controllable; master switch
+      // defaults false so non-experiment builds behave identically.
+      huaweiReliabilityMode:
+          m['platform']?['huawei_reliability_mode'] ?? false,
+      huaweiKeepFbgContinuous:
+          m['platform']?['huawei_keep_fbg_continuous'] ?? true,
+      huaweiDisableSignificantChanges:
+          m['platform']?['huawei_disable_significant_changes'] ?? true,
+      huaweiForceMovingOnRecovery:
+          m['platform']?['huawei_force_moving_on_recovery'] ?? true,
+      huaweiPushRecoveryEnabled:
+          m['platform']?['huawei_push_recovery_enabled'] ?? true,
+      huaweiPushLocationIntervalMinutes:
+          (m['platform']?['huawei_push_location_interval_minutes'] as num?)
+                  ?.toInt() ??
+              7,
     );
   }
 }

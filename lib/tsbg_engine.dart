@@ -64,6 +64,15 @@ class TsbgEngine {
   String? _regionId;
   String? _fid;
 
+  // ---- Huawei reliability profile (laventure_huawei) ----
+  /// Resolved once per process from FBG DeviceInfo.manufacturer.
+  /// Null until first setConfig resolves it.
+  bool? _isHuaweiDevice;
+
+  /// Cooldown bookkeeping so clustered recovery triggers (start + geofence +
+  /// connectivity firing together) don't spam changePace(true).
+  DateTime? _lastHuaweiForcePaceAt;
+
   /// Called by app layer before setConfig/start to tag native HTTP uploads
   /// with the signed-in user, active region, and Firebase Installation ID.
   void setIdentity({required String uid, required String regionId, String? fid}) {
@@ -84,6 +93,10 @@ class TsbgEngine {
   Future<void> setConfig(RuntimeConfig cfg) async {
     _cfg = cfg;
 
+    // Resolve Huawei hardware detection before building the FBG config —
+    // schedule, notification, and sig-change decisions below depend on it.
+    final huaweiMode = await detectHuaweiDevice() && cfg.huaweiReliabilityMode;
+
     // Snapshot identity for HTTP params at config-time.
     final uid = _uid;
     final regionId = _regionId;
@@ -92,6 +105,9 @@ class TsbgEngine {
     if (uid != null) httpParams['uid'] = uid;
     if (regionId != null) httpParams['regionId'] = regionId;
     httpParams['mode'] = geoSystemMode;
+    // Carried in persistence.extras so headless handlers (terminated state)
+    // and zbgIngest can tell Huawei-profile breadcrumbs apart.
+    httpParams['huawei_mode'] = huaweiMode;
 
     if (kDebugMode) {
       debugPrint(
@@ -116,7 +132,14 @@ class TsbgEngine {
 
           // Collect locations only between 05:00–00:00 every day.
           // startSchedule() activates this; FBG stops automatically outside the window.
-          schedule: ['1-7 05:00-00:00'],
+          //
+          // Huawei reliability mode: NO schedule. EMUI routinely fails to
+          // restart a stopped foreground location service at 05:00, which is
+          // the fragile step this profile removes — FBG stays enabled 24/7
+          // and start() is used instead of startSchedule() (see start()).
+          schedule: (huaweiMode && cfg.huaweiKeepFbgContinuous)
+              ? null
+              : ['1-7 05:00-00:00'],
           scheduleUseAlarmManager: Platform.isAndroid,
 
           geolocation: fbg.GeoConfig(
@@ -157,7 +180,9 @@ class TsbgEngine {
               'cancelButton': 'Cancel',
               'settingsButton': 'Settings',
             },
-            stopTimeout: 30,
+            // Configurable from Firestore (platform.stop_timeout_minutes) —
+            // was hardcoded 30, which silently ignored RuntimeConfig.
+            stopTimeout: cfg.stopTimeoutMinutes,
           ),
 
           app: fbg.AppConfig(
@@ -173,13 +198,26 @@ class TsbgEngine {
             // Suppress heads-up banner and status bar icon on Android.
             // The notification still appears in the shade (OS requirement for
             // foreground services) but is otherwise invisible during normal use.
-            notification: fbg.Notification(
-              title: 'SPARRC',
-              text: '',
-              smallIcon: 'drawable/ic_stat_ic_launcher_foreground',
-              priority: fbg.NotificationPriority.min,
-              sticky: false,
-            ),
+            //
+            // Huawei reliability mode: persistent sticky/low notification
+            // instead. Foreground-service hygiene on EMUI — a visible,
+            // sticky notification reduces (does not eliminate) Huawei's
+            // appetite for killing the service.
+            notification: huaweiMode
+                ? fbg.Notification(
+                    title: 'SPARRC location tracking',
+                    text: 'Location collection is active',
+                    smallIcon: 'drawable/ic_stat_ic_launcher_foreground',
+                    priority: fbg.NotificationPriority.low,
+                    sticky: true,
+                  )
+                : fbg.Notification(
+                    title: 'SPARRC',
+                    text: '',
+                    smallIcon: 'drawable/ic_stat_ic_launcher_foreground',
+                    priority: fbg.NotificationPriority.min,
+                    sticky: false,
+                  ),
             // Android: rationale shown when upgrading to Always Allow permission.
             backgroundPermissionRationale: fbg.PermissionRationale(
               message:
@@ -353,6 +391,11 @@ class TsbgEngine {
       await fbg.BackgroundGeolocation.requestPermission();
       if (_cfg?.geofenceOnlyMode == true) {
         await fbg.BackgroundGeolocation.startGeofences();
+      } else if (isHuaweiReliabilityMode &&
+          (_cfg?.huaweiKeepFbgContinuous ?? false)) {
+        // Huawei reliability mode: continuous start(), FBG enabled 24/7.
+        // The daily schedule's 05:00 service restart is what EMUI breaks.
+        await fbg.BackgroundGeolocation.start();
       } else {
         // startSchedule() activates the 05:00-00:00 window; FBG owns on/off.
         await fbg.BackgroundGeolocation.startSchedule();
@@ -363,6 +406,11 @@ class TsbgEngine {
       rethrow;
     }
     _started = true;
+
+    // Huawei: force active moving mode immediately after startup. Observed
+    // pattern on affected devices: a breadcrumb at explicit activation, then
+    // silence — explicit activation works while passive tracking fails.
+    await huaweiForcePace('startup', force: true);
 
     // Startup diagnostics — silent; must not block normal startup path.
     try {
@@ -556,12 +604,138 @@ class TsbgEngine {
       if (zoneId != null) 'zoneId': zoneId,
       'inside_zone': insideZone,
       'mode': geoSystemMode,
+      'huawei_mode': isHuaweiReliabilityMode,
     };
     await fbg.BackgroundGeolocation.setConfig(
       fbg.Config(
         persistence: fbg.PersistenceConfig(extras: updatedExtras),
       ),
     );
+  }
+
+  /// --------------------------------------------
+  /// Huawei reliability profile (laventure_huawei)
+  /// --------------------------------------------
+
+  /// Detects Huawei/Honor hardware once per process via FBG's DeviceInfo.
+  /// Honor is included: post-split Honor devices ship the same EMUI-derived
+  /// background management this profile exists to survive.
+  Future<bool> detectHuaweiDevice() async {
+    final cached = _isHuaweiDevice;
+    if (cached != null) return cached;
+    bool result = false;
+    try {
+      final info = await fbg.DeviceInfo.getInstance();
+      final m = info.manufacturer.toLowerCase();
+      result = m.contains('huawei') || m.contains('honor');
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st,
+          fatal: false, reason: 'huawei_detect_failed');
+    }
+    _isHuaweiDevice = result;
+    FirebaseCrashlytics.instance.setCustomKey('huawei_device', result);
+    return result;
+  }
+
+  /// True when this device is Huawei/Honor AND the remote master switch
+  /// (platform.huawei_reliability_mode) is on. Other OEMs are never affected.
+  bool get isHuaweiReliabilityMode =>
+      (_isHuaweiDevice ?? false) && (_cfg?.huaweiReliabilityMode ?? false);
+
+  /// changePace(true) at an activation/recovery point. No-op outside Huawei
+  /// reliability mode or when huawei_force_moving_on_recovery is off.
+  ///
+  /// Deliberately NOT a periodic Dart timer — timers die with the Dart
+  /// process on EMUI. Every call site is an explicit event: startup, push
+  /// wake, app foreground, geofence ENTER/EXIT, connectivity change, boot.
+  ///
+  /// [force] bypasses the 60s cooldown — used by repair paths where the
+  /// activation is the whole point of the call.
+  Future<void> huaweiForcePace(String source, {bool force = false}) async {
+    if (!isHuaweiReliabilityMode) return;
+    if (!(_cfg?.huaweiForceMovingOnRecovery ?? false)) return;
+    final now = DateTime.now();
+    if (!force &&
+        _lastHuaweiForcePaceAt != null &&
+        now.difference(_lastHuaweiForcePaceAt!) < const Duration(seconds: 60)) {
+      return;
+    }
+    _lastHuaweiForcePaceAt = now;
+    try {
+      await fbg.BackgroundGeolocation.changePace(true);
+      FirebaseCrashlytics.instance.log('huawei_force_pace source=$source');
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st,
+          fatal: false, reason: 'huawei_force_pace_failed:$source');
+    }
+  }
+
+  /// Huawei self-repair ladder (plan §8/§10/§12). Idempotent and safe to call
+  /// repeatedly from every wake opportunity: push wake, app foreground,
+  /// boot recovery, recovery-notification tap.
+  ///
+  /// Sequence: inspect FBG state → if disabled attempt start() (Android may
+  /// reject foreground-service starts from background — recorded, not fatal)
+  /// → fresh persisted fix → sync → changePace(true).
+  ///
+  /// Returns an outcome string the app layer keys off:
+  ///   'ok'             — FBG was enabled; fix/sync/pace ran
+  ///   'restarted'      — FBG was disabled; background restart succeeded
+  ///   'restart_failed' — FBG disabled and start() rejected/failed →
+  ///                      caller should show the visible recovery notification
+  ///   'skipped:…'      — profile not active on this device/config
+  Future<String> huaweiRepairTracking({String source = 'manual'}) async {
+    if (!isHuaweiReliabilityMode) return 'skipped:not_huawei_mode';
+    FirebaseCrashlytics.instance.log('huawei_repair start source=$source');
+
+    bool restarted = false;
+    try {
+      final state = await fbg.BackgroundGeolocation.state;
+      if (!state.enabled) {
+        try {
+          if (_cfg?.geofenceOnlyMode == true) {
+            await fbg.BackgroundGeolocation.startGeofences();
+          } else {
+            await fbg.BackgroundGeolocation.start();
+          }
+          _started = true;
+          restarted = true;
+          FirebaseCrashlytics.instance
+              .log('huawei_repair restarted source=$source');
+        } catch (e, st) {
+          FirebaseCrashlytics.instance.recordError(e, st,
+              fatal: false, reason: 'huawei_repair_restart_failed:$source');
+          return 'restart_failed';
+        }
+      }
+    } catch (e, st) {
+      FirebaseCrashlytics.instance.recordError(e, st,
+          fatal: false, reason: 'huawei_repair_state_failed:$source');
+      return 'restart_failed';
+    }
+
+    // Fresh persisted fix. maximumAge:0 forces a real GPS acquisition rather
+    // than replaying a cached position; persist:true routes it through the
+    // native SQLite → HTTP path (plan §14: native path stays the data path).
+    try {
+      await fbg.BackgroundGeolocation.getCurrentPosition(
+        samples: 1,
+        maximumAge: 0,
+        persist: true,
+        timeout: 30,
+      );
+    } catch (e, st) {
+      // GPS timeout is non-fatal — sync below still flushes buffered records.
+      FirebaseCrashlytics.instance.recordError(e, st,
+          fatal: false, reason: 'huawei_repair_fix_failed:$source');
+    }
+    try {
+      await fbg.BackgroundGeolocation.sync();
+    } catch (_) {
+      // Nothing buffered or no connectivity — native autoSync will retry.
+    }
+    await huaweiForcePace('repair_$source', force: true);
+    return restarted ? 'restarted' : 'ok';
   }
 
   /// --------------------------------------------
@@ -614,6 +788,17 @@ class TsbgEngine {
       }
     });
 
+    // CONNECTIVITY — Huawei activation trigger (plan §6). A connectivity
+    // change is a native wakeup we get for free; use it to force FBG back
+    // into active moving mode on Huawei even when the UI is long dead.
+    fbg.BackgroundGeolocation.onConnectivityChange(
+        (fbg.ConnectivityChangeEvent e) {
+      FirebaseCrashlytics.instance.log('connectivity: ${e.connected}');
+      if (e.connected) {
+        unawaited(huaweiForcePace('connectivity_change'));
+      }
+    });
+
     fbg.BackgroundGeolocation.onProviderChange((fbg.ProviderChangeEvent e) {
       FirebaseCrashlytics.instance.log(
           'provider: gps=${e.gps} network=${e.network} enabled=${e.enabled} status=${e.status} accuracy=${e.accuracyAuthorization}');
@@ -650,6 +835,12 @@ class TsbgEngine {
 
     // GEOFENCE
     fbg.BackgroundGeolocation.onGeofence((fbg.GeofenceEvent e) async {
+      // Huawei activation trigger (plan §6): geofence ENTER/EXIT are prime
+      // breadcrumb opportunities — force active moving mode so the fix
+      // stream flows while the user is at/around a study zone.
+      if (e.action == 'ENTER' || e.action == 'EXIT') {
+        unawaited(huaweiForcePace('geofence_${e.action.toLowerCase()}'));
+      }
       // Handle outer near-zone fence events (Fix 2) — internal mode switching only, not emitted.
       if (e.identifier.endsWith('_near')) {
         if (e.action == 'ENTER') {
@@ -776,7 +967,12 @@ class TsbgEngine {
       case SamplingMode.outside:
         final allowSigChange = cfg.useSignificantChangeWhenOutside &&
             (cfg.rateOutsideS >= cfg.significantChangeOutsideThresholdS);
-        useSigChange = allowSigChange;
+        // Huawei reliability mode: never significant-change-only. It leans on
+        // passive OS wakeups, which EMUI suppresses — use normal time/distance
+        // tracking instead. Remotely reversible via
+        // platform.huawei_disable_significant_changes.
+        useSigChange = allowSigChange &&
+            !(isHuaweiReliabilityMode && cfg.huaweiDisableSignificantChanges);
         heartbeatS = cfg.rateOutsideS;
         distanceM = cfg.distanceFilterOutsideM;
         locationUpdateMs = (heartbeatS > 0) ? heartbeatS * 1000 : null;
