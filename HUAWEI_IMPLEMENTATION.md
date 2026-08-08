@@ -31,34 +31,58 @@ Remaining: everything below.
 ## 1. HMS Location Kit — REQUIRED reading before testing
 
 **Most post-2019 Huawei devices have no Google Play Services (GMS).** FBG's
-Android implementation rides on GMS for two critical things:
+Android implementation depends on GMS for two critical things — confirmed by
+reading the plugin's own `android/build.gradle`, which declares
+`com.google.android.gms:play-services-location` as an unconditional
+dependency:
 
 - **FusedLocationProviderClient** — location acquisition;
 - **ActivityRecognition** — the motion API that transitions FBG
   stationary → moving.
 
 Without GMS, motion detection is dead (device stays `still` forever) and
-location quality degrades — this alone can produce the observed pattern of
-"breadcrumb at explicit activation, silence in between." The profile's
-`changePace(true)`-everywhere design works around dead motion detection, but
-location acquisition itself still needs a working provider.
+location acquisition itself is unreliable or absent — this alone can produce
+the observed pattern of "breadcrumb at explicit activation, silence in
+between." The profile's `changePace(true)`-everywhere design works around
+dead motion detection, but has no answer for acquisition itself failing.
 
-**Transistorsoft sells official Huawei HMS support** (native library ≥ 4.10.0,
-included in the `flutter_background_geolocation 5.0.1` this branch uses):
+**There is no supported HMS fallback — do not budget for one.** Transistorsoft
+DID ship official Huawei HMS support (native ≥ 4.10.0) at one point, but
+**removed it in 4.18.0 (Sept 2025)** because Huawei never rebuilt their HMS
+SDKs to meet Android's 16KB memory-page-size requirement (mandatory for
+current Play Store submissions) — confirmed via the plugin's own CHANGELOG
+and corroborated by upstream GitHub issues #1481 (removal), #1629 (community
+request to restore it, open and unaddressed), and #1689 ("where to buy the
+HMS plugin", unanswered). The shop page that used to sell the license
+(`shop.transistorsoft.com/.../huawei-background-geolocation`) now 404s.
 
-1. Purchase the separate Huawei license key:
-   <https://shop.transistorsoft.com/collections/frontpage/products/huawei-background-geolocation>
-2. Add the key to the app's `AndroidManifest.xml` alongside the existing
-   Transistorsoft license (per the product's install instructions).
-3. The HMS Location SDK version is controlled by the `hmsLocationVersion`
-   Gradle ext (defaults to `6.12.0.300` in the plugin's `build.gradle`).
-   Override in the app's `android/build.gradle` `ext {}` block only if AGC
-   flags an outdated dependency.
+Downgrading FBG to reclaim a pre-removal version (last HMS-capable release:
+4.17.1) is **not a viable workaround**, for two independent reasons:
 
-With the HMS license in place, FBG uses HMS Location Kit + HMS
-ActivityIdentification on GMS-less devices. Without it, expect degraded or
-absent tracking on those devices no matter what this profile does — budget
-for the license before interpreting field results.
+1. **It would require rewriting the whole `zbg_location` engine, not just
+   this branch.** v5 introduced a *compound* Config API
+   (`GeoConfig`/`AppConfig`/`HttpConfig`/`PersistenceConfig`/`ActivityConfig`)
+   that `tsbg_engine.dart` uses throughout — and per Transistorsoft's own
+   v5 migration guide, that compound style is new *in* v5; v5 kept backward
+   compatibility for old v4 flat config, not the reverse. 4.17.1 only
+   understands the flat style, so every `setConfig()` call across every
+   branch in this family (`laventure_simple`, `laventure_2_scheduled`,
+   `laventure_3_noNotif`, this branch) would need rewriting to match.
+2. **Even after that rewrite, the underlying HMS SDK is still stuck
+   non-compliant** with the 16KB requirement — pinning old FBG doesn't fix
+   Huawei's abandonment of their own libraries, it just freezes the app on a
+   component that's already failing current Android standards with no
+   upstream fix in sight.
+
+**Practical implication for this profile:** on Huawei devices with zero GMS
+(no genuine Play Services and no working GMS-compatibility shim), expect this
+profile to help with survival/recovery (fewer kills, faster restarts, more
+wake opportunities) but NOT to guarantee location acquisition — FBG simply
+has no supported provider to fall back to there. Treat "does GMS work on this
+device at all" as the load-bearing unknown for the whole plan, and consider
+logging GMS availability (e.g. via `google_api_availability` or catching the
+acquisition failure mode directly) as an early diagnostic before drawing
+conclusions from field data on any given device.
 
 Bonus: FBG's `DeviceSettings` API can deep-link Huawei's vendor settings
 screens (battery / app-launch) from inside the app — useful for §5 onboarding
