@@ -9,7 +9,7 @@ participant device configuration, and release verification.
 
 | Plan item | Where |
 |---|---|
-| 1. Huawei detection + `platform.huawei_*` runtime flags | `TsbgEngine.detectHuaweiDevice()` / `isHuaweiReliabilityMode`; `RuntimeConfig` (api.dart); parsed in `geo_bootstrap.dart` |
+| 1. Dedicated Huawei build + `platform.huawei_*` runtime flags | `TsbgEngine.isHuaweiReliabilityMode`; `RuntimeConfig` (api.dart); parsed in `geo_bootstrap.dart` |
 | 2. Continuous `start()` + `changePace(true)` (no 05:00 schedule) | `TsbgEngine.setConfig()` (schedule omitted) + `start()` |
 | 3. Sticky low-priority foreground notification | `TsbgEngine.setConfig()` notification block |
 | 4. `stopTimeout` from runtime config (was hardcoded 30) | `TsbgEngine.setConfig()` |
@@ -114,10 +114,12 @@ screens (battery / app-launch) from inside the app — useful for §5 onboarding
 
 Current `geoWakeupSweep` sends FCM data messages. Extend it:
 
-1. **Token selection:** for each target device read
-   `device_installations/{fid}` — if `hpk_token` present, send HPK first;
-   fall back to FCM token if the HPK send errors or no `hpk_token` exists
-   (plan §7).
+1. **Test-channel selection:** for each target device read
+   `device_installations/{fid}` and send through every available channel:
+   HPK when `hpk_token` is present and FCM when an FCM token is present. Give
+   both messages the same server-generated `wake_id`. During this test phase
+   there is intentionally no client deduplication: each delivered channel
+   requests and persists its own fresh fix.
 2. **HPK send:** OAuth2 client-credentials against
    `https://oauth-login.cloud.huawei.com/oauth2/v3/token` using the AGC app's
    Client ID/Secret (store in Cloud Function secrets), then POST to
@@ -125,7 +127,7 @@ Current `geoWakeupSweep` sends FCM data messages. Extend it:
    ```json
    {
      "message": {
-       "data": "{\"type\":\"geo_wakeup\"}",
+       "data": "{\"type\":\"geo_wakeup\",\"wake_id\":\"<shared-id>\"}",
        "android": { "urgency": "HIGH" },
        "token": ["<hpk_token>"]
      }
@@ -140,19 +142,42 @@ Current `geoWakeupSweep` sends FCM data messages. Extend it:
    against sends to measure real delivery.
 4. Retain the existing stale-location watchdog/retry logic unchanged.
 
+Each attempt writes `huawei_recovery_events` with `wake_id`, channel `source`,
+outcome, restart status, FBG `location_uuid`/timestamp when a fix was obtained,
+client timing, and a server completion timestamp. Group events by `wake_id` to
+compare which channel arrived and produced its fix first. Older pushes without
+a `wake_id` remain supported but cannot be paired across channels.
+
 ## 4. Runtime config flags (appConfig/runtime → `platform` map)
 
 | Field | Default | Meaning |
 |---|---|---|
-| `huawei_reliability_mode` | `false` | Master switch. Inert on non-Huawei hardware regardless. |
+| `huawei_reliability_mode` | `false` | Remote master switch for installs of the dedicated Huawei build. |
 | `huawei_keep_fbg_continuous` | `true` | `start()` 24/7 instead of `startSchedule()` |
 | `huawei_disable_significant_changes` | `true` | Never sig-change-only outside |
 | `huawei_force_moving_on_recovery` | `true` | `changePace(true)` at recovery points |
 | `huawei_push_recovery_enabled` | `true` | Headless push repair ladder active |
 | `huawei_push_location_interval_minutes` | `7` | Advisory cadence for the sender |
 
-Rollout: set `huawei_reliability_mode: true` remotely once a Huawei test
-device is enrolled; kill it the same way. No APK ship needed.
+**Testing upload override:** while `huawei_reliability_mode` is `true`, this
+branch forces FBG's effective `autoSyncThreshold` to `1`, regardless of the
+ordinary `platform.auto_sync_threshold` value. This makes new breadcrumbs
+visible as soon as FBG can upload them. Turning the master switch off restores
+the ordinary configured threshold (currently `15`). Remove this override or
+make it remotely configurable before a production rollout if per-record HTTP
+requests are too expensive.
+
+This branch intentionally does not inspect `Build.MANUFACTURER` or any other
+device/OS hardware signal. Distribution is the device-selection boundary:
+only manually identified Huawei/Honor devices should receive the app build
+whose `zbg_location` dependency points at `laventure_huawei`. Within that
+build, set `huawei_reliability_mode: true` remotely to activate the profile;
+set it to `false` to kill the profile without shipping another APK.
+
+Do not distribute this build to general Android devices while the master
+switch is enabled: every install of this build will receive Huawei behavior.
+The ordinary app build must continue to point at the non-Huawei dependency
+ref.
 
 **Overnight note (plan §2):** continuous mode collects 00:00–05:00 samples
 the old schedule did not. Client-side discarding would fight the native

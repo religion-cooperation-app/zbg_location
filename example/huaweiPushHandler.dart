@@ -118,7 +118,10 @@ Future<void> _handleGeoWake(RemoteMessage message,
   if (data['type'] != 'geo_wakeup') return;
   if (!await huaweiHeadlessProfileActive()) return;
 
-  final outcome = await huaweiHeadlessRepair(source: source);
+  final outcome = await huaweiHeadlessRepair(
+    source: source,
+    wakeId: data['wake_id'],
+  );
   if (outcome == 'restart_failed') {
     await _showRecoveryNotification();
   }

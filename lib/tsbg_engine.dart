@@ -65,10 +65,6 @@ class TsbgEngine {
   String? _fid;
 
   // ---- Huawei reliability profile (laventure_huawei) ----
-  /// Resolved once per process from FBG DeviceInfo.manufacturer.
-  /// Null until first setConfig resolves it.
-  bool? _isHuaweiDevice;
-
   /// Cooldown bookkeeping so clustered recovery triggers (start + geofence +
   /// connectivity firing together) don't spam changePace(true).
   DateTime? _lastHuaweiForcePaceAt;
@@ -93,9 +89,13 @@ class TsbgEngine {
   Future<void> setConfig(RuntimeConfig cfg) async {
     _cfg = cfg;
 
-    // Resolve Huawei hardware detection before building the FBG config —
-    // schedule, notification, and sig-change decisions below depend on it.
-    final huaweiMode = await detectHuaweiDevice() && cfg.huaweiReliabilityMode;
+    // This package branch is shipped only in the manually assigned Huawei
+    // build, so the remote master switch is the complete profile gate.
+    final huaweiMode = cfg.huaweiReliabilityMode;
+    // Testing override: surface Huawei breadcrumbs immediately. Disabling the
+    // master switch restores the ordinary Firestore-configured threshold.
+    final effectiveAutoSyncThreshold =
+        huaweiMode ? 1 : cfg.autoSyncThreshold;
 
     // Snapshot identity for HTTP params at config-time.
     final uid = _uid;
@@ -239,7 +239,7 @@ class TsbgEngine {
             autoSync: true,
             batchSync: cfg.batchSync,
             maxBatchSize: cfg.maxBatchSize,
-            autoSyncThreshold: cfg.autoSyncThreshold,
+            autoSyncThreshold: effectiveAutoSyncThreshold,
             // NOTE: no rootProperty here; defaults to 'location'
             // 25s timeout fits within iOS SLC / background-fetch wakeup windows
             // (~30s), giving FBG the best chance of completing a POST before iOS
@@ -280,7 +280,7 @@ class TsbgEngine {
     FirebaseCrashlytics.instance
         .setCustomKey('geofence_only_mode', cfg.geofenceOnlyMode.toString());
     FirebaseCrashlytics.instance
-        .setCustomKey('auto_sync_threshold', cfg.autoSyncThreshold);
+        .setCustomKey('auto_sync_threshold', effectiveAutoSyncThreshold);
     FirebaseCrashlytics.instance
         .setCustomKey('batch_sync', cfg.batchSync.toString());
     FirebaseCrashlytics.instance.setCustomKey(
@@ -292,7 +292,7 @@ class TsbgEngine {
     // to the running engine (ready() with reset:false does not re-apply these).
     try {
       await fbg.BackgroundGeolocation.setConfig(fbg.Config(
-        autoSyncThreshold: cfg.autoSyncThreshold,
+        autoSyncThreshold: effectiveAutoSyncThreshold,
         persistence: fbg.PersistenceConfig(extras: httpParams),
       ));
     } catch (e, st) {
@@ -617,30 +617,10 @@ class TsbgEngine {
   /// Huawei reliability profile (laventure_huawei)
   /// --------------------------------------------
 
-  /// Detects Huawei/Honor hardware once per process via FBG's DeviceInfo.
-  /// Honor is included: post-split Honor devices ship the same EMUI-derived
-  /// background management this profile exists to survive.
-  Future<bool> detectHuaweiDevice() async {
-    final cached = _isHuaweiDevice;
-    if (cached != null) return cached;
-    bool result = false;
-    try {
-      final info = await fbg.DeviceInfo.getInstance();
-      final m = info.manufacturer.toLowerCase();
-      result = m.contains('huawei') || m.contains('honor');
-    } catch (e, st) {
-      FirebaseCrashlytics.instance.recordError(e, st,
-          fatal: false, reason: 'huawei_detect_failed');
-    }
-    _isHuaweiDevice = result;
-    FirebaseCrashlytics.instance.setCustomKey('huawei_device', result);
-    return result;
-  }
-
-  /// True when this device is Huawei/Honor AND the remote master switch
-  /// (platform.huawei_reliability_mode) is on. Other OEMs are never affected.
-  bool get isHuaweiReliabilityMode =>
-      (_isHuaweiDevice ?? false) && (_cfg?.huaweiReliabilityMode ?? false);
+  /// True when the remote master switch is on. This branch is intended only
+  /// for the separately distributed, manually assigned Huawei build; it does
+  /// not inspect or trust OS-reported manufacturer information.
+  bool get isHuaweiReliabilityMode => _cfg?.huaweiReliabilityMode ?? false;
 
   /// changePace(true) at an activation/recovery point. No-op outside Huawei
   /// reliability mode or when huawei_force_moving_on_recovery is off.

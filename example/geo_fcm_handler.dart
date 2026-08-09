@@ -43,7 +43,10 @@ Future<void> geoFirebaseMessagingBackgroundHandler(
     // huaweiPushHandler.dart). Where GMS is present on a Huawei device this
     // runs the same repair ladder as an HPK wake.
     if (Platform.isAndroid && await huaweiHeadlessProfileActive()) {
-      await huaweiHeadlessRepair(source: 'fcm_geo_wakeup');
+      await huaweiHeadlessRepair(
+        source: 'fcm_geo_wakeup',
+        wakeId: message.data['wake_id'],
+      );
     }
     return;
   }
@@ -117,8 +120,8 @@ void geoBackgroundFetchHeadlessTask(HeadlessTask task) async {
 void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
   // Huawei activation trigger (plan §6, headless): connectivity regained is a
   // free native wakeup — force FBG into active moving mode. Requires a
-  // Firestore flag read (no extras on connectivity events); the device check
-  // short-circuits first so non-Huawei devices pay nothing.
+  // Firestore flag read (no extras on connectivity events). This handler is
+  // packaged only in the dedicated Huawei build.
   if (headlessEvent.name == 'connectivitychange') {
     final e = headlessEvent.event as fbg.ConnectivityChangeEvent;
     if (!e.connected) return;
@@ -259,17 +262,10 @@ void geoFbgHeadlessTask(fbg.HeadlessEvent headlessEvent) async {
 // primary channel). Headless isolates cannot reach GeoBootstrap/TsbgEngine
 // singletons, so these talk to FBG and Firestore directly.
 
-/// True when this device is Huawei/Honor AND appConfig/runtime has the
-/// profile enabled. Device check runs first so every other OEM returns
-/// without any Firestore read.
+/// True when appConfig/runtime enables the profile. This handler ships only
+/// in the separately distributed Huawei build, so it deliberately performs
+/// no OS/manufacturer detection.
 Future<bool> huaweiHeadlessProfileActive() async {
-  try {
-    final info = await fbg.DeviceInfo.getInstance();
-    final m = info.manufacturer.toLowerCase();
-    if (!m.contains('huawei') && !m.contains('honor')) return false;
-  } catch (_) {
-    return false;
-  }
   try {
     await Firebase.initializeApp();
     final snap =
@@ -293,9 +289,14 @@ Future<bool> huaweiHeadlessProfileActive() async {
 /// Returns 'ok' | 'restarted' | 'no_fix' | 'restarted_no_fix' |
 /// 'restart_failed'. Callers with a notification surface should show the
 /// visible recovery notification (plan §11) on 'restart_failed'.
-Future<String> huaweiHeadlessRepair({required String source}) async {
+Future<String> huaweiHeadlessRepair({
+  required String source,
+  String? wakeId,
+}) async {
+  final startedAt = DateTime.now().toUtc();
   String outcome = 'ok';
   bool restarted = false;
+  fbg.Location? requestedLocation;
   try {
     final state = await fbg.BackgroundGeolocation.state;
     if (!state.enabled) {
@@ -314,7 +315,7 @@ Future<String> huaweiHeadlessRepair({required String source}) async {
     try {
       // maximumAge:0 → force a real acquisition, not a cached replay.
       // persist:true → native SQLite → HTTP path stays the data path (§14).
-      await fbg.BackgroundGeolocation.getCurrentPosition(
+      requestedLocation = await fbg.BackgroundGeolocation.getCurrentPosition(
         samples: 1,
         maximumAge: 0,
         persist: true,
@@ -335,11 +336,23 @@ Future<String> huaweiHeadlessRepair({required String source}) async {
   // Plan §10: record the outcome. Best-effort — never let bookkeeping break
   // the repair path.
   try {
+    final completedAt = DateTime.now().toUtc();
     await Firebase.initializeApp();
     await FirebaseFirestore.instance.collection('huawei_recovery_events').add({
       'source': source,
+      if (wakeId != null && wakeId.isNotEmpty) 'wake_id': wakeId,
       'outcome': outcome,
-      'ts_iso': DateTime.now().toUtc().toIso8601String(),
+      'restarted': restarted,
+      if (requestedLocation != null) ...{
+        'location_uuid': requestedLocation.uuid,
+        'location_timestamp': requestedLocation.timestamp,
+      },
+      'started_at_iso': startedAt.toIso8601String(),
+      'completed_at_iso': completedAt.toIso8601String(),
+      'fix_duration_ms': completedAt.difference(startedAt).inMilliseconds,
+      'completed_at': FieldValue.serverTimestamp(),
+      // Retained for existing dashboards/queries.
+      'ts_iso': completedAt.toIso8601String(),
     });
   } catch (_) {}
   return outcome;

@@ -142,11 +142,11 @@ class RuntimeConfig {
   final int autoSyncThreshold;
 
   /// ---- Huawei reliability profile (laventure_huawei) ----
-  /// Master switch for the Huawei-specific reliability profile. Only takes
-  /// effect on devices whose manufacturer reports Huawei/Honor — other OEMs
-  /// are unaffected regardless of this flag. Remotely controllable via
-  /// appConfig/runtime platform.huawei_reliability_mode so the profile can be
-  /// enabled/disabled without shipping a new APK.
+  /// Master switch for the Huawei-specific reliability profile in the
+  /// separately distributed Huawei build. There is intentionally no runtime
+  /// manufacturer detection; manually assigning this build determines which
+  /// installs can use the profile. The Firestore flag remains a remote kill
+  /// switch, so the profile can be enabled/disabled without shipping an APK.
   final bool huaweiReliabilityMode;
 
   /// Keep FBG continuously enabled on Huawei (start() instead of the daily

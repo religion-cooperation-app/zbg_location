@@ -349,8 +349,8 @@ class GeoBootstrap {
   /// Call from registerLifecycleTracker on every app open.
   void ensureListeners() => _engine.ensureListeners();
 
-  /// Huawei reliability profile: true when this device is Huawei/Honor AND
-  /// platform.huawei_reliability_mode is on in appConfig/runtime.
+  /// Huawei reliability profile: true when platform.huawei_reliability_mode
+  /// is on. This code is distributed only in the dedicated Huawei build.
   bool get isHuaweiReliabilityMode => _engine.isHuaweiReliabilityMode;
 
   /// Huawei self-repair ladder (plan §8/§10/§12) — delegates to the engine.
